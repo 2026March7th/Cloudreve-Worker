@@ -148,7 +148,10 @@ console.log('▶ 2/4 检查 R2 bucket…');
   }
 }
 
-console.log('▶ 3/4 发布 Worker…');
+console.log('▶ 3/5 准备官方前端（frontend/，缺了会自动拉源码构建）…');
+runOrDie(process.execPath, [path.join(ROOT, 'scripts', 'fetch-frontend.mjs')], '准备官方前端');
+
+console.log('▶ 4/5 发布 Worker…');
 {
   const args = ['deploy'];
   for (const key of ['SITE_URL', 'FRONTEND_URL']) {
@@ -161,14 +164,14 @@ console.log('▶ 3/4 发布 Worker…');
 }
 
 if (process.env.DATABASE_URL) {
-  console.log('▶ 4/4 把 DATABASE_URL 写入 Worker Secret…');
+  console.log('▶ 5/5 把 DATABASE_URL 写入 Worker Secret…');
   // secret put 非交互时从 stdin 读值；失败不阻断（也许面板里已手动设过）
   const r = run(NPX, npxArgs(['secret', 'put', 'DATABASE_URL']), {
     input: `${process.env.DATABASE_URL}\n`,
   });
   console.log(r.code === 0 ? '  已写入。' : `  写入失败（可忽略，若面板里已设置）：\n${r.all}`);
 } else {
-  console.log('▶ 4/4 跳过 Secret（CI 环境变量里没有 DATABASE_URL）。');
+  console.log('▶ 5/5 跳过 Secret（CI 环境变量里没有 DATABASE_URL）。');
   console.log('  记得到 Cloudflare 面板 → 该 Worker → 设置 → 变量和机密，添加 DATABASE_URL。');
 }
 

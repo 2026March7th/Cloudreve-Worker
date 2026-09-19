@@ -10,8 +10,10 @@ dist-check/
 .env
 .env.*
 
-# 官方前端构建产物（本地拷进来用于 [assets] 联调，不入库）
+# 官方前端（fetch-frontend.mjs 的下载/构建中间物与产物，不入库）
 frontend/
+_frontend.tar.gz
+_frontend-src/
 
 # 编辑器 / 系统
 .vscode/

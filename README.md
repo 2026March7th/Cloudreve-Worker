@@ -45,7 +45,7 @@ Workers & Pages → Create → 选仓库，只填两格：
 | `DATABASE_URL` | ✅ | Neon 连接串。加在部署项目的环境变量里，`npm run deploy` 会自动写成运行时 Secret；也可部署后在 Worker 的「变量和机密」里手动加 |
 | `SITE_URL` | 建议 | 站点对外地址（Worker 地址），分享短链 / 下载直链用它；不设则回落到管理后台的 `siteURL` 设置 |
 | `JWT_SECRET` | 可选 | 令牌签名密钥（32 位以上随机串）。不设会自动生成并入库 |
-| `FRONTEND_URL` | 可选 | 官方前端单独部署在别处时才填，Worker 会把非 API 请求反代过去 |
+| `FRONTEND_URL` | 可选 | 官方前端默认已随 Worker 一起发布；只有把前端单独部署到别处（如 Pages）时才填，填了反代优先于内置资源 |
 
 邮件、全文检索（Meilisearch + Tika）、存储策略等全部在**管理后台**配置，不占环境变量。详见 [DEPLOY.md](./DEPLOY.md)。
 
@@ -173,7 +173,8 @@ src/
   routes/               site / session / user / file / share / admin /
                         admin-content / devices / dav / workflow / callback
 migrations/*.sql        建表脚本（首次请求自动执行）
-scripts/                migrate / seed / 验证脚本
+scripts/                deploy / fetch-frontend（自动拉取并构建官方前端）/ migrate / seed / 验证脚本
+frontend/               官方前端构建产物 —— 不入库，部署时自动生成（见 scripts/fetch-frontend.mjs）
 ```
 
 ## 开发

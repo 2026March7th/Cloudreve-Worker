@@ -47,24 +47,19 @@ bucket_name = "cloudreve-worker"
 # ---------------------------------------------------------------------------
 # 官方前端（cloudreve/frontend 的构建产物）
 #
-# 后端不内置任何自研前端。把官方前端构建产物放到 ./frontend 后取消下面的注释，
-# 静态文件与 SPA 回落就由平台的资源层直接处理，Worker 只处理 /api、/s、/f。
+# frontend/ 目录**不入库**：`npm run build` / `npm run deploy` 会先跑
+# scripts/fetch-frontend.mjs 自动获取（优先 Release 预构建包，否则拉上游
+# 源码现构建，固定在上游 .gitmodules 指定的提交 19da0fe1）。
 #
-# 固定用上游 .gitmodules 里那个提交（在 master 分支上，该仓库没有 v4 分支），
-# 构建方式与上游 .build/build-assets.sh 一致：yarn，产物在 ./build。
-#
-#   git clone https://github.com/cloudreve/frontend.git
-#   cd frontend && git checkout 19da0fe1ecd40971fafa813983d769fdce41573c
-#   NODE_OPTIONS="--max-old-space-size=8192" yarn install && yarn run build
-#   cp -r build ../edge/frontend
-#
-# run_worker_first 保证 API / 短链 / 直链优先走 Worker，其余交给静态资源。
+# run_worker_first 保证 API / 短链 / 直链优先走 Worker，其余交给静态资源
+# 与 SPA 回落。想把前端单独部署到别处（Pages 等），不删 frontend/ 也行，
+# 配 FRONTEND_URL 后反代优先于 [assets]。
 # ---------------------------------------------------------------------------
-# [assets]
-# directory = "./frontend"
-# binding = "ASSETS"
-# not_found_handling = "single-page-application"
-# run_worker_first = ["/api/*", "/s/*", "/f/*"]
+[assets]
+directory = "./frontend"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
+run_worker_first = ["/api/*", "/s/*", "/f/*"]
 
 # ---------------------------------------------------------------------------
 # 定时任务：回收站到期清理（对应原版的 trash_collector 队列任务）

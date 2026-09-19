@@ -198,35 +198,28 @@ JSON 列类型不同、没有 ent 的 migration 记录表）。请用全新的�
 
 ## 5. 接官方前端
 
-前端**只能用官方的**，本仓库不含任何前端代码。
+前端**只能用官方的**（<https://github.com/cloudreve/frontend>），本仓库不含任何前端代码，
+但**默认已经帮你接好了**：`npm run build` / `npm run deploy` 会先跑
+`scripts/fetch-frontend.mjs`，把官方前端构建产物准备到 `frontend/` 目录（不入库），
+`wrangler.toml` 里的 `[assets]` 已启用，静态资源与 SPA 回落由平台资源层直接处理。
 
-官方前端仓库：<https://github.com/cloudreve/frontend>。注意——
+获取顺序（自动化，不用手动操作）：
 
-> 上游 `.gitmodules` 把 `assets` 指向这个仓库，**固定的提交是
-> `19da0fe1ecd40971fafa813983d769fdce41573c`，它在 `master` 分支上**
-> （该仓库没有 `v4` 分支）。建议 checkout 到这个提交，而不是跟 `master` 的最新，
-> 否则前端可能与 v4.14.0 的后端契约对不上。
+1. `frontend/` 已存在就直接复用；
+2. 本仓库 Release（tag `frontend-assets`）里的预构建包，秒级；
+3. 都没有就拉上游源码（固定提交 `19da0fe1ecd40971fafa813983d769fdce41573c`，
+   与上游 `.gitmodules` 一致），在构建机上 yarn install + vite build，约 3-5 分钟。
 
-```bash
-# 在 edge/ 外面找个地方
-git clone https://github.com/cloudreve/frontend.git
-cd frontend
-git checkout 19da0fe1ecd40971fafa813983d769fdce41573c
-yarn install
-yarn run build          # 产物在 ./build
-```
+想换前端版本：改 `scripts/fetch-frontend.mjs` 顶部的 `COMMIT` 常量。
+注意别跟到 `master` 最新 —— 前端可能和 v4.14.0 的后端契约对不上。
 
-> 用的是 **yarn**，不是 npm/pnpm —— 这是上游 `.build/build-assets.sh` 里的方式。
-> 构建前设 `NODE_OPTIONS="--max-old-space-size=8192"`，上游脚本就是这么做的，
-> 否则大项目容易内存溢出。
+> 本机想手动构建也行（方式与上游 `.build/build-assets.sh` 一致）：
+> `git clone` 上游仓库 → checkout 到固定提交 → `NODE_OPTIONS="--max-old-space-size=8192" yarn install && yarn run build`
+> → 把 `build/` 拷到 `edge/frontend`。用 yarn，不用 npm/pnpm。
 
-### 方案 A：随 Worker 一起发布（推荐）
+### 方案 A：随 Worker 一起发布（默认，推荐）
 
-```bash
-cp -r build ../edge/frontend
-```
-
-然后在 `wrangler.toml` 里取消这段的注释：
+什么都不用做。`[assets]` 已在 `wrangler.toml` 里启用：
 
 ```toml
 [assets]
@@ -236,21 +229,23 @@ not_found_handling = "single-page-application"
 run_worker_first = ["/api/*", "/s/*", "/f/*"]
 ```
 
-方案 A 不需要配 `FRONTEND_URL`，不配就不反代，请求全走静态资源。
+方案 A 不需要配 `FRONTEND_URL`，请求全走随 Worker 发布的静态资源。
 
 > `run_worker_first` 是关键：它保证 `/api/*`、`/s/*`（分享短链）、`/f/*`（文件直链）
 > 优先交给 Worker，其余路径走静态资源与 SPA 回落。漏了它前端路由会 404。
 
 ### 方案 B：前端单独部署
 
-前端部署到 Cloudflare Pages（或任何静态托管）后：
+前端部署到 Cloudflare Pages（或任何静态托管）后，在面板环境变量（或 `wrangler.toml`
+的 `[vars]`）里加：
 
 ```toml
 [vars]
 FRONTEND_URL = "https://your-frontend.pages.dev"
 ```
 
-Worker 会把所有非 `/api` 请求原样反代过去。**不要**同时配 `[assets]`。
+`FRONTEND_URL` 的优先级高于内置静态资源，非 `/api` 请求会原样反代过去。
+后端代码同样不需要改。
 
 > 前端构建时要让它自己的 API 基址为空（默认就是同源相对路径），否则会指向错误的域名。
 
