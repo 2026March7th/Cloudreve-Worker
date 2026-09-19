@@ -1,5 +1,5 @@
 {
-  "name": "cloudreve-edge",
+  "name": "cloudreve-worker",
   "version": "4.14.0",
   "private": true,
   "description": "Cloudreve v4 backend reimplemented for Cloudflare Workers (KV + Neon + R2/OneDrive)",

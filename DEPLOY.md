@@ -12,9 +12,22 @@
 
 3. 部署页里把 `DATABASE_URL` 填成第 1 步的连接串，其余保持默认，点 **Deploy**。
    KV、R2 由 Cloudflare 自动创建；**建表和初始化在首次打开站点时自动完成**，没有任何命令要跑。
-4. 打开 Worker 地址（`https://cloudreve-edge.<你的子域>.workers.dev`），注册第一个账号 —— **第一个注册的用户自动是管理员**。
+4. 打开 Worker 地址（`https://cloudreve-worker.<你的子域>.workers.dev`），注册第一个账号 —— **第一个注册的用户自动是管理员**。
 5. 收尾：Cloudflare 面板 → 你的 Worker → 设置 → 变量，把 `SITE_URL` 改成这个 Worker 地址。
 6. 前端接入见第 5 节（同样只需要浏览器）。
+
+### 不用按钮，在 Cloudflare 面板手动接仓库
+
+Cloudflare 面板 → Workers & Pages → Create → 选你 fork 的仓库，只需要填两格：
+
+| 框 | 填什么 |
+|---|---|
+| **构建命令**（Build command） | `npm install` |
+| **部署命令**（Deploy command） | `npx wrangler deploy` |
+
+输出目录 / 根目录：留空。然后到 Worker 的 **设置 → 变量与机密** 里添加
+`DATABASE_URL`（类型选 Secret，值是 Neon 连接串），保存后重新部署一次即可。
+KV 和 R2 会按 `wrangler.toml` 自动创建，**占位 ID 不用改**。
 
 ---
 
@@ -71,11 +84,11 @@ id = "上一步拿到的 id"
 > 预览命名空间（`--preview`）填进去。
 
 ```bash
-npx wrangler r2 bucket create cloudreve-edge
+npx wrangler r2 bucket create cloudreve-worker
 ```
 
 桶名要和 `wrangler.toml` 里 `[[r2_buckets]] bucket_name` 一致（默认就是
-`cloudreve-edge`）。**不需要改绑定的名称** `binding = "R2"`，代码按这个名字取。
+`cloudreve-worker`）。**不需要改绑定的名称** `binding = "R2"`，代码按这个名字取。
 
 ---
 

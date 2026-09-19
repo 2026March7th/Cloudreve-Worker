@@ -1,5 +1,5 @@
 #:schema node_modules/wrangler/config-schema.json
-name = "cloudreve-edge"
+name = "cloudreve-worker"
 main = "src/index.ts"
 compatibility_date = "2025-01-01"
 compatibility_flags = ["nodejs_compat"]
@@ -20,7 +20,7 @@ fallthrough = true
 [vars]
 # 站点对外地址，用于生成分享短链 / 下载直链 / 回调地址。
 # 部署完成后在 Cloudflare 面板 → 设置 → 变量里改成你的真实地址，
-# 例如 https://cloudreve-edge.<你的子域>.workers.dev
+# 例如 https://cloudreve-worker.<你的子域>.workers.dev
 SITE_URL = ""
 # 官方前端的地址。**只在没有配置 [assets] 时才需要填**：
 # 填了就把非 /api 的请求原样反代过去（前端可独立部署在 Pages 等）。
@@ -41,7 +41,7 @@ preview_id = "REPLACE_WITH_YOUR_KV_PREVIEW_ID"
 
 [[r2_buckets]]
 binding = "R2"
-bucket_name = "cloudreve-edge"
+bucket_name = "cloudreve-worker"
 
 # ---------------------------------------------------------------------------
 # 可选的 R2 公共访问域名，用于生成不带签名的直链

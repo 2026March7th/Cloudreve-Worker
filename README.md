@@ -1,39 +1,52 @@
-# Cloudreve Edge
+# Cloudreve-Worker
 
-把 Cloudreve v4 的后端**重写**成一套可跑在 Cloudflare Workers 上的 TypeScript 实现
-（不是编译、不是移植二进制 —— Go 跑不了 Workers）。
+把 Cloudreve v4 的后端**重写**成可跑在 Cloudflare Workers 上的 TypeScript 实现
+（不是编译、不是移植 —— Go 跑不了 Workers）。
 
-- **只做后端。** 前端 100% 使用[官方前端](https://github.com/cloudreve/frontend)，
-  本项目不含任何自研前端代码。
-- **数据面**：Neon Postgres（元数据）+ Cloudflare KV（会话/上传会话状态/设置缓存）
-  + Cloudflare R2 或 OneDrive（文件本体）。
-- **对象存储**：内置 `r2` 策略类型，直接走 Worker 的 R2 绑定；另有完整的 OneDrive
-  （Microsoft Graph）驱动，含全球版与世纪互联两套 OAuth 端点。
-- 与上游 v4.14.0 的接口契约、错误码、字段名逐条对齐（见下文「对齐方式」）。
-
-> 本项目是 Cloudreve 的衍生作品，沿用上游的 **GPL-3.0** 许可（见 `LICENSE`）。
-> 上游版权归 Cloudreve 项目及其贡献者所有。
+- 前端 100% 使用[官方前端](https://github.com/cloudreve/frontend)，本项目只做后端
+- 元数据存 Neon Postgres，文件本体存 R2 或 OneDrive，会话/缓存用 KV
+- 与上游 v4.14.0 的接口契约、错误码、字段名逐条对齐，官方前端不需要任何修改
+- 沿用上游的 GPL-3.0 许可，上游版权归 Cloudreve 项目及其贡献者所有
 
 ---
 
-## 1. 它是什么 / 不是什么
+## 一键部署
 
-| | |
+全程手机浏览器可完成，不需要本机装任何东西：
+
+1. 打开 [neon.tech](https://neon.tech) 注册（可用 GitHub 登录），新建项目，复制首页的 **Connection string**（`postgresql://...` 那串）。
+2. 点部署按钮：
+
+   [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/LegspCpd/Cloudreve-Worker)
+
+3. 部署页把 `DATABASE_URL` 填成第 1 步的连接串，点 **Deploy**。KV 和 R2 自动创建，建表和初始化在**首次打开站点时自动完成**。
+4. 打开 Worker 地址，注册第一个账号 —— **第一个注册的用户自动是管理员**。
+5. 收尾：Worker 设置 → 变量，把 `SITE_URL` 改成这个 Worker 地址。
+
+### 不用按钮，在面板手动接 fork 的仓库
+
+Workers & Pages → Create → 选仓库，只填两格：
+
+| 框 | 命令 |
 |---|---|
-| ✅ 是 | 一个**独立的 Cloudreve v4 后端实现**，API 与官方前端兼容，可部署到 Cloudflare 免费/付费套餐 |
-| ✅ 是 | 单节点、无状态（状态都在 Neon / KV / R2 里），可以水平扩容 |
-| ❌ 不是 | 上游仓库的分支或补丁，不共用任何代码 |
-| ❌ 不是 | 上游数据库的直读实现 —— 用的是自建的等价 schema（见 `migrations/0001_init.sql`） |
-| ❌ 不是 | 完整功能对等。**未实现的功能见第 4 节**，请先读完再决定是否适用 |
+| **构建命令** | `npm install` |
+| **部署命令** | `npx wrangler deploy` |
 
-### 为什么不是「把 Go 编译成 WASM」
+输出目录留空。然后到 **设置 → 变量与机密** 添加 `DATABASE_URL`，保存后重新部署一次。KV 和 R2 按 `wrangler.toml` 自动创建，不用改任何 ID。
 
-Workers 的 isolate 模型不支持长驻进程、原生 socket、任意文件系统访问；Cloudreve 后端
-重度依赖 ent ORM、本地缓存、队列任务与多节点 RPC。可行的路线只有重写。
+## 环境变量
 
----
+| 变量 | 必填 | 说明 |
+|---|---|---|
+| `DATABASE_URL` | ✅ | Neon 连接串（Secret 类型）。在 [neon.tech](https://neon.tech) 建项目后复制 |
+| `SITE_URL` | 建议 | 站点对外地址，影响分享短链、邮件激活链接。默认空，部署后在面板里改成 Worker 地址 |
+| `JWT_SECRET` | 可选 | 令牌签名密钥（32 位以上随机串）。不设会自动生成并入库 |
+| `FRONTEND_URL` | 可选 | 官方前端单独部署在别处时才填，Worker 会把非 API 请求反代过去 |
+| `LOG_LEVEL` | 可选 | `debug` / `info` / `warn` / `error`，默认 `info` |
 
-## 2. 架构
+邮件、全文检索（Meilisearch + Tika）、存储策略等全部在**管理后台**配置，不占环境变量。详见 [DEPLOY.md](./DEPLOY.md)。
+
+## 架构
 
 ```
                     ┌──────────────────────────────────────────┐
@@ -50,263 +63,117 @@ Workers 的 isolate 模型不支持长驻进程、原生 socket、任意文件�
                               └────────┘
 ```
 
-### 关键设计取舍
+关键设计取舍：
 
-- **HTTP 驱动的 Postgres。** 用 `@neondatabase/serverless`，每条查询一个 HTTP 请求。
-  **没有事务** —— 上游用 `ent` 事务包裹的多步操作，这里改成「先做不可逆的、后做可逆的」
-  的顺序，失败时靠幂等重试兜底。这是本项目最大的语义偏离，见第 5 节。
-- **位集用 `bytea`。** `groups.permissions`、`dav_accounts.options` 等在原版是
-  `boolset.BooleanSet`（Go 的 `[]byte`），JSON 序列化成 base64。这里保持完全一致，
-  包括 **LSB-first** 的位序，否则权限会整片错位。
-- **软删除的回收站语义照抄上游。** 删除 = 把 `files.name` 改成随机 UUID
-  + `file_children` 置 NULL，真实路径写进 `sys:restore_uri` 元数据；
-  列表显示名取自该元数据的最后一段，恢复时靠它定位原目录。自动清理依据
-  `sys:expected_collect_time`，挂在 Worker 的 `scheduled()` 上（对应上游的
-  `trash_collector` 队列任务）。
-- **HashID 与 JWT 与上游同算法。** hashid salt、令牌前缀（`Bearer ` / `Bearer Cr `）、
-  scope 语义、`code` 错误码表全部逐字对齐，前端不需要任何适配。
+- **HTTP 驱动的 Postgres，没有事务。** 用 `@neondatabase/serverless`，每条查询一个 HTTP 请求。上游用事务包裹的多步操作，这里改成「先做不可逆的、后做可逆的」，失败靠幂等重试兜底。
+- **位集用 `bytea`。** 权限位集与上游 `boolset.BooleanSet` 的 base64 序列化完全一致（含 LSB-first 位序），否则权限会整片错位。
+- **回收站语义照抄上游。** 删除 = 文件行改名随机 UUID + 真实路径写进元数据；每小时 Cron 清理到期项。
+- **HashID / JWT / 错误码与上游同算法**，前端零适配。
 
 ---
 
-## 3. 对齐方式（怎么保证不出错）
+以下内容面向想深入了解或自己改代码的人。
 
-这个项目的原则是**任何契约都回源码核对，不凭印象**。落地方式：
+## 它是什么 / 不是什么
 
-- 错误码：`pkg/serializer/error.go` → `src/lib/errors.ts`（逐条抄，含 HTTP 复用码 401/403/404）
-- 路由：`routers/router.go` → `src/routes/*.ts`（含各端点的鉴权中间件要求）
-- 响应字段：`service/explorer/response.go` 等 → `src/services/*.ts` 的 `*Response` 接口，
-  JSON tag 就是 TS 字段名
-- 设置键：`inventory/setting.go` 的 `DefaultSettings` → `src/settings/defaults.ts`
-  （**键名一个都不能编**，前端会直接读）
-- schema：`ent/schema/*.go` → `migrations/0001_init.sql`（含 `StorageKey` 改写，
-  例如 `entities.props` 在库里叫 `recycle_options`）
-- 权限：`inventory/types/types.go` 的 `GroupPermission` → `src/lib/boolset.ts`
-- 导航/权限判定：`pkg/filemanager/fs/dbfs/*_navigator.go` → `src/services/fs.ts` 的
-  `resolveMy` / `resolveTrash` / `resolveShare` / `resolveSharedWithMe`
+| | |
+|---|---|
+| ✅ 是 | 一个**独立的 Cloudreve v4 后端实现**，API 与官方前端兼容，可部署到 Cloudflare 免费/付费套餐 |
+| ✅ 是 | 单节点、无状态（状态都在 Neon / KV / R2 里），可以水平扩容 |
+| ❌ 不是 | 上游仓库的分支或补丁，不共用任何代码 |
+| ❌ 不是 | 上游数据库的直读实现 —— 用的是自建的等价 schema（见 `migrations/0001_init.sql`） |
+| ❌ 不是 | 完整功能对等。**未实现的功能见下节**，请先读完再决定是否适用 |
 
----
+Workers 的 isolate 模型不支持长驻进程、原生 socket、任意文件系统访问；上游后端重度依赖 ent ORM、本地缓存、队列任务与多节点 RPC。可行的路线只有重写，这也是本仓库存在的原因。
 
-## 4. 功能实现状态
+## 功能实现状态
 
-判定口径是**官方前端会不会调到**：前端 `src/api/api.ts` 里每个 `send()` 调用就是一条契约，
-逐条核对后，edge 侧分三态 —— **已实现 / 返回 40019 的桩 / 路由根本不存在（404）**。
-桩是刻意保留的：不让前端拿到 404 后误判成「后端挂了」。
+判定口径是**官方前端会不会调到**：前端 `src/api/api.ts` 里每个 `send()` 调用就是一条契约。按 127 条前端契约统计：
 
-按 127 条前端契约统计：**已实现 101 条、桩 12 条、仍缺失 14 条**。
-这个数字可以随时复算：
-
-```bash
-python scripts/scan-frontend-contract.py <官方前端>/src/api src/routes .
-# 结果写进 _gap_result.txt
+```
+已实现 120 条    桩 7 条（返回 40019）    缺失 0 条
 ```
 
-下表列**尚未实现**的部分；已经补上的（两步验证、搜索、打包、后台文件管理）见后面一节。
+复算：`python scripts/scan-frontend-contract.py <官方前端>/src/api src/routes .`
 
-| 功能 | 端点 | 状态 |
-|---|---|---|
-| 浏览压缩包内容 | `GET /api/v4/file/archive` | 返回 40019。需要一个 ZIP **读取器**（含 inflate）；目前只实现了写入端 |
-| ~~全文搜索（FTS）~~ | `GET /api/v4/file/search`、`POST /api/v4/workflow/rebuildFtsIndex` | **已实现，与原版同构**：Meilisearch 建索引 + Tika 抽正文（两者都是 HTTP 服务，Workers 直接调用）。索引、分块、distinct、高亮、AI 向量检索的参数逐项对齐上游。需要在管理面板「文件系统 → 全文检索」里配 endpoint；**未配置时自动回落文件名匹配**，不会出现开了没反应 |
-| 事件推送（SSE） | `GET /api/v4/file/events` | 返回 40019 |
-| WOPI / 在线预览会话 | `/api/v4/file/wopi`、`PUT /api/v4/file/viewerSession` | 返回 40019 |
-| 上传回调（其它驱动） | `GET /api/v4/callback/*` | 返回 40019。remote / oss / upyun / cos / s3 / ks3 / obs / qiniu 都不实现 |
-| ~~WebDAV~~ | `/api/v4/devices/dav` 共 4 条 + `/dav` 协议路由 | **已实现**。账号 CRUD + 完整协议服务端（OPTIONS/PROPFIND/GET/HEAD/PUT/MKCOL/DELETE/MOVE/COPY/PROPPATCH/LOCK/UNLOCK），Basic Auth 走 `dav_accounts`，只读账号禁写。`share://` 账号暂不挂载（返回 403），LOCK 是 KV 简化锁 |
-| ~~两步验证（TOTP）~~ | `POST /api/v4/session/token/2fa` | **已实现**。RFC 6238 自实现（`src/lib/totp.ts`），与上游 `pquerna/otp` 参数逐项对齐 |
-| ~~Passkey / WebAuthn~~ | `PUT/POST /api/v4/session/authn`、`GET/POST/DELETE /api/v4/user/authn` | **已实现**。WebAuthn 服务端零依赖自实现（`src/lib/webauthn.ts`）：CBOR 解码、COSE 公钥（ES256/RS256/Ed25519）、rpIdHash/origin/challenge/签名/计数器全量校验，用真实密钥对做过协议级测试。受站点设置 `authn_enabled`（默认开）门控 |
-| ~~OAuth 应用授权~~ | `GET /api/v4/session/oauth/app/:id`、`POST /consent`、`POST /token`、`GET /userinfo`、`DELETE /grant/:id` | **已实现完整版**：授权码流程（redirect_uri 精确匹配、scope 子集校验、PKCE S256、授权码一次性）+ OIDC userinfo + 授权撤销，管理面板建的应用即可被第三方接入 |
-| 节点管理 | `/api/v4/admin/node/*` | **增删改查与连通性测试已实现**。对真实上游从节点的 ping 测试是真 HTTP 请求 + 同款 HMAC 签名（`Authorization: Bearer Cr`），aria2 下载器测试走真实 JSON-RPC。但边缘版任务不分派到节点（请求内同步跑完），节点配置仅作为兼容与扩展预留 |
-| ~~任务队列（打包 / 远程下载）~~ | `/api/v4/workflow/*` | **已实现，但口径不同**：原版投后台任务慢慢跑，边缘版**在请求内同步跑完**。打包把 zip 直接写进 `dst`；远程下载仅支持 HTTP(S) 直链。单次上限 200 MB，超限明确报错而不是建一个跑不完的任务。重建索引分批推进（每批 40 个，再点一次继续）。解压 / 导入仍是桩 |
-| ~~后台文件 / 实体 / 分享管理~~ | `/api/v4/admin/file/*`、`/admin/entity/*`、`/admin/share/*` | **已实现**（`src/routes/admin-content.ts`），带筛选、排序与分页 |
-| 缩略图生成 | `GET /api/v4/file/thumb` | 端点可用，但只**透传**存储驱动的缩略图能力；边缘版不做本地转码 |
-| 限速 | — | 未实现。`speed_limit`（组）与 `speed`（直链）字段被读取但**不生效**，URL 里的 `/speed/` 段仅作协议占位 |
-| 付费分享 | — | 完全没有。`CodePurchaseRequired` 等四个码保留定义但不会有路径返回 |
-| 文件锁 | `DELETE /api/v4/file/lock` | 直接返回成功（无锁实现） |
+### 已实现的主要功能
 
-### 已实现、但容易误判为「没实现」的几处
+文件管理与回收站、分享（密码/有效期/付费位）、上传下载（R2 + OneDrive，含分片与直传回调）、文件版本自动裁剪、两步验证（TOTP）、Passkey/WebAuthn（ES256/RS256/Ed25519）、WebDAV（账号 CRUD + 完整协议服务端）、OAuth2 授权码流程（PKCE + userinfo）、打包下载（流式 ZIP 入库）、远程下载（HTTP 直链）、全文检索（Meilisearch + Tika，与原版同构）、管理后台（用户/组/策略/文件/实体/分享/节点/OAuth 应用）、SMTP 邮件（激活/找回/测试发信）。
+
+### 未实现（7 个桩 + 几项明确说明）
 
 | 功能 | 端点 | 说明 |
 |---|---|---|
-| 两步验证（TOTP） | `GET /api/v4/user/setting/2fa`、`PATCH /api/v4/user/setting`、`POST /api/v4/session/token/2fa` | RFC 6238 自实现（`src/lib/totp.ts`），用官方测试向量验证过；密钥先暂存 KV `2fa_init_{uid}`，验码通过才写进账号 |
-| 远程下载 | `POST /api/v4/workflow/download` | 仅 HTTP(S) 直链；种子 / 磁力需要 aria2 从节点，不支持 |
-| 上传回调（OneDrive） | `POST /api/v4/callback/onedrive/:sid/:key` | OneDrive 是客户端直传，字节不经过 Worker，必须靠这个回调完成「实体转正 + 容量记账」 |
-| 文件版本管理 | `POST /api/v4/file/version/current`、`DELETE /api/v4/file/version` | 含 `extended_info.entities` 的可见性规则 |
-| 邮件（激活 / 找回密码 / 测试发信） | `POST /api/v4/user/reset`、`GET /api/v4/user/activate/:id`、`POST /api/v4/admin/tool/mail` | SMTP 协议自实现（`src/services/smtp.ts`），配置在管理后台，见第 5 节 |
+| 解压 / 浏览压缩包 | `POST /workflow/decompress`、`GET /file/archive` | 需要一个 ZIP 读取器（写入端已实现）；桩返回 40019 |
+| 从存储策略导入 | `POST /workflow/import` | 桩 |
+| 事件推送（SSE） | `GET /file/events` | 桩 |
+| WOPI / 在线预览会话 | `/file/wopi`、`/file/viewerSession` | 桩 |
+| 其它驱动上传回调 | `/callback/*`（remote/oss/cos/s3 等） | 只实现了 OneDrive 回调，其余桩 |
+| 缩略图 | `GET /file/thumb` | 只透传存储驱动的缩略图能力，不做本地转码 |
+| 限速 | — | 字段被读取但不生效 |
+| 付费分享 | — | 没有支付体系，相关错误码保留但不会有路径返回 |
+| 多节点分派 | `/admin/node/*` | 节点 CRUD 与连通性测试可用，但任务不分派到节点（请求内同步跑完） |
 
-### 前端会碰到的具体影响
+### 已实现、但与原版口径不同的几处
 
-- 官方前端的「解压」「浏览压缩包」「从存储策略导入」按钮会收到 40019。
-- 其余管理后台页面（文件 / 实体 / 分享 / 用户 / 用户组 / 存储策略 / OAuth 应用 / 节点）都可用，节点页是空列表。
+- **workflow 任务在请求内同步跑完**：原版投后台 goroutine 池慢慢跑，Workers 没有常驻进程。打包单次上限 200 MB，超限明确报错而不是建一个跑不完的任务。
+- **全文检索未配置时回落文件名匹配**：Meilisearch/Tika 是原版就要求的独立部署项，没配也能用搜索，只是搜不到正文。
+- **邮件的 `mail_keepalive` 不生效**：Workers 每次发信新建连接，字段留着只为兼容面板。
+- **`SITE_URL` 初始为空**：部署后到面板改成真实地址，否则分享链接指向错误主机。
 
-### 邮件怎么配：在管理后台，不在环境变量
+## 配置速查（详细步骤见 DEPLOY.md）
 
-进 **管理后台 → 设置 → 邮件**，填下面这几项。面板直接读写 `settings` 表，
-键名与上游一致，**不需要任何环境变量**：
+- **邮件**：管理后台 → 设置 → 邮件。Resend 填 `smtp.resend.com:465`，用户名 `resend`，密码是 API Key。⚠️ 端口 25 被 Workers 禁止，只能用 465 或 587。
+- **全文检索**：管理后台 → 文件系统 → 全文检索。填 Meilisearch 和 Tika 的地址，配好点「重建索引」；新上传的文件自动进索引。
+- **R2 直链**：给桶配自定义域后，加变量 `R2_PUBLIC_BASE`，直链就不走 Worker 中转。
+- **OneDrive**：策略里填 Azure 应用的 client_id / client_secret / refresh_token，server 域名决定走全球版还是世纪互联。
 
-| 面板字段 | 设置键 | 说明 |
-|---|---|---|
-| 发件人名称 | `fromName` | |
-| 发件人地址 | `fromAdress` | 上游的拼写错误，**别改**，改了面板就读不到 |
-| SMTP 服务器 | `smtpHost` | 例：`smtp.resend.com` |
-| SMTP 端口 | `smtpPort` | **只能用 465（SSL）或 587（STARTTLS）** |
-| SMTP 用户名 | `smtpUser` | Resend 填 `resend` |
-| SMTP 密码 | `smtpPass` | Resend 填 API Key（`re_` 开头） |
-| 回复地址 | `replyTo` | |
-| 强制 SSL | `smtpEncryption` | 打开则要求 TLS 必须成功，服务器不支持就直接报错 |
-| 连接保活 | `mail_keepalive` | 边缘版每次发信新建连接，不做连接池，这一项**不生效**，留着只为兼容面板 |
+## 有意为之的偏离（写在明处）
 
-填完点「发送测试邮件」—— 它会用**你当前表单里的值**（尚未保存也生效）真的发一封，
-这是判断配置对不对最快的方式。
+1. **没有数据库事务。** 原因见架构一节。副作用是极端并发下可能出现半完成状态，设计上尽量把不可逆操作排在最后。
+2. **第一个注册的用户自动进管理员组。** 原版靠 seed 脚本建管理员，云端部署没有这个机会。
+3. **新增了一个端点** `POST /api/v4/share/save/:id`（转存到自己的网盘）。原版官方前端的「保存到我的网盘」走符号目录，这条路径也已实现且行为对齐（符号目录不可遍历）；WebDAV 下看不到符号目录内容，需要转存请用新增端点。
+4. **版本管理只做自动裁剪。** `/file/version` 一族端点（查看/切回/手动删历史版本）返回 40019 —— 历史版本存着但看不到。
+5. **CORS 默认关闭**，与上游一致；前端与 Worker 同源时不需要开。
+6. **直链访问计数**与上游一致，但没做去重。
 
-用 Resend 时这样填：
+## 对齐方式（怎么保证不出错）
 
-| 字段 | 值 |
-|---|---|
-| SMTP 服务器 | `smtp.resend.com` |
-| SMTP 端口 | `465` |
-| SMTP 用户名 | `resend` |
-| SMTP 密码 | 你的 API Key（`re_` 开头） |
+原则是**任何契约都回源码核对，不凭印象**：
 
-发件人地址必须是**已在 Resend 验证过的域名**下的邮箱，否则会被服务商拒收。
+- 错误码：`pkg/serializer/error.go` → `src/lib/errors.ts`
+- 路由：`routers/router.go` → `src/routes/*.ts`
+- 响应字段：`service/*/response.go` 的 JSON tag → `src/services/*.ts` 的 `*Response` 接口
+- 设置键：`inventory/setting.go` → `src/settings/defaults.ts`（键名一个都不能编，前端会直接读）
+- schema：`ent/schema/*.go` → `migrations/0001_init.sql`
+- 权限：`inventory/types/types.go` 的 `GroupPermission` → `src/lib/boolset.ts`
 
-> ⚠️ **端口 25 用不了。** Cloudflare Workers 禁止出站连 25 端口（反滥用策略，官方文档
-> 写得很明确：`Connections to port 25 are prohibited`）。上游的默认值恰好就是 25，
-> 所以刚部署完什么都别改直接发信必然失败 —— 报错会直接告诉你改成 465 或 587。
+覆盖度用 `scripts/scan-frontend-contract.py` 自动比对官方前端与后端路由，方法论见 [docs/FRONTEND-CONTRACT-COVERAGE.md](./docs/FRONTEND-CONTRACT-COVERAGE.md)。
 
-「注册需邮件激活」由 `email_active` 控制（默认关闭）。打开后新注册用户状态是
-`inactive`，要先点邮件里的链接才能登录；此时若 SMTP 没配好，注册会返回 40028。
-
-### 全文检索怎么配
-
-进 **管理后台 → 文件系统 → 全文检索**，打开总开关，然后填两个外部服务的地址：
-
-| 面板字段 | 设置键 | 说明 |
-|---|---|---|
-| 总开关 | `fts_enabled` | 关闭时 `/file/search` 自动回落文件名匹配 |
-| Meilisearch 地址 | `fts_meilisearch_endpoint` | 例：`http://meilisearch:7700`，末尾的 `/` 会自动去掉 |
-| Meilisearch API Key | `fts_meilisearch_api_key` | 可留空（本地无鉴权实例） |
-| 每页结果数 | `fts_meilisearch_page_size` | 上游默认 5 |
-| AI 语义检索 | `fts_meilisearch_embed_enabled` | 对应上游 embedder（`cr-text`），配置 JSON 原样透传给 Meilisearch |
-| Tika 地址 | `fts_tika_endpoint` | 例：`http://tika:9998` |
-| 抽取扩展名 | `fts_tika_exts` | 上游默认 `pdf,doc,docx,xls,xlsx,ppt,pptx,odt,ods,odp,rtf,txt,md,html,htm,epub,csv` |
-| 抽取体积上限 | `fts_tika_max_file_size` | 上游默认 25 MB |
-| 分块大小 | `fts_chunk_size` | 上游默认 2000 字节 |
-
-配好之后点面板上的 **「重建索引」**：每次调用清空旧索引、推一批文件（40 个），
-文件多时再点一次就是继续 —— 任务列表里的进度条按真实进度走，不会假死。
-之后**新上传的文件自动进索引**（走 `waitUntil`，不拖慢上传响应），
-改名、删除、进回收站、恢复都会同步索引。
-
-这两个服务（Meilisearch / Tika）是原版就要求的独立部署项，不是边缘版新增的负担；
-原版怎么部署，边缘版就怎么连。
-
----
-
-## 5. 有意为之的偏离（写在明处）
-
-1. **没有数据库事务。** 原因见第 2 节「关键设计取舍」。副作用是极端并发下可能出现
-   半完成状态（例如实体已写、文件行未更新）。设计上尽量把「不可逆操作」排在最后。
-2. **新增了一个端点** `POST /api/v4/share/save/:id`（转存到自己的网盘，直接复制实体）。
-   原版没有独立转存端点，官方前端的「保存到我的网盘」走的是另一条路：
-   `POST /file/create` 建一个**符号目录**（`files.is_symbolic = true`），
-   metadata 带 `sys:shared_redirect = cloudreve://<shareHashid>@share`。
-   这条路径在边缘版也已实现（见 `src/services/fs.ts` 的 `create`）：
-   - create 时检测到该 metadata 就置 `is_symbolic`（对齐 `manager/operation.go:116-135`）；
-   - 符号目录**不可遍历**，`cloudreve://my/<符号目录>/...` 与直接列它都返回
-     403 `Symbolic folder cannot be walked into`（对齐 `dbfs/navigator.go:179-183, 241-243`）。
-   - ⚠️ 上游还实现了 `SharedAddressTranslation`（把符号目录映射到真实分享地址），
-     只有 WebDAV 调用它。边缘版的 WebDAV 沿用普通 API 的行为：符号目录不可遍历
-     （403）。也就是说通过 WebDAV 看不到「保存到我的网盘」的符号目录内容 ——
-     如果需要，就用上面那个新增端点转存成真实文件。
-3. **`groups.permissions` 的 `authn_enabled` 默认值已与上游对齐（`"1"`）。**
-   Passkey 实现落地后，站点设置 `authn_enabled` 默认开启，登录页会出现
-   Passkey 按钮；不想用就在管理后台把它关掉。
-4. **CORS 默认关闭。** 与上游一致：只有配置了 `CORS_ALLOW_ORIGINS` 才回 `ACAO` 头。
-   官方前端与 Worker 同源部署时不需要开。
-5. **版本管理只做自动裁剪，没做手动操作。** 覆盖写会新增版本实体，之后按用户的
-   版本保留策略裁剪（`version_retention` / `version_retention_max` / `version_retention_ext`，
-   默认保留 10 版，对齐上游 `CapEntities`）。被裁掉的实体会连同物理对象一起删除，
-   用户容量同步回冲。但 `/file/version` 一族端点（查看历史版本、切回旧版、手动删版）
-   未实现，返回 40019 —— 也就是说历史版本**存着但看不到**。
-6. **直链访问计数。** `GET /f/:id/:name` 会 `downloads += 1`，与上游一致；
-   但边缘版不做 `UniqueRedirectDirectLink` 去重。
-
----
-
-## 6. 快速开始
-
-### 6.1 一键部署（推荐，手机就能完成）
-
-全程只需要浏览器，不需要本机装任何东西：
-
-1. **建数据库**：打开 [neon.tech](https://neon.tech) 注册（可用 GitHub 登录），新建项目，复制首页的 **Connection string**（`postgresql://...` 开头的那串）。
-2. **点部署按钮**：
-
-   [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/LegspCpd/Cloudreve-Worker)
-
-3. 在部署页把 `DATABASE_URL` 填成第 1 步复制的连接串，其余保持默认，点 **Deploy**。KV 和 R2 会自动创建，建表和初始化**在首次打开站点时自动完成**。
-4. 部署完成后打开 Worker 地址（`https://cloudreve-edge.<你的子域>.workers.dev`），注册第一个账号 —— **第一个注册的用户自动是管理员**。
-5. 收尾：Cloudflare 面板 → 你的 Worker → 设置 → 变量，把 `SITE_URL` 改成这个 Worker 地址（分享链接、邮件激活链接会用到）。
-
-前端接入（把官方前端和后端拼到同一个域名下）见 DEPLOY.md 第 5 节，同样只需要浏览器操作。
-
-### 6.2 手工部署（CLI）
-
-```bash
-npm install
-npx wrangler kv namespace create KV          # 把返回的 id 填进 wrangler.toml
-npx wrangler r2 bucket create cloudreve-edge
-npx wrangler secret put DATABASE_URL         # Neon 连接串
-npm run deploy                               # 建表在首次请求时自动完成
-```
-
-`db:migrate` / `db:seed` 两个脚本仍然保留（见 `scripts/`），但正常部署**不需要**跑它们 —— Worker 首次请求会自动建表、播种系统用户组和默认存储策略。
-
-接入官方前端有两种方式（**推荐 A**），见 DEPLOY.md 第 5 节。
-
----
-
-## 7. 目录结构
+## 目录结构
 
 ```
 src/
   index.ts              Worker 入口：中间件、路由挂载、/s 与 /f、scheduled()
   env.ts                绑定与变量类型
   middleware/app.ts     请求上下文（设置 + 当前用户 + 仓储）
-  lib/
-    errors.ts           错误码表（对齐 pkg/serializer/error.go）
-    boolset.ts          权限位集 + GroupPermission 位号
-    response.ts         统一信封 {code, data, msg}
-    hashid.ts           HashID 编解码 [id, type]
-    jwt.ts              HS256 令牌
-    sign.ts             HMAC URL 签名（Cr 前缀）
-    crypto.ts           sha256 / base64 / 随机串
-    sysmeta.ts          sys:* 元数据键
+  lib/                  errors / boolset / response / hashid / jwt / sign /
+                        crypto / sysmeta / totp / webauthn / zip
   db/
-    index.ts            Neon 连接
     provision.ts        冷启动自动建表 + 播种系统数据（首次请求时执行）
     repo.ts             各表仓储（SQL 都在这）
-    types.ts            行类型（BIGINT 已归一化成 number）
-  services/
-    context.ts          AppContext：权限、容量、策略解析
-    fs.ts               文件系统（四种 navigator 合并实现）
-    share.ts            分享
-    share-rules.ts      分享有效性判定（fs 与 share 共用）
-    user.ts / upload.ts / download.ts / uri.ts / savepath.ts
-  storage/
-    index.ts            驱动工厂
-    r2.ts / onedrive.ts / types.ts
-  settings/
-    defaults.ts         设置默认值（对齐 inventory/setting.go）
-    provider.ts         读取 + KV 缓存 + 冷启动自举
-  routes/
-    site / session / user / file / share / admin
-migrations/0001_init.sql
-scripts/migrate.mjs    执行 migrations/*.sql
-scripts/seed.mjs       三个系统用户组 + 默认策略 + 管理员
+    types.ts            行类型
+  services/             fs / share / user / upload / download / oauth /
+                        passkey / search / workflow / mail / smtp
+  storage/              r2 / onedrive 驱动
+  settings/             defaults（对齐上游）+ provider（KV 缓存）
+  routes/               site / session / user / file / share / admin /
+                        admin-content / devices / dav / workflow / callback
+migrations/*.sql        建表脚本（首次请求自动执行）
+scripts/                migrate / seed / 验证脚本
 ```
 
----
-
-## 8. 开发
+## 开发
 
 ```bash
 npm run typecheck     # tsc --noEmit
@@ -314,13 +181,8 @@ npm run build         # wrangler deploy --dry-run --outdir=dist
 npm run dev           # 本地 wrangler dev
 ```
 
-本地调试把机密写进 `.dev.vars`（已被 `.gitignore` 排除）：
+本地调试把机密写进 `.dev.vars`（已被 `.gitignore` 排除），参考 `.dev.vars.example`。
 
-```
-DATABASE_URL="postgresql://..."
-JWT_SECRET="..."
-```
-
-## 9. 许可
+## 许可
 
 GPL-3.0，与上游 Cloudreve 一致。详见 `LICENSE`。
