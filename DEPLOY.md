@@ -1,5 +1,23 @@
 # 部署手册
 
+> **只想快点用上、手边没有电脑？** 走下面的一键部署，全程手机浏览器可完成；
+> 后面的 CLI 手册留给想精细控制的人。
+
+## 一键部署（推荐，手机可完成）
+
+1. 打开 [neon.tech](https://neon.tech) 注册（可用 GitHub / Google 登录），新建项目，复制首页的 **Connection string**（`postgresql://...` 那串）。
+2. 打开一键部署按钮：
+
+   [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/LegspCpd/Cloudreve-Worker)
+
+3. 部署页里把 `DATABASE_URL` 填成第 1 步的连接串，其余保持默认，点 **Deploy**。
+   KV、R2 由 Cloudflare 自动创建；**建表和初始化在首次打开站点时自动完成**，没有任何命令要跑。
+4. 打开 Worker 地址（`https://cloudreve-edge.<你的子域>.workers.dev`），注册第一个账号 —— **第一个注册的用户自动是管理员**。
+5. 收尾：Cloudflare 面板 → 你的 Worker → 设置 → 变量，把 `SITE_URL` 改成这个 Worker 地址。
+6. 前端接入见第 5 节（同样只需要浏览器）。
+
+---
+
 从零到能登录，一共 6 步。全程只需要 `wrangler` 和一个 Neon 账号。
 
 > 前置条件：Node 20+、一个 Cloudflare 账号、一个 Neon 账号（免费档够用）。
@@ -94,6 +112,12 @@ npx wrangler r2 bucket create cloudreve-edge
 ---
 
 ## 4. 建表 + 初始化
+
+> **这一步通常可以跳过。** Worker 首次收到请求时会自动建表、播种三个系统用户组
+> 和默认存储策略（见 `src/db/provision.ts`），幂等且并发安全。下面的脚本只在
+> 想看每条语句的执行结果、或要在本机调试时才有用。
+>
+> 管理员账号也不再需要 seed：**第一个注册的用户自动进管理员组**。
 
 这两步在**本机**跑（连的是同一个 Neon 库），脚本会读取 `DATABASE_URL` 环境变量，
 或者 `edge/.dev.vars` 文件。

@@ -7,6 +7,6 @@
 -- =============================================================================
 
 ALTER TABLE nodes DROP COLUMN IF EXISTS status;
-ALTER TABLE nodes ADD  COLUMN status TEXT NOT NULL DEFAULT 'active';
+ALTER TABLE nodes ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active';
 
 ALTER TABLE nodes ADD COLUMN IF NOT EXISTS settings JSONB NOT NULL DEFAULT '{}'::jsonb;

@@ -352,11 +352,20 @@ export class UserService {
     }
 
     const digest = await digestPassword(password);
+
+    // 第一个注册的用户进管理员组。原版靠 CLI seed 建管理员账号；边缘版的
+    // 部署路径是「云端一键部署、不碰本机」，没有机会预设密码，所以采用
+    // 「先到先得」：站点无用户时，注册即管理员。之后注册的仍按 default_group。
+    const groupId =
+      (await this.ctx.users.isEmpty())
+        ? 1 // Admin 组（seed 与上游 application/migrator 的约定一致）
+        : this.ctx.settings.defaultGroupId;
+
     const user = await this.ctx.users.create({
       email: normalized,
       nick: normalized.split('@')[0] ?? normalized,
       passwordDigest: digest,
-      groupId: this.ctx.settings.defaultGroupId,
+      groupId,
       status: needActivation ? 'inactive' : 'active',
       language,
     });

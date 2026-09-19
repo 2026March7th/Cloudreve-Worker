@@ -1,0 +1,7 @@
+# 「Deploy to Cloudflare」按钮会读取这个文件，在部署页逐项让你填写。
+# 只有机密才放这里；非机密变量在 wrangler.toml 的 [vars] 里。
+
+# Neon Postgres 连接串（必填）。
+# 获取方式：https://neon.tech 注册 → 新建项目 → Dashboard 首页复制
+# "Connection string"（形如 postgresql://user:pass@ep-xxx.aws.neon.tech/neondb?sslmode=require）
+DATABASE_URL=

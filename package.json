@@ -21,5 +21,18 @@
     "@cloudflare/workers-types": "^4.20241218.0",
     "typescript": "^5.7.2",
     "wrangler": "^3.99.0"
+  },
+  "cloudflare": {
+    "bindings": {
+      "DATABASE_URL": {
+        "description": "**必填**。Neon Postgres 连接串：在 [neon.tech](https://neon.tech) 注册并新建项目后，从 Dashboard 复制 Connection string（形如 `postgresql://user:pass@ep-xxx.aws.neon.tech/neondb?sslmode=require`）。"
+      },
+      "KV": {
+        "description": "会话吊销名单、上传会话状态、验证码缓存。保持默认即可，部署时自动创建。"
+      },
+      "R2": {
+        "description": "文件本体存储（内置 r2 存储策略）。保持默认即可，部署时自动创建。"
+      }
+    }
   }
 }

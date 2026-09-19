@@ -23,6 +23,7 @@ import { appContext, ctxOf, type AppBindings } from './middleware/app';
 import { fail, ok } from './lib/response';
 import { AppError, CodeNotFound } from './lib/errors';
 import { ensureSettings, loadSettings } from './settings/provider';
+import { provision } from './db/provision';
 import { HashIDCodec } from './lib/hashid';
 import { JWTService } from './lib/jwt';
 import { AppContext } from './services/context';
@@ -40,7 +41,7 @@ import { DownloadService } from './services/download';
 import { FileSystemService } from './services/fs';
 import { ShareService } from './services/share';
 
-const BOOTSTRAP_FLAG = 'bootstrap:done:v1';
+const BOOTSTRAP_FLAG = 'bootstrap:done:v2';
 
 const app = new Hono<AppBindings>();
 
@@ -49,12 +50,14 @@ const app = new Hono<AppBindings>();
 // ---------------------------------------------------------------------------
 
 app.use('*', async (c, next) => {
-  // 冷启动自举：补齐设置表、生成 siteID / secret_key / hash_id_salt。
-  // 用 KV 标记避免每个请求都打一次数据库。
+  // 冷启动自举：自动建表、播种系统组与默认策略、补齐设置表。
+  // 三件事都幂等，用 KV 标记避免每个请求都打一遍数据库。
+  // 这样部署完直接打开站点就能用 —— 不需要本机跑 migrate / seed。
   const bootstrapped = await c.env.KV.get(BOOTSTRAP_FLAG);
   if (!bootstrapped) {
+    await provision(c.env);
     await ensureSettings(c.env);
-    await c.env.KV.put(BOOTSTRAP_FLAG, '1', { expirationTtl: 86400 });
+    await c.env.KV.put(BOOTSTRAP_FLAG, '1');
   }
   await next();
 });

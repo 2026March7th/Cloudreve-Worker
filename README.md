@@ -233,25 +233,32 @@ python scripts/scan-frontend-contract.py <官方前端>/src/api src/routes .
 
 ## 6. 快速开始
 
-完整步骤见 **[DEPLOY.md](./DEPLOY.md)**。最短路径：
+### 6.1 一键部署（推荐，手机就能完成）
+
+全程只需要浏览器，不需要本机装任何东西：
+
+1. **建数据库**：打开 [neon.tech](https://neon.tech) 注册（可用 GitHub 登录），新建项目，复制首页的 **Connection string**（`postgresql://...` 开头的那串）。
+2. **点部署按钮**：
+
+   [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/LegspCpd/Cloudreve-Worker)
+
+3. 在部署页把 `DATABASE_URL` 填成第 1 步复制的连接串，其余保持默认，点 **Deploy**。KV 和 R2 会自动创建，建表和初始化**在首次打开站点时自动完成**。
+4. 部署完成后打开 Worker 地址（`https://cloudreve-edge.<你的子域>.workers.dev`），注册第一个账号 —— **第一个注册的用户自动是管理员**。
+5. 收尾：Cloudflare 面板 → 你的 Worker → 设置 → 变量，把 `SITE_URL` 改成这个 Worker 地址（分享链接、邮件激活链接会用到）。
+
+前端接入（把官方前端和后端拼到同一个域名下）见 DEPLOY.md 第 5 节，同样只需要浏览器操作。
+
+### 6.2 手工部署（CLI）
 
 ```bash
 npm install
-
-# 1. 建资源
 npx wrangler kv namespace create KV          # 把返回的 id 填进 wrangler.toml
 npx wrangler r2 bucket create cloudreve-edge
-
-# 2. 配机密（不要写进 wrangler.toml）
 npx wrangler secret put DATABASE_URL         # Neon 连接串
-
-# 3. 建表 + 初始化（本地跑，用同一个 DATABASE_URL）
-DATABASE_URL="postgresql://..." npm run db:migrate
-ADMIN_EMAIL=you@example.com ADMIN_PASSWORD='...' DATABASE_URL="postgresql://..." npm run db:seed
-
-# 4. 发布
-npm run deploy
+npm run deploy                               # 建表在首次请求时自动完成
 ```
+
+`db:migrate` / `db:seed` 两个脚本仍然保留（见 `scripts/`），但正常部署**不需要**跑它们 —— Worker 首次请求会自动建表、播种系统用户组和默认存储策略。
 
 接入官方前端有两种方式（**推荐 A**），见 DEPLOY.md 第 5 节。
 
@@ -275,6 +282,7 @@ src/
     sysmeta.ts          sys:* 元数据键
   db/
     index.ts            Neon 连接
+    provision.ts        冷启动自动建表 + 播种系统数据（首次请求时执行）
     repo.ts             各表仓储（SQL 都在这）
     types.ts            行类型（BIGINT 已归一化成 number）
   services/

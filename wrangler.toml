@@ -5,11 +5,23 @@ compatibility_date = "2025-01-01"
 compatibility_flags = ["nodejs_compat"]
 
 # ---------------------------------------------------------------------------
-# 变量（非机密）。机密请用 `wrangler secret put <NAME>` 写入，不要写在这里。
+# 把 migrations/*.sql 当文本打进包里 —— 首次请求时 Worker 自动建表，
+# 不需要本机跑任何迁移命令。见 src/db/provision.ts。
+# ---------------------------------------------------------------------------
+[[rules]]
+type = "Text"
+globs = ["**/*.sql"]
+fallthrough = true
+
+# ---------------------------------------------------------------------------
+# 变量（非机密）。机密（DATABASE_URL）不要写在这里 —— 它声明在
+# .dev.vars.example 里，「Deploy to Cloudflare」按钮会在部署页让你填。
 # ---------------------------------------------------------------------------
 [vars]
-# 站点对外地址，用于生成分享短链 / 下载直链 / 回调地址
-SITE_URL = "https://cloudreve-edge.example.workers.dev"
+# 站点对外地址，用于生成分享短链 / 下载直链 / 回调地址。
+# 部署完成后在 Cloudflare 面板 → 设置 → 变量里改成你的真实地址，
+# 例如 https://cloudreve-edge.<你的子域>.workers.dev
+SITE_URL = ""
 # 官方前端的地址。**只在没有配置 [assets] 时才需要填**：
 # 填了就把非 /api 的请求原样反代过去（前端可独立部署在 Pages 等）。
 # 如果按下面的 [assets] 把官方前端构建产物随 Worker 一起发布，这里留空即可。
@@ -18,18 +30,15 @@ FRONTEND_URL = ""
 LOG_LEVEL = "info"
 
 # ---------------------------------------------------------------------------
-# KV：会话黑名单、上传会话状态、验证码、实体 URL 缓存、OneDrive token 缓存
-# 创建：wrangler kv namespace create KV
+# KV / R2：**用「Deploy to Cloudflare」按钮部署时不用改这两个占位 ID** ——
+# 按钮会自动创建真实的 KV namespace 和 R2 bucket 并回填到你的仓库里。
+# 只有用 `wrangler deploy` 手工部署时才需要替换成真实 ID。
 # ---------------------------------------------------------------------------
 [[kv_namespaces]]
 binding = "KV"
 id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
 preview_id = "REPLACE_WITH_YOUR_KV_PREVIEW_ID"
 
-# ---------------------------------------------------------------------------
-# R2：文件本体存储（作为内置的 "r2" 存储策略使用）
-# 创建：wrangler r2 bucket create cloudreve-edge
-# ---------------------------------------------------------------------------
 [[r2_buckets]]
 binding = "R2"
 bucket_name = "cloudreve-edge"

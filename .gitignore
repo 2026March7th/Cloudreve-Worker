@@ -24,3 +24,4 @@ Thumbs.db
 *.log
 _gap.json
 _gap_result.txt
+_*.txt

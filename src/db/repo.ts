@@ -182,6 +182,12 @@ export class UserRepo {
     return rows[0] ? normalizeUser(rows[0]) : null;
   }
 
+  /** 站点是否还没有任何用户。第一个注册的用户会被提升为管理员。 */
+  async isEmpty(): Promise<boolean> {
+    const rows = (await this.sql`SELECT 1 FROM users WHERE deleted_at IS NULL LIMIT 1`) as unknown[];
+    return rows.length === 0;
+  }
+
   /**
    * 按关键字搜索活跃用户（nick / email 模糊匹配）。
    * 对应上游 `userClient.SearchActive`（inventory/user.go:467）。
