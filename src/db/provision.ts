@@ -111,8 +111,8 @@ async function seedSystemData(env: Env): Promise<void> {
     UniqueRedirectDirectLink: 17,
   } as const;
 
-  const GB = 1 << 30;
-  const TB = 1 << 40;
+  const GB = 1024 ** 3;
+  const TB = 1024 ** 4;
 
   const groups = [
     {
@@ -181,7 +181,11 @@ async function seedSystemData(env: Env): Promise<void> {
           INSERT INTO groups (id, name, max_storage, speed_limit, permissions, settings, storage_policy_id)
           VALUES (${group.id}, ${group.name}, ${group.maxStorage}, NULL, ${`\\x${hex}`}::bytea,
                   ${JSON.stringify(group.settings)}::jsonb, NULL)
-          ON CONFLICT (id) DO NOTHING
+          ON CONFLICT (id) DO UPDATE SET
+            name = EXCLUDED.name,
+            max_storage = EXCLUDED.max_storage,
+            permissions = EXCLUDED.permissions,
+            settings = EXCLUDED.settings
         `;
       }),
       // 让自增序列跟在手工指定的 id 之后，避免后续插入主键冲突

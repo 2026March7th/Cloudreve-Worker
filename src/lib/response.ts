@@ -64,7 +64,11 @@ export function fail(c: Context, err: unknown, status: 200 | 404 = 200): Respons
 
   const body: Envelope = { code, msg };
   if (raw !== undefined && raw !== null && !isProduction(c)) {
-    body.error = raw instanceof Error ? raw.message : String(raw);
+    // postgres.js 的错误带 detail（如 `Key (group_users)=(2) is not present in
+    // table "groups"`），拼进来才能从一次报错里直接定位数据问题。
+    const detail = (raw as { detail?: string })?.detail;
+    const base = raw instanceof Error ? raw.message : String(raw);
+    body.error = detail ? `${base} | ${detail}` : base;
   }
   const cid = c.get('correlationId');
   if (typeof cid === 'string' && cid) {

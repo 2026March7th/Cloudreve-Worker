@@ -42,7 +42,14 @@ import { DownloadService } from './services/download';
 import { FileSystemService } from './services/fs';
 import { ShareService } from './services/share';
 
-const BOOTSTRAP_FLAG = 'bootstrap:done:v2';
+/**
+ * 自举完成标记。**版本号要随「自举内容变化」递增**：KV 里的旧标记不会
+ * 自动失效，改了 provision / 播种逻辑后必须 bump，让存量部署在下一次
+ * 冷启动重跑一遍（全部幂等，代价是每 isolate 多跑一次 KV get + 标记命中后跳过）。
+ * v3：修正 groups 播种（1<<40 位运算 bug + ON CONFLICT DO UPDATE），并让
+ * 半播种的存量库（groups 缺行导致注册报外键错误）自愈。
+ */
+const BOOTSTRAP_FLAG = 'bootstrap:done:v3';
 /** 自举失败后的冷却键（20 秒 TTL）：期间请求直接快速失败，不再重放自举。 */
 const BOOTSTRAP_COOLDOWN = 'bootstrap:cooldown:v1';
 /** 同一 isolate 内的并发请求共享一次自举。 */

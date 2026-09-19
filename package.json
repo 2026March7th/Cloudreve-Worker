@@ -10,7 +10,8 @@
     "build": "node scripts/fetch-frontend.mjs && wrangler deploy --dry-run --outdir=dist",
     "typecheck": "tsc --noEmit",
     "db:migrate": "node scripts/migrate.mjs",
-    "db:seed": "node scripts/seed.mjs"
+    "db:seed": "node scripts/seed.mjs",
+    "smoke": "node scripts/smoke.mjs"
   },
   "dependencies": {
     "@neondatabase/serverless": "^0.10.4",
