@@ -246,6 +246,31 @@ async function seedSystemData(env: Env): Promise<void> {
       ON CONFLICT (guid) DO NOTHING
     `;
   }
+
+  // 数据修复：早期 PATCH /admin/settings 没解包 `settings` 键，前端「确认站点
+  // URL」弹窗提交的 `{settings: {siteURL: ...}}` 被当成名为 "settings" 的单条
+  // 设置存进了库。把这条脏行 JSON 里的键值还原成正经设置，再删掉脏行。
+  // 幂等：脏行删除后此查询恒空，不再有副作用。
+  const dirty = (await sql`
+    SELECT value FROM settings WHERE name = 'settings' AND deleted_at IS NULL LIMIT 1
+  `) as Array<{ value: string | null }>;
+  if (dirty[0]?.value) {
+    try {
+      const parsed = JSON.parse(dirty[0].value) as Record<string, unknown>;
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        for (const [k, v] of Object.entries(parsed)) {
+          if (typeof v !== 'string') continue;
+          await sql`
+            INSERT INTO settings (name, value) VALUES (${k}, ${v})
+            ON CONFLICT (name) DO UPDATE SET value = EXCLUDED.value, updated_at = now()
+          `;
+        }
+      }
+      await sql`DELETE FROM settings WHERE name = 'settings'`;
+    } catch {
+      // JSON 解析失败说明不是那次 bug 写入的行，保持不动
+    }
+  }
 }
 
 /** 冷启动入口：建表 + 播种。可安全重复调用（幂等 + KV 标记短路）。 */

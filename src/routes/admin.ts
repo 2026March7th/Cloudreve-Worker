@@ -86,7 +86,12 @@ adminRoutes.get('/summary', async (c) => {
   const generate = c.req.query('generate') === 'true' || c.req.query('generate') === '1';
 
   const version = { version: BACKEND_VERSION, pro: false, commit: 'edge' };
-  const siteUrls = ctx.settings.siteUrl ? [ctx.settings.siteUrl] : [];
+  // siteURL 设置值是**逗号分隔的 URL 列表**（前端 SiteUrlWarning 用
+  // urls.join(",") 提交、上游 siteUrlPreProcessor 按逗号切分），逐段拆开。
+  const siteUrls = ctx.settings.siteUrl
+    .split(',')
+    .map((u) => u.trim())
+    .filter(Boolean);
 
   if (!generate) {
     return ok(c, { site_urls: siteUrls, version } as never);
@@ -188,17 +193,26 @@ adminRoutes.post('/settings', async (c) => {
   return ok(c, out);
 });
 
-/** 修改设置 */
+/** 修改设置。请求体契约对齐上游 `SetSettingService`（service/admin/site.go:207）：
+ *  `{ settings: { <key>: <value> } }` —— 值嵌在 `settings` 键下，不是顶层。
+ *  之前直接遍历顶层键，前端 SiteUrlWarning 点「设为主要站点」发的
+ *  `{settings: {siteURL: ...}}` 会被当成一个名为 "settings" 的设置存进库，
+ *  siteURL 本身永远写不进去，确认弹窗因此每次刷新都重现。 */
 adminRoutes.patch('/settings', async (c) => {
   const ctx = ctxOf(c);
   const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
-  if (!body || typeof body !== 'object' || Object.keys(body).length === 0) {
+  // 兼容两种形态：上游标准 `{settings: {...}}` 与历史误用的平铺键值
+  const raw = (body && typeof body.settings === 'object' && body.settings !== null ? body.settings : body) as Record<
+    string,
+    unknown
+  >;
+  if (!raw || typeof raw !== 'object' || Object.keys(raw).length === 0) {
     return fail(c, Err.param('No settings provided'));
   }
 
   const sql = (await import('../db')).getSql(ctx.env);
   const updated: string[] = [];
-  for (const [key, value] of Object.entries(body)) {
+  for (const [key, value] of Object.entries(raw)) {
     // 密钥类字段禁止通过接口读回，但仍然允许写入
     const strValue = typeof value === 'string' ? value : JSON.stringify(value);
     await sql`

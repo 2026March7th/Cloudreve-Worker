@@ -50,9 +50,16 @@ export function paginationArgs(body: {
   page?: unknown;
   page_size?: unknown;
 }): { page: number; pageSize: number; offset: number } {
-  const page = Math.max(0, Number(body.page ?? 0) || 0);
+  // 前端请求体里的 page 是 **1 基**（上游 AdminListService binding min=1），
+  // 而上游 service 层统一 `Page: service.Page - 1` 传给 inventory，并以这个
+  // **0 基**值回填响应 `pagination.page`（service/admin/user.go:64、
+  // inventory/user.go:546）。之前这里漏了减 1，offset 直接 page*pageSize：
+  // 第一页从第 N+1 条开始 —— 只有一个用户时用户列表永远为空，且响应
+  // pagination.page 恒等于请求页码，前端 `setPage(page + 1)` 同步逻辑变成
+  // 无限循环（节点页 URL pages 一路累加）。这里集中做 1 基 → 0 基转换。
+  const page1 = Math.max(1, Math.floor(Number(body.page ?? 1)) || 1);
   const pageSize = Math.min(1000, Math.max(1, Number(body.page_size ?? 20) || 20));
-  return { page, pageSize, offset: page * pageSize };
+  return { page: page1 - 1, pageSize, offset: (page1 - 1) * pageSize };
 }
 
 /** 组装响应里的 `pagination`。 */

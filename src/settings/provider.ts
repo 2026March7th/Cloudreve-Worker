@@ -81,7 +81,12 @@ export class SettingsProvider {
     return this.get('siteTitle', 'Cloud storage for everyone');
   }
   get siteUrl(): string {
-    const configured = this.get('siteURL', '');
+    // siteURL 设置值是逗号分隔的 URL 列表（上游 siteUrlPreProcessor 契约），
+    // 拼直链 / 回调用第一个（主站点）。
+    const configured = this.get('siteURL', '')
+      .split(',')
+      .map((u) => u.trim())
+      .filter(Boolean)[0];
     return configured || this.env.SITE_URL || '';
   }
   get siteScript(): string {
