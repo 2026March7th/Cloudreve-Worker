@@ -1,0 +1,516 @@
+/**
+ * OneDrive 驱动（Microsoft Graph API）。
+ *
+ * 配置字段的对应关系严格按 Cloudreve v4 的 `onedrive/client.go`：
+ *   - `policy.server`        → Graph API 基址（如 https://graph.microsoft.com/v1.0）
+ *                              **并且**决定 OAuth 端点：host 为
+ *                              `microsoftgraph.chinacloudapi.cn` 时走世纪互联，
+ *                              否则走 global。
+ *   - `policy.settings.od_driver` → drive 资源段（`me/drive` 或 `sites/<id>/drive`），
+ *                              默认 `me/drive`。注意它**不**参与 OAuth 端点选择。
+ *   - `policy.bucket_name`   → OAuth client_id
+ *   - `policy.secret_key`    → OAuth client_secret
+ *   - `policy.access_key`    → **refresh_token**（原版就把 refresh token 存在这个字段）
+ *   - `policy.settings.od_redirect` → OAuth redirect_uri
+ *
+ * 上传走客户端直传：`createUploadSession` 返回的 `uploadUrl` 直接交给客户端，
+ * 分片由客户端 PUT 给微软，不经过 Worker。
+ */
+import type { Env } from '../env';
+import type { StoragePolicyRow } from '../db/types';
+import {
+  resolveChunkSize,
+  type DriverCapabilities,
+  type GetSourceArgs,
+  type ObjectContent,
+  type StorageDriver,
+  type UploadCredential,
+  type UploadRequest,
+  type UploadSession,
+  type UploadedPart,
+} from './types';
+
+const OAUTH_GLOBAL = {
+  token: 'https://login.microsoftonline.com/common/oauth2/v2.0/token',
+  authorize: 'https://login.microsoftonline.com/common/oauth2/v2.0/authorize',
+};
+const OAUTH_CHINA = {
+  token: 'https://login.chinacloudapi.cn/common/oauth2/v2.0/token',
+  authorize: 'https://login.chinacloudapi.cn/common/oauth2/v2.0/authorize',
+};
+
+const CHINA_GRAPH_HOST = 'microsoftgraph.chinacloudapi.cn';
+/** 单次简单上传上限（Graph 要求 ≤ 4MB） */
+const SIMPLE_UPLOAD_LIMIT = 4 * 1024 * 1024;
+/** access token 提前刷新余量（原版 AccessTokenExpiryMargin = 600 秒） */
+const TOKEN_EXPIRY_MARGIN = 600;
+/** $batch 单次最多 20 条请求（原版 BatchDelete 按 20 分组） */
+const BATCH_SIZE = 20;
+
+interface OAuthCredential {
+  access_token: string;
+  refresh_token: string;
+  /** 绝对过期时间（Unix 秒），与原版把相对秒数转绝对值的做法一致 */
+  expires_in: number;
+}
+
+/** 逐段编码路径；Cloudreve 的文件名校验已禁止 `:` `/` 等字符，这里主要处理空格与 `#`。 */
+function graphPath(path: string): string {
+  return path
+    .split('/')
+    .filter((s) => s.length > 0)
+    .map((s) => encodeURIComponent(s))
+    .join('/');
+}
+
+export class OneDriveDriver implements StorageDriver {
+  readonly type = 'onedrive';
+  readonly chunkSize: number;
+  readonly settings;
+  private readonly graphBase: string;
+  private readonly driveResource: string;
+  private readonly oauth: { token: string; authorize: string };
+  private readonly capacity = 0;
+
+  constructor(
+    private readonly env: Env,
+    readonly policy: StoragePolicyRow,
+  ) {
+    this.settings = policy.settings ?? {};
+    // Graph 基址去掉尾部斜杠
+    this.graphBase = (policy.server ?? 'https://graph.microsoft.com/v1.0').replace(/\/+$/, '');
+    this.driveResource = (this.settings.od_driver || 'me/drive').replace(/^\/+|\/+$/g, '');
+    this.chunkSize = resolveChunkSize(policy.settings, 50 << 20); // 原版默认 50MB
+
+    let host = '';
+    try {
+      host = new URL(this.graphBase).host;
+    } catch {
+      host = '';
+    }
+    this.oauth = host === CHINA_GRAPH_HOST ? OAUTH_CHINA : OAUTH_GLOBAL;
+  }
+
+  capabilities(): DriverCapabilities {
+    return {
+      // 下载走 @microsoft.graph.downloadUrl，需要 Worker 先换取一次直链
+      proxyRequired: this.settings.internal_proxy === true,
+      uploadSentinelRequired: true,
+      // 原版未设置 MaxSourceExpire，此处同样为 0（不限制）
+      maxSourceExpire: 0,
+      thumbSupportedExts: this.settings.thumb_exts ?? [],
+      thumbSupportAllExts: this.settings.thumb_support_all_exts === true,
+      thumbMaxSize: this.settings.thumb_max_size ?? 0,
+    };
+  }
+
+  // -------------------------------------------------------------------------
+  // OAuth
+  // -------------------------------------------------------------------------
+
+  private get credentialKey(): string {
+    return `cred_od_${this.policy.id}`;
+  }
+
+  /**
+   * 取可用的 access token。
+   * 命中 KV 缓存且未接近过期就直接用；否则用 refresh_token 换新的。
+   */
+  private async accessToken(): Promise<string> {
+    const cached = (await this.env.KV.get(this.credentialKey, 'json')) as OAuthCredential | null;
+    const now = Math.floor(Date.now() / 1000);
+    if (cached?.access_token && cached.expires_in - TOKEN_EXPIRY_MARGIN > now) {
+      return cached.access_token;
+    }
+    return (await this.refreshToken(cached?.refresh_token ?? this.policy.access_key ?? '')).access_token;
+  }
+
+  private async refreshToken(refreshToken: string): Promise<OAuthCredential> {
+    if (!refreshToken) {
+      throw new Error('OneDrive policy is missing a refresh token (policy.access_key)');
+    }
+    const body = new URLSearchParams({
+      client_id: this.policy.bucket_name ?? '',
+      client_secret: this.policy.secret_key ?? '',
+      redirect_uri: this.settings.od_redirect ?? '',
+      grant_type: 'refresh_token',
+      refresh_token: refreshToken,
+    });
+
+    const res = await fetch(this.oauth.token, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: body.toString(),
+    });
+
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      throw new Error(`Failed to refresh OneDrive token: ${res.status} ${text.slice(0, 300)}`);
+    }
+
+    const json = (await res.json()) as {
+      access_token: string;
+      refresh_token?: string;
+      expires_in: number;
+    };
+
+    const credential: OAuthCredential = {
+      access_token: json.access_token,
+      refresh_token: json.refresh_token || refreshToken,
+      expires_in: Math.floor(Date.now() / 1000) + (json.expires_in ?? 3600),
+    };
+
+    // 缓存到 KV；TTL 取「距过期还有 margin 秒」的下限 60 秒
+    const ttl = Math.max(60, credential.expires_in - TOKEN_EXPIRY_MARGIN - Math.floor(Date.now() / 1000));
+    await this.env.KV.put(this.credentialKey, JSON.stringify(credential), { expirationTtl: ttl });
+
+    return credential;
+  }
+
+  /** 生成授权 URL（后台配置策略时用）。 */
+  authorizeUrl(scopes: string[]): string {
+    const url = new URL(this.oauth.authorize);
+    url.searchParams.set('client_id', this.policy.bucket_name ?? '');
+    url.searchParams.set('scope', scopes.join(' '));
+    url.searchParams.set('response_type', 'code');
+    url.searchParams.set('redirect_uri', this.settings.od_redirect ?? '');
+    url.searchParams.set('state', String(this.policy.id));
+    return url.toString();
+  }
+
+  /** 用授权码换 token（后台 OAuth 回调时用）。 */
+  async exchangeCode(code: string): Promise<void> {
+    const body = new URLSearchParams({
+      client_id: this.policy.bucket_name ?? '',
+      client_secret: this.policy.secret_key ?? '',
+      redirect_uri: this.settings.od_redirect ?? '',
+      grant_type: 'authorization_code',
+      code,
+    });
+    const res = await fetch(this.oauth.token, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: body.toString(),
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      throw new Error(`Failed to exchange OneDrive code: ${res.status} ${text.slice(0, 300)}`);
+    }
+    const json = (await res.json()) as {
+      access_token: string;
+      refresh_token: string;
+      expires_in: number;
+    };
+    const credential: OAuthCredential = {
+      access_token: json.access_token,
+      refresh_token: json.refresh_token,
+      expires_in: Math.floor(Date.now() / 1000) + (json.expires_in ?? 3600),
+    };
+    const ttl = Math.max(60, credential.expires_in - TOKEN_EXPIRY_MARGIN - Math.floor(Date.now() / 1000));
+    await this.env.KV.put(this.credentialKey, JSON.stringify(credential), { expirationTtl: ttl });
+  }
+
+  // -------------------------------------------------------------------------
+  // 请求封装
+  // -------------------------------------------------------------------------
+
+  private url(api: string): string {
+    return `${this.graphBase}/${this.driveResource}/${api}`;
+  }
+
+  /** 带鉴权与 429 重试的 Graph 请求。 */
+  private async request(
+    method: string,
+    url: string,
+    init?: { body?: BodyInit; headers?: Record<string, string>; noAuth?: boolean },
+    retries = 2,
+  ): Promise<Response> {
+    const headers: Record<string, string> = { ...(init?.headers ?? {}) };
+    if (!init?.noAuth) {
+      headers['Authorization'] = `Bearer ${await this.accessToken()}`;
+    }
+    if (init?.body && !headers['Content-Type']) {
+      headers['Content-Type'] = 'application/json';
+    }
+
+    const res = await fetch(url, { method, headers, body: init?.body });
+
+    // 429 / 5xx 退避重试
+    if ((res.status === 429 || res.status >= 500) && retries > 0) {
+      const retryAfter = Number(res.headers.get('Retry-After') ?? '1');
+      await new Promise((r) => setTimeout(r, Math.min(5, Math.max(1, retryAfter)) * 1000));
+      return this.request(method, url, init, retries - 1);
+    }
+    return res;
+  }
+
+  // -------------------------------------------------------------------------
+  // 存储操作
+  // -------------------------------------------------------------------------
+
+  async token(session: UploadSession, file: UploadRequest): Promise<UploadCredential> {
+    const expires = Math.floor(session.expireAt / 1000);
+    const behavior = file.overwrite ? 'replace' : 'fail';
+
+    // 一律走 createUploadSession。原版 `onedrive/onedrive.go` 的上传流程就是这样：
+    // 直接开上传会话把 uploadUrl 交给客户端，没有「小文件先简单 PUT 一次」这一步。
+    const res = await this.request('POST', this.url(`root:/${graphPath(file.savePath)}:/createUploadSession`), {
+      body: JSON.stringify({ item: { '@microsoft.graph.conflictBehavior': behavior } }),
+    });
+
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      throw new Error(`Failed to create OneDrive upload session: ${res.status} ${text.slice(0, 300)}`);
+    }
+
+    const json = (await res.json()) as { uploadUrl: string };
+    session.uploadId = json.uploadUrl;
+
+    return {
+      session_id: session.id,
+      chunk_size: this.chunkSize,
+      expires,
+      upload_urls: [json.uploadUrl],
+      uploadID: json.uploadUrl,
+    };
+  }
+
+  /**
+   * 中转模式的写入。OneDrive 的正常路径是客户端直传，
+   * 只有当客户端拿不到 uploadUrl 时才会走到这里：此时按分片顺序
+   * 逐个 PUT 到 uploadUrl。
+   */
+  async writeChunk(
+    session: UploadSession,
+    index: number,
+    body: ReadableStream,
+    length: number,
+  ): Promise<UploadedPart | null> {
+    if (!session.uploadId) {
+      throw new Error('OneDrive upload session is missing an uploadUrl');
+    }
+    const start = index * session.chunkSize;
+    const end = start + length - 1;
+    const res = await fetch(session.uploadId, {
+      method: 'PUT',
+      headers: {
+        'Content-Length': String(length),
+        'Content-Range': `bytes ${start}-${end}/${session.size}`,
+      },
+      body,
+      // @ts-expect-error Workers 运行时需要 duplex 才能流式发送请求体
+      duplex: 'half',
+    });
+    if (!res.ok && res.status !== 202) {
+      const text = await res.text().catch(() => '');
+      throw new Error(`Failed to upload OneDrive chunk: ${res.status} ${text.slice(0, 300)}`);
+    }
+    return null;
+  }
+
+  /** 直接使用 uploadUrl 作为「分片地址」，由服务端顺序推送（备用路径）。 */
+  async completeUpload(session: UploadSession): Promise<void> {
+    if (!session.uploadId) return;
+    // createUploadSession 返回的 URL 本身就是上传入口，
+    // 收尾在最后一个分片 PUT 完成时由微软侧自动完成，这里只需清掉状态。
+    void session;
+  }
+
+  async cancelToken(session: UploadSession): Promise<void> {
+    if (!session.uploadId) return;
+    try {
+      await fetch(session.uploadId, {
+        method: 'DELETE',
+        // 该 URL 自带凭据，不需要再带 Authorization
+      });
+    } catch {
+      // ignore
+    }
+  }
+
+  async put(file: UploadRequest, body: ReadableStream, contentLength: number): Promise<void> {
+    const behavior = file.overwrite ? 'replace' : 'fail';
+    if (contentLength <= SIMPLE_UPLOAD_LIMIT) {
+      const res = await this.request(
+        'PUT',
+        this.url(`root:/${graphPath(file.savePath)}:/content`) +
+          `?@microsoft.graph.conflictBehavior=${behavior}`,
+        {
+          body: body as unknown as BodyInit,
+          headers: {
+            'Content-Type': file.mimeType || 'application/octet-stream',
+            'Content-Length': String(contentLength),
+          },
+        },
+      );
+      if (!res.ok) {
+        const text = await res.text().catch(() => '');
+        throw new Error(`Failed to upload to OneDrive: ${res.status} ${text.slice(0, 300)}`);
+      }
+      return;
+    }
+    // 大文件走上传会话后分片推送
+    const sessionRes = await this.request(
+      'POST',
+      this.url(`root:/${graphPath(file.savePath)}:/createUploadSession`),
+      { body: JSON.stringify({ item: { '@microsoft.graph.conflictBehavior': behavior } }) },
+    );
+    if (!sessionRes.ok) {
+      const text = await sessionRes.text().catch(() => '');
+      throw new Error(`Failed to create OneDrive upload session: ${sessionRes.status} ${text.slice(0, 300)}`);
+    }
+    const { uploadUrl } = (await sessionRes.json()) as { uploadUrl: string };
+    const reader = body.getReader();
+    let offset = 0;
+    try {
+      for (;;) {
+        const chunk = await readAtMost(reader, this.chunkSize);
+        if (chunk === null) break;
+        const end = offset + chunk.byteLength - 1;
+        const res = await fetch(uploadUrl, {
+          method: 'PUT',
+          headers: {
+            'Content-Length': String(chunk.byteLength),
+            'Content-Range': `bytes ${offset}-${end}/${file.size}`,
+          },
+          body: chunk,
+        });
+        if (!res.ok && res.status !== 202) {
+          const text = await res.text().catch(() => '');
+          throw new Error(`Failed to upload OneDrive chunk: ${res.status} ${text.slice(0, 300)}`);
+        }
+        offset += chunk.byteLength;
+      }
+    } finally {
+      reader.releaseLock();
+    }
+  }
+
+  async delete(sources: string[]): Promise<string[]> {
+    if (sources.length === 0) return [];
+    const failed: string[] = [];
+
+    for (let i = 0; i < sources.length; i += BATCH_SIZE) {
+      const batch = sources.slice(i, i + BATCH_SIZE);
+      // $batch 的 url 是相对 drive 资源的路径，需要转义
+      const requests = batch.map((path, idx) => ({
+        id: String(idx),
+        method: 'DELETE',
+        url: `/${this.driveResource}/root:/${graphPath(path)}`,
+      }));
+
+      const res = await this.request('POST', `${this.graphBase}/$batch`, {
+        body: JSON.stringify({ requests }),
+      });
+
+      if (!res.ok) {
+        failed.push(...batch);
+        continue;
+      }
+
+      const json = (await res.json()) as {
+        responses: { id: string; status: number }[];
+      };
+      for (const r of json.responses ?? []) {
+        // 404 视为已删除
+        if (r.status !== 204 && r.status !== 404) {
+          const original = batch[Number(r.id)];
+          if (original) failed.push(original);
+        }
+      }
+    }
+
+    return failed;
+  }
+
+  /** 取文件元信息（含 @microsoft.graph.downloadUrl）。 */
+  private async fileInfo(path: string): Promise<{
+    size: number;
+    downloadUrl?: string;
+  } | null> {
+    const res = await this.request(
+      'GET',
+      `${this.url(`root:/${graphPath(path)}`)}?expand=thumbnails`,
+    );
+    if (res.status === 404) return null;
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      throw new Error(`Failed to get OneDrive file info: ${res.status} ${text.slice(0, 300)}`);
+    }
+    const json = (await res.json()) as {
+      size: number;
+      '@microsoft.graph.downloadUrl'?: string;
+    };
+    return { size: json.size ?? 0, downloadUrl: json['@microsoft.graph.downloadUrl'] };
+  }
+
+  async meta(source: string): Promise<{ size: number } | null> {
+    const info = await this.fileInfo(source);
+    return info ? { size: info.size } : null;
+  }
+
+  async get(source: string, range?: string | null): Promise<ObjectContent | null> {
+    const info = await this.fileInfo(source);
+    if (!info?.downloadUrl) return null;
+    const res = await fetch(info.downloadUrl, {
+      headers: range ? { Range: range } : undefined,
+    });
+    if (!res.ok && res.status !== 206) return null;
+    return {
+      body: res.body as ReadableStream,
+      size: info.size,
+      contentType: res.headers.get('Content-Type') ?? undefined,
+      contentRange: res.headers.get('Content-Range'),
+    };
+  }
+
+  async source(source: string, _args: GetSourceArgs): Promise<string> {
+    // 原版实现即：取 @microsoft.graph.downloadUrl 直接返回（该链接自带短期凭据）
+    const info = await this.fileInfo(source);
+    if (!info?.downloadUrl) {
+      throw new Error(`OneDrive object not found: ${source}`);
+    }
+    return info.downloadUrl;
+  }
+
+  async thumb(source: string, size: string): Promise<string | null> {
+    const res = await this.request(
+      'GET',
+      this.url(`root:/${graphPath(source)}:/thumbnails/0/${size}`),
+    );
+    if (!res.ok) return null;
+    const json = (await res.json()) as { url?: string; value?: { url?: string }[] };
+    return json.url ?? json.value?.[0]?.url ?? null;
+  }
+}
+
+/**
+ * 从 ReadableStream 读取至多 maxBytes，返回 Uint8Array；流已结束返回 null。
+ * （避免把整个大文件读进内存）
+ */
+async function readAtMost(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  maxBytes: number,
+): Promise<Uint8Array<ArrayBuffer> | null> {
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+
+  while (total < maxBytes) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (value) {
+      chunks.push(value);
+      total += value.byteLength;
+    }
+  }
+
+  if (total === 0) return null;
+
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const c of chunks) {
+    out.set(c, offset);
+    offset += c.byteLength;
+  }
+  return out;
+}

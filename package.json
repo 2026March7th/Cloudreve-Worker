@@ -1,0 +1,25 @@
+{
+  "name": "cloudreve-edge",
+  "version": "4.14.0",
+  "private": true,
+  "description": "Cloudreve v4 backend reimplemented for Cloudflare Workers (KV + Neon + R2/OneDrive)",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "build": "wrangler deploy --dry-run --outdir=dist",
+    "typecheck": "tsc --noEmit",
+    "db:migrate": "node scripts/migrate.mjs",
+    "db:seed": "node scripts/seed.mjs"
+  },
+  "dependencies": {
+    "@neondatabase/serverless": "^0.10.4",
+    "hashids": "^2.3.0",
+    "hono": "^4.6.14"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20241218.0",
+    "typescript": "^5.7.2",
+    "wrangler": "^3.99.0"
+  }
+}

@@ -1,0 +1,368 @@
+# 部署手册
+
+从零到能登录，一共 6 步。全程只需要 `wrangler` 和一个 Neon 账号。
+
+> 前置条件：Node 20+、一个 Cloudflare 账号、一个 Neon 账号（免费档够用）。
+> 本手册里的命令都在 `edge/` 目录下执行。
+
+---
+
+## 0. 先想清楚两件事
+
+**① R2 要不要开？** R2 需要先在 Cloudflare 后台「同意 R2 服务条款」才能创建桶，
+免费额度是 10GB 存储 + 每月 100 万次 A 类操作。不想用 R2 就跳过第 2 步的建桶，
+改在部署完成后到管理后台加一个 OneDrive 存储策略。
+
+**② 前端放哪？** 两种方案，第 5 步二选一：
+
+| | 方案 A（推荐） | 方案 B |
+|---|---|---|
+| 做法 | 官方前端构建产物随 Worker 一起发布（`[assets]`） | 官方前端单独部署到 Cloudflare Pages，Worker 反代 |
+| 优点 | 天然同源，Cookie 与 `/api` 路径都不用操心；一个域名搞定 | 前后端可以分别更新 |
+| 缺点 | 改前端要重新发布 Worker | 要额外维护 `FRONTEND_URL`，跨域/回跳更容易出错 |
+
+下面按方案 A 走，方案 B 的差异在第 5 节注明。
+
+---
+
+## 1. 装依赖
+
+```bash
+cd edge
+npm install
+```
+
+---
+
+## 2. 建 KV 与 R2
+
+```bash
+npx wrangler kv namespace create KV
+```
+
+输出里会有一行 `id = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"`，把它填进 `wrangler.toml`
+的 `[[kv_namespaces]]`：
+
+```toml
+[[kv_namespaces]]
+binding = "KV"
+id = "上一步拿到的 id"
+```
+
+> `preview_id` 只影响 `wrangler dev` 的本地模拟，可以删掉那一行，也可以再建一个
+> 预览命名空间（`--preview`）填进去。
+
+```bash
+npx wrangler r2 bucket create cloudreve-edge
+```
+
+桶名要和 `wrangler.toml` 里 `[[r2_buckets]] bucket_name` 一致（默认就是
+`cloudreve-edge`）。**不需要改绑定的名称** `binding = "R2"`，代码按这个名字取。
+
+---
+
+## 3. 建 Neon 数据库并导出连接串
+
+1. 在 Neon 控制台新建一个项目（区域选离用户近的）。
+2. 进项目的 **Connection Details**，把 **Connection string** 复制出来，
+   形如：
+
+   ```
+   postgresql://neondb_owner:AbCdEf123@ep-cool-name-123456.ap-southeast-1.aws.neon.tech/neondb?sslmode=require
+   ```
+
+   > 用 **Pooler** 的连接串也可以，Worker 走的是 HTTP 驱动，不占连接数。
+   > 但**不要**去掉 `sslmode=require`。
+
+3. 存成 Worker 机密（**不要**写进 `wrangler.toml`，那会被提交到仓库）：
+
+   ```bash
+   npx wrangler secret put DATABASE_URL
+   # 粘贴上一步的连接串，回车
+   ```
+
+4. 顺便生成一个 JWT 密钥（可选但推荐）：
+
+   ```bash
+   npx wrangler secret put JWT_SECRET
+   # 粘贴一串 32 位以上的随机字符串
+   ```
+
+   > 不设也能跑：会回退到数据库里 `settings.secret_key` 的值（首次启动自动生成）。
+   > 显式设置的好处是刷新/吊销令牌时不完全依赖数据库可读性。
+
+---
+
+## 4. 建表 + 初始化
+
+这两步在**本机**跑（连的是同一个 Neon 库），脚本会读取 `DATABASE_URL` 环境变量，
+或者 `edge/.dev.vars` 文件。
+
+**方式一：临时环境变量（推荐）**
+
+```bash
+export DATABASE_URL="postgresql://...你刚才那条连接串..."
+
+npx tsx --version >/dev/null 2>&1 || true   # 忽略，只是提示 node 版本
+
+node scripts/migrate.mjs
+```
+
+**方式二：写 `.dev.vars`（本地调试也用得上）**
+
+```
+# edge/.dev.vars  —— 已被 .gitignore 排除，不会提交
+DATABASE_URL="postgresql://..."
+```
+
+```bash
+node scripts/migrate.mjs
+```
+
+`migrate.mjs` 会按文件名顺序执行 `migrations/*.sql`，每条语句打印 OK / FAIL。
+**遇到 FAIL 会立刻停下**，不会有半套 schema。
+
+预期输出（首次）：
+
+```
+>>> 0001_init.sql (N statements)
+    [1/N] OK  CREATE TABLE IF NOT EXISTS groups ...
+    ...
+Migration completed.
+```
+
+接着初始化基础数据：
+
+```bash
+ADMIN_EMAIL='you@example.com' ADMIN_PASSWORD='换成你自己的强密码' node scripts/seed.mjs
+```
+
+它会做四件事（都是幂等的，重复跑安全）：
+
+1. 补齐 `settings` 表缺失的键，并生成 `siteID` / `secret_key` / `hash_id_salt`；
+2. 建三个系统用户组：`#1 Admin`、`#2 User`、`#3 Anonymous`
+   （组 ID 与原版约定一致，**不能改**，`default_group = 2` 指的就是 #2）；
+3. 建默认存储策略 `R2 Default`（type = `r2`），并绑到 User 组；
+4. 建管理员账号（邮件 + 密码），密码摘要是 `<salt>:<sha256hex(password+salt)>`。
+
+> ⚠️ **不传 `ADMIN_PASSWORD` 就不会建管理员**，脚本只打印一句提示。
+> 建完一定要能登进去 —— 否则后面没法进管理后台。
+
+### 如果你的库是从原版 Cloudreve 迁过来的
+
+**不支持。** 边缘版用的是自建的等价 schema（列名/索引一致，但少了 6 张表、
+JSON 列类型不同、没有 ent 的 migration 记录表）。请用全新的库。
+
+---
+
+## 5. 接官方前端
+
+前端**只能用官方的**，本仓库不含任何前端代码。
+
+官方前端仓库：<https://github.com/cloudreve/frontend>。注意——
+
+> 上游 `.gitmodules` 把 `assets` 指向这个仓库，**固定的提交是
+> `19da0fe1ecd40971fafa813983d769fdce41573c`，它在 `master` 分支上**
+> （该仓库没有 `v4` 分支）。建议 checkout 到这个提交，而不是跟 `master` 的最新，
+> 否则前端可能与 v4.14.0 的后端契约对不上。
+
+```bash
+# 在 edge/ 外面找个地方
+git clone https://github.com/cloudreve/frontend.git
+cd frontend
+git checkout 19da0fe1ecd40971fafa813983d769fdce41573c
+yarn install
+yarn run build          # 产物在 ./build
+```
+
+> 用的是 **yarn**，不是 npm/pnpm —— 这是上游 `.build/build-assets.sh` 里的方式。
+> 构建前设 `NODE_OPTIONS="--max-old-space-size=8192"`，上游脚本就是这么做的，
+> 否则大项目容易内存溢出。
+
+### 方案 A：随 Worker 一起发布（推荐）
+
+```bash
+cp -r build ../edge/frontend
+```
+
+然后在 `wrangler.toml` 里取消这段的注释：
+
+```toml
+[assets]
+directory = "./frontend"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
+run_worker_first = ["/api/*", "/s/*", "/f/*"]
+```
+
+`[vars]` 里的 `FRONTEND_URL` 保持空字符串。
+
+> `run_worker_first` 是关键：它保证 `/api/*`、`/s/*`（分享短链）、`/f/*`（文件直链）
+> 优先交给 Worker，其余路径走静态资源与 SPA 回落。漏了它前端路由会 404。
+
+### 方案 B：前端单独部署
+
+前端部署到 Cloudflare Pages（或任何静态托管）后：
+
+```toml
+[vars]
+FRONTEND_URL = "https://your-frontend.pages.dev"
+```
+
+Worker 会把所有非 `/api` 请求原样反代过去。**不要**同时配 `[assets]`。
+
+> 前端构建时要让它自己的 API 基址为空（默认就是同源相对路径），否则会指向错误的域名。
+
+---
+
+## 6. 发布
+
+```bash
+npm run typecheck    # 可选，确认没有类型错误
+npm run deploy
+```
+
+成功后把 `[vars]` 里的 `SITE_URL` 改成真实域名再 `npm run deploy` 一次：
+
+```toml
+[vars]
+SITE_URL = "https://你的域名"
+```
+
+> `SITE_URL` 参与生成分享短链、下载直链、OneDrive OAuth 回调地址。
+> 留成 `example.workers.dev` 会让所有生成的链接都指向错误的主机。
+
+如果配了自定义域名，在 Cloudflare 后台 **Workers → 你的 Worker → Settings → Domains & Routes**
+里添加，然后在 `settings` 表里把 `siteURL` 也设成同一个域名
+（`siteURL` 优先于 `SITE_URL`，见 `src/settings/provider.ts` 的 `siteUrl`）。
+
+---
+
+## 7. 定时任务
+
+`wrangler.toml` 里已经有：
+
+```toml
+[triggers]
+crons = ["0 * * * *"]
+```
+
+每小时跑一次回收站清理（对应上游的 `trash_collector` 队列任务）。
+`npm run deploy` 会自动注册，不需要额外操作。
+
+---
+
+## 8. 验收清单
+
+按顺序验一遍，任何一步不对都别再往下走：
+
+1. `curl https://你的域名/api/v4/site/ping` → `{"code":0,...}`
+2. 打开首页，能看到官方前端的登录页（不是纯文本的「后端已就绪」提示）
+3. 用第 4 步建的管理员账号登录成功
+4. 新建一个文件夹、上传一个小文件、下载回来 —— 校验内容一致
+5. 建立分享链接（带密码），用一个浏览器隐身窗口打开，输入密码能访问
+6. 把文件删掉 → 回收站里能看到（显示的是原文件名，不是一串随机字符）→ 恢复成功
+7. 进管理后台，能看到用户列表与存储策略
+
+> 第 6 步特意提「原文件名」：回收站项的 `files.name` 会被改成随机 UUID，
+> 显示名靠 `sys:restore_uri` 元数据回落。如果看到随机字符，说明软删除的元数据没写进去。
+
+---
+
+## 9. 配置存储策略
+
+### 用 R2（第 2 步建好的那个桶）
+
+管理后台 → 存储策略 → 编辑 `R2 Default`：
+
+- 类型：`r2`（边缘版内置，不需要填 server / ak / sk）
+- 桶名：留空即可（绑定已经指明了桶）
+
+想让 R2 直链不走 Worker 中转，需要一个便宜甚至免费的公共访问域名：
+
+- 在 Cloudflare 给桶配一个自定义域（R2 → 你的桶 → Settings → Public access）
+- 然后把 `R2_PUBLIC_BASE` 加到 `wrangler.toml` 的 `[vars]`：
+
+  ```toml
+  [vars]
+  R2_PUBLIC_BASE = "https://files.example.com"
+  ```
+
+配了之后 `POST /file/url` 会返回不带签名的直链；不配则返回
+`/api/v4/file/content/:id/:speed/:name?sign=...` 由 Worker 流式代理。
+
+### 用 OneDrive
+
+管理后台 → 存储策略 → 新建，类型选 `onedrive`，字段对应关系：
+
+| 策略字段 | 填什么 |
+|---|---|
+| `server` | `https://graph.microsoft.com/v1.0`（**决定了 OAuth 端点**：host 是 `microsoftgraph.chinacloudapi.cn` 时走世纪互联，否则走全球版） |
+| `bucket_name` | Azure 应用的 **client_id** |
+| `secret_key` | Azure 应用的 **client_secret** |
+| `access_key` | **refresh_token**（原版就把 refresh token 存在这个字段） |
+| `settings.od_driver` | `me/drive` 或 `sites/<站点ID>/drive`，默认 `me/drive` |
+| `settings.od_redirect` | OAuth 回调地址。**必须和 Azure 应用里登记的重定向 URI 完全一致** |
+
+然后在策略编辑页点「获取授权链接」，走完微软的授权流程，把回调到的
+refresh_token 填回 `access_key`。
+
+> OneDrive 的**上传走客户端直传**：Worker 调 `createUploadSession` 拿到 `uploadUrl`
+> 交给浏览器，分片由浏览器直接 PUT 给微软，不经过 Worker。
+> 云端限速（`speed`）在 Workers 上无法实现，URL 里的 speed 段只是协议占位。
+
+---
+
+## 10. 已知限制与排错
+
+### 「前端显示后端已就绪」的纯文本页
+
+说明既没配 `[assets]` 也没配 `FRONTEND_URL`。回第 5 步。
+
+### 登录后立刻被登出 / 刷新令牌失败
+
+`hash_id_salt` 或 `secret_key` 被改过（比如重复跑了 `ensureSettings` 之外的手工
+UPDATE）。这两个键一旦生成就**不能再变** —— hashid 是哈希出来的用户/文件 ID，
+salt 变了所有旧 ID 全部失效。要换就接受所有链接与令牌作废。
+
+### 上传到某个大小就失败
+
+- R2 策略：检查策略的「最大文件大小」（`max_size`，0 = 不限）。
+- OneDrive 策略：单文件超过 4MB 会走分片上传，分片大小必须是 320KiB 的整数倍
+  （驱动已处理）。失败先看 Graph API 返回的 `error.message`。
+
+### 大文件下载中断
+
+`GET /api/v4/file/content/*` 会把整个对象**流式**转发出去，Worker 有 CPU 时间
+与内存上限，但流式转发不占 CPU。真正的限制是客户端的超时设置。
+
+### 定时任务没跑
+
+`wrangler.toml` 的 `[triggers] crons` 只在**发布后**生效，`wrangler dev` 不会触发。
+手动验证：
+
+```bash
+npx wrangler tail          # 另开一个终端
+# 等整点，或到 Cloudflare 后台手动触发一次 Cron
+```
+
+### 想清空重来
+
+```sql
+DROP SCHEMA public CASCADE;
+CREATE SCHEMA public;
+```
+
+然后在 Neon 控制台重新授权，再跑一遍第 4 步。
+**R2 里的对象不会跟着删**，需要单独清桶。
+
+---
+
+## 11. 安全提醒
+
+- `.dev.vars` 与 `wrangler secret` 里的东西**永远不要提交**。`.gitignore` 已经挡了
+  `.dev.vars`，但别把它复制成别的文件名。
+- 管理后台的默认账号是第 4 步自己建的，**没有默认密码这回事** —— 如果忘了，
+  重新跑一次 `seed.mjs` 换一个邮箱建新管理员，或者直接改库里的 `users.password`。
+- 上生产前确认 `siteURL` / `SITE_URL` 是 https 域名。
+- 跨域默认关闭。除非官方前端部署在别的域，否则不要开 `CORS_ALLOW_ORIGINS`。

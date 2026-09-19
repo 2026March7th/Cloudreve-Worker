@@ -1,0 +1,146 @@
+/**
+ * 密码摘要、随机串与摘要工具。
+ *
+ * 密码存储格式对应 Cloudreve v4 `inventory/user.go` 的 `digestPassword`：
+ *   `<32位随机salt>:<sha256hex(password + salt)>`
+ * 校验时按冒号切分；第二段长度为 64 视为 sha256（v4），否则按 sha1 处理（v3 兼容）。
+ */
+
+const ALPHABET = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+
+/** 生成指定长度的随机串，取自密码学安全随机源。 */
+export function randomString(length: number): string {
+  const bytes = new Uint8Array(length);
+  crypto.getRandomValues(bytes);
+  let out = '';
+  for (let i = 0; i < length; i++) {
+    out += ALPHABET[bytes[i]! % ALPHABET.length];
+  }
+  return out;
+}
+
+const encoder = new TextEncoder();
+
+export async function sha256Hex(input: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', encoder.encode(input));
+  return toHex(new Uint8Array(digest));
+}
+
+export async function sha1Hex(input: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-1', encoder.encode(input));
+  return toHex(new Uint8Array(digest));
+}
+
+/** SHA-256 原始字节，用于 refresh token 的 state_hash。 */
+export async function sha256Bytes(input: string): Promise<Uint8Array> {
+  const digest = await crypto.subtle.digest('SHA-256', encoder.encode(input));
+  return new Uint8Array(digest);
+}
+
+export function toHex(bytes: Uint8Array): string {
+  let out = '';
+  for (const b of bytes) {
+    out += b.toString(16).padStart(2, '0');
+  }
+  return out;
+}
+
+export function fromHex(hex: string): Uint8Array {
+  const out = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < out.length; i++) {
+    out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+  }
+  return out;
+}
+
+/** 恒定时间比较，避免签名比对被计时攻击。 */
+export function timingSafeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) {
+    diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+  return diff === 0;
+}
+
+/** 生成密码摘要：`<salt>:<sha256hex(password+salt)>`。 */
+export async function digestPassword(password: string): Promise<string> {
+  const salt = randomString(32);
+  const digest = await sha256Hex(password + salt);
+  return `${salt}:${digest}`;
+}
+
+/**
+ * 校验明文密码是否与存储的摘要匹配。
+ *
+ * 与上游保持逐字一致的判定顺序：
+ *   1. 按 `:` 切分，段数必须是 2 或 3，否则视为未知格式；
+ *   2. 3 段（v2 遗留的 `md5:<hash>:<salt>`）需要 MD5 —— Web Crypto 不提供 MD5，
+ *      这里如实返回「未知密码类型」。该分支只影响从 v2 老库迁移过来的账号，
+ *      全新部署不会产生这种格式。见 README「已知差异」。
+ *   3. 第二段长度为 64 用 SHA-256，否则用 SHA-1（v3 兼容），
+ *      比对 `H(password + salt)`，其中 salt 是第一段。
+ */
+export async function checkPassword(
+  stored: string | null | undefined,
+  password: string,
+): Promise<boolean> {
+  if (!stored) return false;
+  const parts = stored.split(':');
+  if (parts.length !== 2 && parts.length !== 3) return false;
+
+  if (parts.length === 3) {
+    // v2 格式，需要 MD5；未实现，一律拒绝（与上游在缺少 MD5 时的结果一致）。
+    return false;
+  }
+
+  const [salt, expected] = parts as [string, string];
+  const hasher = expected.length === 64 ? sha256Hex : sha1Hex;
+  const actual = await hasher(password + salt);
+  return timingSafeEqual(actual, expected);
+}
+
+/** 生成 RFC4122 v4 UUID。 */
+export function uuidv4(): string {
+  return crypto.randomUUID();
+}
+
+// ---------------------------------------------------------------------------
+// base64 / base64url
+// ---------------------------------------------------------------------------
+
+export function bytesToBase64(bytes: Uint8Array): string {
+  let binary = '';
+  for (const b of bytes) binary += String.fromCharCode(b);
+  return btoa(binary);
+}
+
+export function base64ToBytes(b64: string): Uint8Array<ArrayBuffer> {
+  const binary = atob(b64);
+  const out = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);
+  return out;
+}
+
+export function bytesToBase64Url(bytes: Uint8Array): string {
+  return bytesToBase64(bytes).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+export function base64UrlToBytes(s: string): Uint8Array<ArrayBuffer> {
+  const padded = s.replace(/-/g, '+').replace(/_/g, '/');
+  const pad = padded.length % 4 === 0 ? '' : '='.repeat(4 - (padded.length % 4));
+  return base64ToBytes(padded + pad);
+}
+
+export function stringToBase64Url(s: string): string {
+  return bytesToBase64Url(encoder.encode(s));
+}
+
+export function base64UrlToString(s: string): string {
+  return new TextDecoder().decode(base64UrlToBytes(s));
+}
+
+/** Hex 字符串转 bytea 字面量（供 Postgres 参数使用），空串表示为 `\x`。 */
+export function hexToByteaLiteral(hex: string): string {
+  return `\\x${hex}`;
+}

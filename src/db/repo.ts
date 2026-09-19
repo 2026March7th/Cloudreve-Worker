@@ -1,0 +1,1334 @@
+/**
+ * 数据访问层。
+ *
+ * 所有 SQL 集中在这里，上层服务不直接写 SQL。读出的一律经 `normalize*`
+ * 归一化（bigint → number、bytea → Uint8Array、jsonb → object）。
+ */
+import { getSql, toByteaLiteral, toBytes, toDate, toJson, toNum, toNumOrNull, type Sql } from './index';
+import type {
+  EntityRow,
+  FileProps,
+  FileRow,
+  GroupRow,
+  MetadataRow,
+  ShareRow,
+  StoragePolicyRow,
+  TaskRow,
+  UserRow,
+  UserWithGroup,
+} from './types';
+import type { Env } from '../env';
+import { uuidv4 } from '../lib/crypto';
+import { MetadataExpectedCollectTime } from '../lib/sysmeta';
+
+// ---------------------------------------------------------------------------
+// 归一化
+// ---------------------------------------------------------------------------
+
+export function normalizeGroup(r: Record<string, unknown>): GroupRow {
+  return {
+    id: toNum(r.id),
+    created_at: toDate(r.created_at) ?? new Date(),
+    updated_at: toDate(r.updated_at) ?? new Date(),
+    deleted_at: toDate(r.deleted_at),
+    name: String(r.name ?? ''),
+    max_storage: toNumOrNull(r.max_storage),
+    speed_limit: toNumOrNull(r.speed_limit),
+    permissions: toBytes(r.permissions),
+    settings: toJson(r.settings, {}),
+    storage_policy_id: toNumOrNull(r.storage_policy_id),
+  };
+}
+
+export function normalizeUser(r: Record<string, unknown>): UserRow {
+  return {
+    id: toNum(r.id),
+    created_at: toDate(r.created_at) ?? new Date(),
+    updated_at: toDate(r.updated_at) ?? new Date(),
+    deleted_at: toDate(r.deleted_at),
+    email: String(r.email ?? ''),
+    nick: String(r.nick ?? ''),
+    password: (r.password as string) ?? null,
+    status: (r.status as UserRow['status']) ?? 'active',
+    storage: toNum(r.storage),
+    two_factor_secret: (r.two_factor_secret as string) ?? null,
+    avatar: (r.avatar as string) ?? null,
+    settings: toJson(r.settings, {}),
+    group_users: toNum(r.group_users),
+  };
+}
+
+export function normalizePolicy(r: Record<string, unknown>): StoragePolicyRow {
+  return {
+    id: toNum(r.id),
+    created_at: toDate(r.created_at) ?? new Date(),
+    updated_at: toDate(r.updated_at) ?? new Date(),
+    deleted_at: toDate(r.deleted_at),
+    name: String(r.name ?? ''),
+    type: String(r.type ?? ''),
+    server: (r.server as string) ?? null,
+    bucket_name: (r.bucket_name as string) ?? null,
+    is_private: r.is_private === null || r.is_private === undefined ? null : Boolean(r.is_private),
+    access_key: (r.access_key as string) ?? null,
+    secret_key: (r.secret_key as string) ?? null,
+    max_size: toNumOrNull(r.max_size),
+    dir_name_rule: (r.dir_name_rule as string) ?? null,
+    file_name_rule: (r.file_name_rule as string) ?? null,
+    settings: toJson(r.settings, {}),
+    node_id: toNumOrNull(r.node_id),
+  };
+}
+
+export function normalizeFile(r: Record<string, unknown>): FileRow {
+  return {
+    id: toNum(r.id),
+    created_at: toDate(r.created_at) ?? new Date(),
+    updated_at: toDate(r.updated_at) ?? new Date(),
+    type: toNum(r.type),
+    name: String(r.name ?? ''),
+    owner_id: toNum(r.owner_id),
+    size: toNum(r.size),
+    primary_entity: toNumOrNull(r.primary_entity),
+    file_children: toNumOrNull(r.file_children),
+    is_symbolic: Boolean(r.is_symbolic),
+    props: toJson(r.props, {}),
+    storage_policy_files: toNumOrNull(r.storage_policy_files),
+  };
+}
+
+export function normalizeEntity(r: Record<string, unknown>): EntityRow {
+  return {
+    id: toNum(r.id),
+    created_at: toDate(r.created_at) ?? new Date(),
+    updated_at: toDate(r.updated_at) ?? new Date(),
+    deleted_at: toDate(r.deleted_at),
+    type: toNum(r.type),
+    source: String(r.source ?? ''),
+    size: toNum(r.size),
+    reference_count: toNum(r.reference_count),
+    storage_policy_entities: toNum(r.storage_policy_entities),
+    created_by: toNumOrNull(r.created_by),
+    upload_session_id: (r.upload_session_id as string) ?? null,
+    recycle_options: toJson(r.recycle_options, {}),
+  };
+}
+
+export function normalizeShare(r: Record<string, unknown>): ShareRow {
+  return {
+    id: toNum(r.id),
+    created_at: toDate(r.created_at) ?? new Date(),
+    updated_at: toDate(r.updated_at) ?? new Date(),
+    deleted_at: toDate(r.deleted_at),
+    password: (r.password as string) ?? null,
+    views: toNum(r.views),
+    downloads: toNum(r.downloads),
+    expires: toDate(r.expires),
+    remain_downloads: toNumOrNull(r.remain_downloads),
+    props: toJson(r.props, {}),
+    file_shares: toNumOrNull(r.file_shares),
+    user_shares: toNumOrNull(r.user_shares),
+  };
+}
+
+export function normalizeMetadata(r: Record<string, unknown>): MetadataRow {
+  return {
+    id: toNum(r.id),
+    created_at: toDate(r.created_at) ?? new Date(),
+    updated_at: toDate(r.updated_at) ?? new Date(),
+    deleted_at: toDate(r.deleted_at),
+    name: String(r.name ?? ''),
+    value: String(r.value ?? ''),
+    file_id: toNum(r.file_id),
+    is_public: Boolean(r.is_public),
+  };
+}
+
+export function normalizeTask(r: Record<string, unknown>): TaskRow {
+  return {
+    id: toNum(r.id),
+    created_at: toDate(r.created_at) ?? new Date(),
+    updated_at: toDate(r.updated_at) ?? new Date(),
+    deleted_at: toDate(r.deleted_at),
+    type: String(r.type ?? ''),
+    status: (r.status as TaskRow['status']) ?? 'queued',
+    public_state: toJson(r.public_state, {}),
+    private_state: (r.private_state as string) ?? null,
+    correlation_id: (r.correlation_id as string) ?? null,
+    user_tasks: toNumOrNull(r.user_tasks),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// 用户
+// ---------------------------------------------------------------------------
+
+export class UserRepo {
+  private sql: Sql;
+  constructor(private env: Env) {
+    this.sql = getSql(env);
+  }
+
+  async byId(id: number): Promise<UserRow | null> {
+    const rows = (await this.sql`
+      SELECT * FROM users WHERE id = ${id} AND deleted_at IS NULL LIMIT 1
+    `) as Record<string, unknown>[];
+    return rows[0] ? normalizeUser(rows[0]) : null;
+  }
+
+  async byEmail(email: string): Promise<UserRow | null> {
+    const rows = (await this.sql`
+      SELECT * FROM users WHERE lower(email) = lower(${email}) AND deleted_at IS NULL LIMIT 1
+    `) as Record<string, unknown>[];
+    return rows[0] ? normalizeUser(rows[0]) : null;
+  }
+
+  /** 取用户并带上所属用户组（权限判定几乎都要用到 group）。 */
+  async byIdWithGroup(id: number): Promise<UserWithGroup | null> {
+    const rows = (await this.sql`
+      SELECT u.*, row_to_json(g.*) AS __group
+      FROM users u
+      JOIN groups g ON g.id = u.group_users AND g.deleted_at IS NULL
+      WHERE u.id = ${id} AND u.deleted_at IS NULL
+      LIMIT 1
+    `) as Record<string, unknown>[];
+    const row = rows[0];
+    if (!row) return null;
+    const user = normalizeUser(row);
+    const group = normalizeGroup(toJson<Record<string, unknown>>(row.__group, {}));
+    return { ...user, group };
+  }
+
+  async byEmailWithGroup(email: string): Promise<UserWithGroup | null> {
+    const rows = (await this.sql`
+      SELECT u.*, row_to_json(g.*) AS __group
+      FROM users u
+      JOIN groups g ON g.id = u.group_users AND g.deleted_at IS NULL
+      WHERE lower(u.email) = lower(${email}) AND u.deleted_at IS NULL
+      LIMIT 1
+    `) as Record<string, unknown>[];
+    const row = rows[0];
+    if (!row) return null;
+    const user = normalizeUser(row);
+    const group = normalizeGroup(toJson<Record<string, unknown>>(row.__group, {}));
+    return { ...user, group };
+  }
+
+  async create(args: {
+    email: string;
+    nick: string;
+    passwordDigest: string | null;
+    groupId: number;
+    status?: string;
+  }): Promise<UserRow> {
+    // 新建用户的默认设置照抄原版 `inventory/user.go:381`：
+    // `types.UserSetting{VersionRetention: true, VersionRetentionMax: 10}`。
+    // 版本裁剪（`upload.capVersionEntities`）读的就是这两个字段。
+    const defaultSettings = JSON.stringify({ version_retention: true, version_retention_max: 10 });
+    const rows = (await this.sql`
+      INSERT INTO users (email, nick, password, group_users, status, storage, settings)
+      VALUES (${args.email}, ${args.nick}, ${args.passwordDigest}, ${args.groupId},
+              ${args.status ?? 'active'}, 0, ${defaultSettings}::jsonb)
+      RETURNING *
+    `) as Record<string, unknown>[];
+    return normalizeUser(rows[0]!);
+  }
+
+  async updatePassword(id: number, digest: string): Promise<void> {
+    await this.sql`
+      UPDATE users SET password = ${digest}, updated_at = now()
+      WHERE id = ${id}
+    `;
+  }
+
+  async updateProfile(id: number, args: { nick?: string; avatar?: string }): Promise<void> {
+    await this.sql`
+      UPDATE users
+      SET nick = COALESCE(${args.nick ?? null}, nick),
+          avatar = COALESCE(${args.avatar ?? null}, avatar),
+          updated_at = now()
+      WHERE id = ${id}
+    `;
+  }
+
+  async updateSettings(id: number, settings: Record<string, unknown>): Promise<void> {
+    await this.sql`
+      UPDATE users SET settings = ${JSON.stringify(settings)}::jsonb, updated_at = now()
+      WHERE id = ${id}
+    `;
+  }
+
+  async updateGroup(id: number, groupId: number): Promise<void> {
+    await this.sql`
+      UPDATE users SET group_users = ${groupId}, updated_at = now() WHERE id = ${id}
+    `;
+  }
+
+  async updateStatus(id: number, status: string): Promise<void> {
+    await this.sql`
+      UPDATE users SET status = ${status}, updated_at = now() WHERE id = ${id}
+    `;
+  }
+
+  async setTwoFactorSecret(id: number, secret: string | null): Promise<void> {
+    await this.sql`
+      UPDATE users SET two_factor_secret = ${secret}, updated_at = now() WHERE id = ${id}
+    `;
+  }
+
+  /** 增减已用容量。容量计算依赖这个字段，必须与实际写入同步。 */
+  async addStorage(id: number, delta: number): Promise<void> {
+    await this.sql`
+      UPDATE users SET storage = GREATEST(0, storage + ${delta}), updated_at = now()
+      WHERE id = ${id}
+    `;
+  }
+
+  /** 按已归属实体的实际大小重算容量（用于校正漂移）。 */
+  async recalcStorage(id: number): Promise<number> {
+    const rows = (await this.sql`
+      SELECT COALESCE(SUM(e.size), 0) AS total
+      FROM entities e
+      WHERE e.deleted_at IS NULL
+        AND e.created_by = ${id}
+        AND e.type = 0
+        AND e.upload_session_id IS NULL
+        AND e.reference_count > 0
+    `) as Record<string, unknown>[];
+    const total = toNum(rows[0]?.total);
+    await this.sql`UPDATE users SET storage = ${total}, updated_at = now() WHERE id = ${id}`;
+    return total;
+  }
+
+  async list(args: {
+    page: number;
+    pageSize: number;
+    orderBy?: string;
+    orderDirection?: string;
+    keyword?: string;
+    groupId?: number;
+    status?: string;
+  }): Promise<{ users: UserRow[]; total: number }> {
+    const orderCol = whitelist(args.orderBy, ['id', 'email', 'nick', 'created_at', 'updated_at', 'storage'], 'id');
+    const orderDir = whitelist(args.orderDirection, ['asc', 'desc'], 'desc');
+    const offset = Math.max(0, args.page) * args.pageSize;
+
+    const keyword = args.keyword ?? null;
+    const groupId = args.groupId ?? null;
+    const status = args.status ?? null;
+
+    const where = `
+      deleted_at IS NULL
+        AND ($1::text IS NULL OR email ILIKE '%' || $1 || '%' OR nick ILIKE '%' || $1 || '%')
+        AND ($2::int IS NULL OR group_users = $2)
+        AND ($3::text IS NULL OR status = $3)
+    `;
+    const params = [keyword, groupId, status];
+
+    // ORDER BY 的列名无法参数化，因此只能白名单校验后拼进 SQL 文本
+    const rows = (await this.sql(
+      `SELECT * FROM users WHERE ${where} ORDER BY ${orderCol} ${orderDir} LIMIT $4 OFFSET $5`,
+      [...params, args.pageSize, offset],
+    )) as Record<string, unknown>[];
+
+    const countRows = (await this.sql(
+      `SELECT COUNT(*)::int AS total FROM users WHERE ${where}`,
+      params,
+    )) as Record<string, unknown>[];
+
+    return {
+      users: rows.map(normalizeUser),
+      total: toNum(countRows[0]?.total),
+    };
+  }
+
+  async countAll(): Promise<number> {
+    const rows = (await this.sql`
+      SELECT COUNT(*)::int AS total FROM users WHERE deleted_at IS NULL
+    `) as Record<string, unknown>[];
+    return toNum(rows[0]?.total);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 用户组
+// ---------------------------------------------------------------------------
+
+export class GroupRepo {
+  private sql: Sql;
+  constructor(env: Env) {
+    this.sql = getSql(env);
+  }
+
+  async byId(id: number): Promise<GroupRow | null> {
+    const rows = (await this.sql`
+      SELECT * FROM groups WHERE id = ${id} AND deleted_at IS NULL LIMIT 1
+    `) as Record<string, unknown>[];
+    return rows[0] ? normalizeGroup(rows[0]) : null;
+  }
+
+  async list(): Promise<GroupRow[]> {
+    const rows = (await this.sql`
+      SELECT * FROM groups WHERE deleted_at IS NULL ORDER BY id ASC
+    `) as Record<string, unknown>[];
+    return rows.map(normalizeGroup);
+  }
+
+  async create(args: {
+    name: string;
+    maxStorage: number | null;
+    speedLimit: number | null;
+    permissions: Uint8Array;
+    settings: Record<string, unknown>;
+    storagePolicyId: number | null;
+  }): Promise<GroupRow> {
+    const rows = (await this.sql`
+      INSERT INTO groups (name, max_storage, speed_limit, permissions, settings, storage_policy_id)
+      VALUES (${args.name}, ${args.maxStorage}, ${args.speedLimit},
+              ${toByteaLiteral(args.permissions)}::bytea,
+              ${JSON.stringify(args.settings)}::jsonb, ${args.storagePolicyId})
+      RETURNING *
+    `) as Record<string, unknown>[];
+    return normalizeGroup(rows[0]!);
+  }
+
+  async update(
+    id: number,
+    args: {
+      name?: string;
+      maxStorage?: number | null;
+      speedLimit?: number | null;
+      permissions?: Uint8Array;
+      settings?: Record<string, unknown>;
+      storagePolicyId?: number | null;
+    },
+  ): Promise<void> {
+    await this.sql`
+      UPDATE groups SET
+        name              = COALESCE(${args.name ?? null}, name),
+        max_storage       = ${args.maxStorage === undefined ? (null as unknown as number) : args.maxStorage},
+        speed_limit       = ${args.speedLimit === undefined ? (null as unknown as number) : args.speedLimit},
+        permissions       = COALESCE(${args.permissions ? toByteaLiteral(args.permissions) : null}::bytea, permissions),
+        settings          = COALESCE(${args.settings ? JSON.stringify(args.settings) : null}::jsonb, settings),
+        storage_policy_id = ${args.storagePolicyId === undefined ? null : args.storagePolicyId},
+        updated_at        = now()
+      WHERE id = ${id}
+    `;
+  }
+
+  /** 只更新非 null 的字段版本，供后台表单使用。 */
+  async patch(
+    id: number,
+    args: {
+      name?: string;
+      maxStorage?: number | null;
+      speedLimit?: number | null;
+      permissions?: Uint8Array;
+      settings?: Record<string, unknown>;
+      storagePolicyId?: number | null;
+    },
+  ): Promise<void> {
+    if (args.name !== undefined) {
+      await this.sql`UPDATE groups SET name = ${args.name}, updated_at = now() WHERE id = ${id}`;
+    }
+    if (args.maxStorage !== undefined) {
+      await this.sql`UPDATE groups SET max_storage = ${args.maxStorage}, updated_at = now() WHERE id = ${id}`;
+    }
+    if (args.speedLimit !== undefined) {
+      await this.sql`UPDATE groups SET speed_limit = ${args.speedLimit}, updated_at = now() WHERE id = ${id}`;
+    }
+    if (args.permissions !== undefined) {
+      await this.sql`
+        UPDATE groups SET permissions = ${toByteaLiteral(args.permissions)}::bytea, updated_at = now()
+        WHERE id = ${id}
+      `;
+    }
+    if (args.settings !== undefined) {
+      await this.sql`
+        UPDATE groups SET settings = ${JSON.stringify(args.settings)}::jsonb, updated_at = now()
+        WHERE id = ${id}
+      `;
+    }
+    if (args.storagePolicyId !== undefined) {
+      await this.sql`
+        UPDATE groups SET storage_policy_id = ${args.storagePolicyId}, updated_at = now() WHERE id = ${id}
+      `;
+    }
+  }
+
+  async softDelete(id: number): Promise<void> {
+    await this.sql`
+      UPDATE groups SET deleted_at = now(), updated_at = now() WHERE id = ${id}
+    `;
+  }
+
+  async countUsers(id: number): Promise<number> {
+    const rows = (await this.sql`
+      SELECT COUNT(*)::int AS total FROM users WHERE group_users = ${id} AND deleted_at IS NULL
+    `) as Record<string, unknown>[];
+    return toNum(rows[0]?.total);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 存储策略
+// ---------------------------------------------------------------------------
+
+export class PolicyRepo {
+  private sql: Sql;
+  constructor(env: Env) {
+    this.sql = getSql(env);
+  }
+
+  async byId(id: number): Promise<StoragePolicyRow | null> {
+    const rows = (await this.sql`
+      SELECT * FROM storage_policies WHERE id = ${id} AND deleted_at IS NULL LIMIT 1
+    `) as Record<string, unknown>[];
+    return rows[0] ? normalizePolicy(rows[0]) : null;
+  }
+
+  async list(): Promise<StoragePolicyRow[]> {
+    const rows = (await this.sql`
+      SELECT * FROM storage_policies WHERE deleted_at IS NULL ORDER BY id ASC
+    `) as Record<string, unknown>[];
+    return rows.map(normalizePolicy);
+  }
+
+  /** 默认策略：id 最小的一条。原版用一个 is_default 设置，这里简化为取最小 id。 */
+  async defaultPolicy(): Promise<StoragePolicyRow | null> {
+    const rows = (await this.sql`
+      SELECT * FROM storage_policies WHERE deleted_at IS NULL ORDER BY id ASC LIMIT 1
+    `) as Record<string, unknown>[];
+    return rows[0] ? normalizePolicy(rows[0]) : null;
+  }
+
+  async create(args: {
+    name: string;
+    type: string;
+    server?: string | null;
+    bucketName?: string | null;
+    isPrivate?: boolean | null;
+    accessKey?: string | null;
+    secretKey?: string | null;
+    maxSize?: number | null;
+    dirNameRule?: string | null;
+    fileNameRule?: string | null;
+    settings?: Record<string, unknown>;
+  }): Promise<StoragePolicyRow> {
+    const rows = (await this.sql`
+      INSERT INTO storage_policies
+        (name, type, server, bucket_name, is_private, access_key, secret_key,
+         max_size, dir_name_rule, file_name_rule, settings)
+      VALUES (${args.name}, ${args.type}, ${args.server ?? null}, ${args.bucketName ?? null},
+              ${args.isPrivate ?? null}, ${args.accessKey ?? null}, ${args.secretKey ?? null},
+              ${args.maxSize ?? null}, ${args.dirNameRule ?? null}, ${args.fileNameRule ?? null},
+              ${JSON.stringify(args.settings ?? {})}::jsonb)
+      RETURNING *
+    `) as Record<string, unknown>[];
+    return normalizePolicy(rows[0]!);
+  }
+
+  async update(id: number, patchFields: Record<string, unknown>, encrypted: {
+    accessKey?: string | null;
+    secretKey?: string | null;
+  }): Promise<void> {
+    if (patchFields.name !== undefined) {
+      await this.sql`UPDATE storage_policies SET name = ${patchFields.name as string}, updated_at = now() WHERE id = ${id}`;
+    }
+    if (patchFields.type !== undefined) {
+      await this.sql`UPDATE storage_policies SET type = ${patchFields.type as string}, updated_at = now() WHERE id = ${id}`;
+    }
+    if (patchFields.server !== undefined) {
+      await this.sql`UPDATE storage_policies SET server = ${patchFields.server as string | null}, updated_at = now() WHERE id = ${id}`;
+    }
+    if (patchFields.bucket_name !== undefined) {
+      await this.sql`UPDATE storage_policies SET bucket_name = ${patchFields.bucket_name as string | null}, updated_at = now() WHERE id = ${id}`;
+    }
+    if (patchFields.is_private !== undefined) {
+      await this.sql`UPDATE storage_policies SET is_private = ${patchFields.is_private as boolean | null}, updated_at = now() WHERE id = ${id}`;
+    }
+    if (patchFields.max_size !== undefined) {
+      await this.sql`UPDATE storage_policies SET max_size = ${patchFields.max_size as number | null}, updated_at = now() WHERE id = ${id}`;
+    }
+    if (patchFields.dir_name_rule !== undefined) {
+      await this.sql`UPDATE storage_policies SET dir_name_rule = ${patchFields.dir_name_rule as string | null}, updated_at = now() WHERE id = ${id}`;
+    }
+    if (patchFields.file_name_rule !== undefined) {
+      await this.sql`UPDATE storage_policies SET file_name_rule = ${patchFields.file_name_rule as string | null}, updated_at = now() WHERE id = ${id}`;
+    }
+    if (patchFields.settings !== undefined) {
+      await this.sql`
+        UPDATE storage_policies SET settings = ${JSON.stringify(patchFields.settings)}::jsonb, updated_at = now()
+        WHERE id = ${id}
+      `;
+    }
+    if (encrypted.accessKey !== undefined) {
+      await this.sql`UPDATE storage_policies SET access_key = ${encrypted.accessKey}, updated_at = now() WHERE id = ${id}`;
+    }
+    if (encrypted.secretKey !== undefined) {
+      await this.sql`UPDATE storage_policies SET secret_key = ${encrypted.secretKey}, updated_at = now() WHERE id = ${id}`;
+    }
+  }
+
+  async softDelete(id: number): Promise<void> {
+    await this.sql`UPDATE storage_policies SET deleted_at = now(), updated_at = now() WHERE id = ${id}`;
+  }
+
+  async countFiles(id: number): Promise<number> {
+    const rows = (await this.sql`
+      SELECT COUNT(*)::int AS total FROM files WHERE storage_policy_files = ${id} LIMIT 1
+    `) as Record<string, unknown>[];
+    return toNum(rows[0]?.total);
+  }
+
+  async countGroups(id: number): Promise<number> {
+    const rows = (await this.sql`
+      SELECT COUNT(*)::int AS total FROM groups WHERE storage_policy_id = ${id} AND deleted_at IS NULL
+    `) as Record<string, unknown>[];
+    return toNum(rows[0]?.total);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 文件
+// ---------------------------------------------------------------------------
+
+export interface ListFilesArgs {
+  parentId: number | null;
+  ownerId: number | null;
+  trash?: boolean;
+  page: number;
+  pageSize: number;
+  orderBy: string;
+  orderDirection: string;
+  typeFilter?: number | null;
+  nameKeyword?: string | null;
+  /**
+   * 「分享给我」是一棵**扁平**的树（原版 `inventory/file_utils.go:118-141`
+   * 的 `childFileQuery(ownerID, isSymbolic=true, nil)`）：过滤条件是
+   * `name <> '' AND owner_id = uid AND is_symbolic AND file_children IS NOT NULL`，
+   * 不看 parentId。为 true 时忽略 `parentId` / `trash`。
+   */
+  sharedWithMe?: boolean;
+}
+
+export class FileRepo {
+  private sql: Sql;
+  constructor(env: Env) {
+    this.sql = getSql(env);
+  }
+
+  async byId(id: number): Promise<FileRow | null> {
+    const rows = (await this.sql`
+      SELECT * FROM files WHERE id = ${id} LIMIT 1
+    `) as Record<string, unknown>[];
+    return rows[0] ? normalizeFile(rows[0]) : null;
+  }
+
+  /** 取用户根目录；不存在则创建（首次登录时调用）。 */
+  async ensureRoot(ownerId: number): Promise<FileRow> {
+    const existing = (await this.sql`
+      SELECT * FROM files WHERE owner_id = ${ownerId} AND file_children IS NULL AND name = '' LIMIT 1
+    `) as Record<string, unknown>[];
+    if (existing[0]) return normalizeFile(existing[0]);
+
+    const rows = (await this.sql`
+      INSERT INTO files (type, name, owner_id, size, is_symbolic)
+      VALUES (1, '', ${ownerId}, 0, false)
+      ON CONFLICT DO NOTHING
+      RETURNING *
+    `) as Record<string, unknown>[];
+    if (rows[0]) return normalizeFile(rows[0]);
+
+    // 并发下可能已被其它请求插入
+    const again = (await this.sql`
+      SELECT * FROM files WHERE owner_id = ${ownerId} AND file_children IS NULL AND name = '' LIMIT 1
+    `) as Record<string, unknown>[];
+    return normalizeFile(again[0]!);
+  }
+
+  /** 按父目录 + 名字找子节点。parentId 为 null 表示找根目录本身。 */
+  async childByName(parentId: number | null, name: string): Promise<FileRow | null> {
+    const rows = (await this.sql`
+      SELECT * FROM files
+      WHERE name = ${name}
+        AND ((${parentId}::int IS NULL AND file_children IS NULL) OR file_children = ${parentId})
+      LIMIT 1
+    `) as Record<string, unknown>[];
+    return rows[0] ? normalizeFile(rows[0]) : null;
+  }
+
+  /** 沿路径逐级向下查找。返回 null 表示路径不存在。 */
+  async resolvePath(ownerId: number, elements: string[]): Promise<FileRow | null> {
+    const root = await this.ensureRoot(ownerId);
+    let current = root;
+    for (const el of elements) {
+      const next = await this.childByName(current.id, el);
+      if (!next) return null;
+      current = next;
+    }
+    return current;
+  }
+
+  /** 列出目录内容（或回收站内容）。 */
+  async list(args: ListFilesArgs): Promise<{ files: FileRow[]; total: number }> {
+    const orderCol = whitelist(args.orderBy, ['name', 'size', 'updated_at', 'created_at'], 'name');
+    const orderDir = whitelist(args.orderDirection, ['asc', 'desc'], 'asc');
+
+    const params: unknown[] = [];
+    const add = (value: unknown): string => {
+      params.push(value);
+      return `$${params.length}`;
+    };
+
+    const conds: string[] = [];
+
+    // 「分享给我」：扁平列表，不按父目录过滤（见 ListFilesArgs.sharedWithMe）
+    if (args.sharedWithMe) {
+      conds.push(`f.name <> '' AND f.is_symbolic = TRUE AND f.file_children IS NOT NULL`);
+    } else if (args.trash) {
+      conds.push(`f.file_children IS NULL AND f.name <> ''`);
+    } else if (args.parentId === null) {
+      conds.push(`f.file_children IS NULL AND f.name = ''`);
+    } else {
+      conds.push(`f.file_children = ${add(args.parentId)}`);
+    }
+
+    if (args.ownerId !== null && args.ownerId !== undefined) {
+      conds.push(`f.owner_id = ${add(args.ownerId)}`);
+    }
+    if (args.typeFilter !== null && args.typeFilter !== undefined) {
+      conds.push(`f.type = ${add(args.typeFilter)}`);
+    }
+    if (args.nameKeyword) {
+      conds.push(`f.name ILIKE '%' || ${add(args.nameKeyword)} || '%'`);
+    }
+
+    const where = conds.length > 0 ? conds.join(' AND ') : 'TRUE';
+    const whereParamCount = params.length;
+
+    const limitPlaceholder = add(args.pageSize);
+    const offsetPlaceholder = add(Math.max(0, args.page) * args.pageSize);
+
+    const rows = (await this.sql(
+      `SELECT f.* FROM files f
+       WHERE ${where}
+       ORDER BY f.${orderCol} ${orderDir}, f.id ASC
+       LIMIT ${limitPlaceholder} OFFSET ${offsetPlaceholder}`,
+      params,
+    )) as Record<string, unknown>[];
+
+    const countRows = (await this.sql(
+      `SELECT COUNT(*)::int AS total FROM files f WHERE ${where}`,
+      params.slice(0, whereParamCount),
+    )) as Record<string, unknown>[];
+
+    return { files: rows.map(normalizeFile), total: toNum(countRows[0]?.total) };
+  }
+
+  /**
+   * 递归统计目录下的文件数与总大小。用于文件夹摘要。
+   * 走一次递归 CTE，避免 N+1 查询。
+   */
+  async folderSummary(folderId: number): Promise<{ size: number; files: number; folders: number }> {
+    const rows = (await this.sql`
+      WITH RECURSIVE sub AS (
+        SELECT id, type, size FROM files WHERE file_children = ${folderId}
+        UNION ALL
+        SELECT f.id, f.type, f.size FROM files f JOIN sub ON f.file_children = sub.id
+      )
+      SELECT
+        COALESCE(SUM(CASE WHEN type = 0 THEN size ELSE 0 END), 0) AS total_size,
+        COUNT(*) FILTER (WHERE type = 0)::int AS file_count,
+        COUNT(*) FILTER (WHERE type = 1)::int AS folder_count
+      FROM sub
+    `) as Record<string, unknown>[];
+    const r = rows[0] ?? {};
+    return {
+      size: toNum(r.total_size),
+      files: toNum(r.file_count),
+      folders: toNum(r.folder_count),
+    };
+  }
+
+  async create(args: {
+    type: number;
+    name: string;
+    ownerId: number;
+    parentId: number | null;
+    size?: number;
+    policyId?: number | null;
+    primaryEntity?: number | null;
+    isSymbolic?: boolean;
+    props?: FileProps | Record<string, unknown>;
+  }): Promise<FileRow> {
+    const rows = (await this.sql`
+      INSERT INTO files (type, name, owner_id, file_children, size, storage_policy_files,
+                         primary_entity, is_symbolic, props)
+      VALUES (${args.type}, ${args.name}, ${args.ownerId}, ${args.parentId}, ${args.size ?? 0},
+              ${args.policyId ?? null}, ${args.primaryEntity ?? null},
+              ${args.isSymbolic ?? false},
+              ${JSON.stringify(args.props ?? {})}::jsonb)
+      RETURNING *
+    `) as Record<string, unknown>[];
+    return normalizeFile(rows[0]!);
+  }
+
+  async rename(id: number, newName: string): Promise<void> {
+    await this.sql`UPDATE files SET name = ${newName}, updated_at = now() WHERE id = ${id}`;
+  }
+
+  async move(ids: number[], dstParentId: number | null): Promise<void> {
+    if (ids.length === 0) return;
+    for (const id of ids) {
+      await this.sql`
+        UPDATE files SET file_children = ${dstParentId}, updated_at = now() WHERE id = ${id}
+      `;
+    }
+  }
+
+  async updateParent(id: number, parentId: number | null): Promise<void> {
+    await this.sql`
+      UPDATE files SET file_children = ${parentId}, updated_at = now() WHERE id = ${id}
+    `;
+  }
+
+  async updateSize(id: number, size: number): Promise<void> {
+    await this.sql`UPDATE files SET size = ${size}, updated_at = now() WHERE id = ${id}`;
+  }
+
+  async updatePrimaryEntity(id: number, entityId: number | null): Promise<void> {
+    await this.sql`
+      UPDATE files SET primary_entity = ${entityId}, updated_at = now() WHERE id = ${id}
+    `;
+  }
+
+  async patchProps(id: number, props: Record<string, unknown>): Promise<void> {
+    await this.sql`
+      UPDATE files SET props = ${JSON.stringify(props)}::jsonb, updated_at = now() WHERE id = ${id}
+    `;
+  }
+
+  async deleteMany(ids: number[]): Promise<void> {
+    if (ids.length === 0) return;
+    for (const id of ids) {
+      await this.sql`DELETE FROM files WHERE id = ${id}`;
+    }
+  }
+
+  /**
+   * 把文件放进回收站。与 `inventory.fileClient.SoftDelete` 一致：
+   * `files.name` 改成随机 UUID、`file_children` 置空。
+   *
+   * 回收站里的项就是这样识别的（`file_children IS NULL AND name <> ''`），
+   * 原始路径必须由调用方在改名**之前**算出来并写进 `sys:restore_uri` 元数据。
+   */
+  async moveToTrash(ids: number[]): Promise<void> {
+    for (const id of ids) {
+      await this.sql`
+        UPDATE files
+        SET name = ${uuidv4()}, file_children = NULL, updated_at = now()
+        WHERE id = ${id}
+      `;
+    }
+  }
+
+  /**
+   * 回收站里已到期的项。到期时间来自软删除时写入的 `sys:expected_collect_time`
+   * 元数据（秒级时间戳），由原版 `MetadataExpectedCollectTime` 对应。
+   */
+  async listExpiredTrash(nowSeconds: number, limit = 200): Promise<FileRow[]> {
+    const rows = (await this.sql(
+      `SELECT f.* FROM files f
+       JOIN metadata m
+         ON m.file_id = f.id
+        AND m.name = $2
+        AND m.deleted_at IS NULL
+       WHERE f.file_children IS NULL
+         AND f.name <> ''
+         AND f.deleted_at IS NULL
+         AND m.value ~ '^[0-9]+$'
+         AND m.value::bigint <= $1::bigint
+       LIMIT $3`,
+      [nowSeconds, MetadataExpectedCollectTime, limit],
+    )) as Record<string, unknown>[];
+    return rows.map(normalizeFile);
+  }
+
+  /** 统计某目录下的直接子节点数量。 */
+  async countChildren(parentId: number): Promise<number> {
+    const rows = (await this.sql`
+      SELECT COUNT(*)::int AS total FROM files WHERE file_children = ${parentId}
+    `) as Record<string, unknown>[];
+    return toNum(rows[0]?.total);
+  }
+
+  /** 收集一批文件及其全部后代 id（用于删除、拼装打包下载）。 */
+  async collectDescendants(ids: number[]): Promise<number[]> {
+    if (ids.length === 0) return [];
+    const out = new Set<number>(ids);
+    let frontier = ids;
+    // 逐层展开，避免单条递归 CTE 参数过多
+    for (let depth = 0; depth < 64 && frontier.length > 0; depth++) {
+      const rows = (await this.sql`
+        SELECT id FROM files WHERE file_children = ANY(${frontier}::int[])
+      `) as Record<string, unknown>[];
+      const next = rows.map((r) => toNum(r.id)).filter((id) => !out.has(id));
+      if (next.length === 0) break;
+      for (const id of next) out.add(id);
+      frontier = next;
+    }
+    return Array.from(out);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 实体
+// ---------------------------------------------------------------------------
+
+export class EntityRepo {
+  private sql: Sql;
+  constructor(env: Env) {
+    this.sql = getSql(env);
+  }
+
+  async byId(id: number): Promise<EntityRow | null> {
+    const rows = (await this.sql`
+      SELECT * FROM entities WHERE id = ${id} AND deleted_at IS NULL LIMIT 1
+    `) as Record<string, unknown>[];
+    return rows[0] ? normalizeEntity(rows[0]) : null;
+  }
+
+  async create(args: {
+    type: number;
+    source: string;
+    size: number;
+    policyId: number;
+    createdBy: number | null;
+    uploadSessionId?: string | null;
+  }): Promise<EntityRow> {
+    const rows = (await this.sql`
+      INSERT INTO entities (type, source, size, reference_count, storage_policy_entities,
+                            created_by, upload_session_id, recycle_options)
+      VALUES (${args.type}, ${args.source}, ${args.size}, 1, ${args.policyId},
+              ${args.createdBy}, ${args.uploadSessionId ?? null}, '{}'::jsonb)
+      RETURNING *
+    `) as Record<string, unknown>[];
+    return normalizeEntity(rows[0]!);
+  }
+
+  async updateSize(id: number, size: number, source?: string): Promise<void> {
+    if (source === undefined) {
+      await this.sql`UPDATE entities SET size = ${size}, updated_at = now() WHERE id = ${id}`;
+    } else {
+      await this.sql`
+        UPDATE entities SET size = ${size}, source = ${source}, updated_at = now() WHERE id = ${id}
+      `;
+    }
+  }
+
+  async clearUploadSession(id: number): Promise<void> {
+    await this.sql`
+      UPDATE entities SET upload_session_id = NULL, updated_at = now() WHERE id = ${id}
+    `;
+  }
+
+  /** 增加引用计数（多个文件共用同一份内容时）。 */
+  async retain(ids: number[]): Promise<void> {
+    for (const id of ids) {
+      await this.sql`
+        UPDATE entities SET reference_count = reference_count + 1, updated_at = now() WHERE id = ${id}
+      `;
+    }
+  }
+
+  /** 减少引用计数，返回引用归零、可以真正删除的实体。 */
+  async release(ids: number[]): Promise<EntityRow[]> {
+    const toDelete: EntityRow[] = [];
+    for (const id of ids) {
+      const rows = (await this.sql`
+        UPDATE entities
+        SET reference_count = GREATEST(0, reference_count - 1), updated_at = now()
+        WHERE id = ${id}
+        RETURNING *
+      `) as Record<string, unknown>[];
+      const row = rows[0];
+      if (row && toNum(row.reference_count) <= 0) {
+        toDelete.push(normalizeEntity(row));
+      }
+    }
+    return toDelete;
+  }
+
+  /** 硬删除实体记录。 */
+  async hardDelete(ids: number[]): Promise<void> {
+    for (const id of ids) {
+      await this.sql`DELETE FROM file_entities WHERE entity_id = ${id}`;
+      await this.sql`DELETE FROM entities WHERE id = ${id}`;
+    }
+  }
+
+  async listByFile(fileId: number): Promise<EntityRow[]> {
+    const rows = (await this.sql`
+      SELECT e.* FROM entities e
+      JOIN file_entities fe ON fe.entity_id = e.id
+      WHERE fe.file_id = ${fileId} AND e.deleted_at IS NULL
+      ORDER BY e.created_at DESC
+    `) as Record<string, unknown>[];
+    return rows.map(normalizeEntity);
+  }
+
+  async linkFile(fileId: number, entityId: number): Promise<void> {
+    await this.sql`
+      INSERT INTO file_entities (file_id, entity_id) VALUES (${fileId}, ${entityId})
+      ON CONFLICT DO NOTHING
+    `;
+  }
+
+  async unlinkFile(fileId: number, entityId: number): Promise<void> {
+    await this.sql`
+      DELETE FROM file_entities WHERE file_id = ${fileId} AND entity_id = ${entityId}
+    `;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 分享
+// ---------------------------------------------------------------------------
+
+export class ShareRepo {
+  private sql: Sql;
+  constructor(env: Env) {
+    this.sql = getSql(env);
+  }
+
+  async byId(id: number): Promise<ShareRow | null> {
+    const rows = (await this.sql`
+      SELECT * FROM shares WHERE id = ${id} AND deleted_at IS NULL LIMIT 1
+    `) as Record<string, unknown>[];
+    return rows[0] ? normalizeShare(rows[0]) : null;
+  }
+
+  async create(args: {
+    fileId: number;
+    userId: number;
+    password: string | null;
+    expires: Date | null;
+    remainDownloads: number | null;
+    props: Record<string, unknown>;
+  }): Promise<ShareRow> {
+    const rows = (await this.sql`
+      INSERT INTO shares (password, views, downloads, expires, remain_downloads, props,
+                          file_shares, user_shares)
+      VALUES (${args.password}, 0, 0, ${args.expires}, ${args.remainDownloads},
+              ${JSON.stringify(args.props)}::jsonb, ${args.fileId}, ${args.userId})
+      RETURNING *
+    `) as Record<string, unknown>[];
+    return normalizeShare(rows[0]!);
+  }
+
+  async update(
+    id: number,
+    args: {
+      password?: string | null;
+      expires?: Date | null;
+      remainDownloads?: number | null;
+      props?: Record<string, unknown>;
+    },
+  ): Promise<void> {
+    if (args.password !== undefined) {
+      await this.sql`UPDATE shares SET password = ${args.password}, updated_at = now() WHERE id = ${id}`;
+    }
+    if (args.expires !== undefined) {
+      await this.sql`UPDATE shares SET expires = ${args.expires}, updated_at = now() WHERE id = ${id}`;
+    }
+    if (args.remainDownloads !== undefined) {
+      await this.sql`
+        UPDATE shares SET remain_downloads = ${args.remainDownloads}, updated_at = now() WHERE id = ${id}
+      `;
+    }
+    if (args.props !== undefined) {
+      await this.sql`
+        UPDATE shares SET props = ${JSON.stringify(args.props)}::jsonb, updated_at = now() WHERE id = ${id}
+      `;
+    }
+  }
+
+  async incrementViews(id: number): Promise<void> {
+    await this.sql`UPDATE shares SET views = views + 1, updated_at = now() WHERE id = ${id}`;
+  }
+
+  async incrementDownloads(id: number, delta = 1): Promise<void> {
+    await this.sql`
+      UPDATE shares
+      SET downloads = downloads + ${delta},
+          remain_downloads = CASE
+            WHEN remain_downloads IS NULL THEN NULL
+            ELSE GREATEST(0, remain_downloads - ${delta})
+          END,
+          updated_at = now()
+      WHERE id = ${id}
+    `;
+  }
+
+  async listByUser(args: {
+    userId: number;
+    page: number;
+    pageSize: number;
+    orderBy: string;
+    orderDirection: string;
+    /** 对应原版 `ListShareArgs.PublicOnly`：只要 password 为 NULL 的分享。 */
+    publicOnly?: boolean;
+  }): Promise<{ shares: ShareRow[]; total: number }> {
+    const orderCol = whitelist(args.orderBy, ['id', 'created_at', 'updated_at', 'views', 'downloads'], 'id');
+    const orderDir = whitelist(args.orderDirection, ['asc', 'desc'], 'desc');
+    const offset = Math.max(0, args.page) * args.pageSize;
+    const publicCond = args.publicOnly ? ' AND password IS NULL' : '';
+
+    const rows = (await this.sql(
+      `SELECT * FROM shares
+       WHERE user_shares = $1 AND deleted_at IS NULL${publicCond}
+       ORDER BY ${orderCol} ${orderDir}
+       LIMIT $2 OFFSET $3`,
+      [args.userId, args.pageSize, offset],
+    )) as Record<string, unknown>[];
+
+    const countRows = (await this.sql(
+      `SELECT COUNT(*)::int AS total FROM shares
+       WHERE user_shares = $1 AND deleted_at IS NULL${publicCond}`,
+      [args.userId],
+    )) as Record<string, unknown>[];
+
+    return { shares: rows.map(normalizeShare), total: toNum(countRows[0]?.total) };
+  }
+
+  /** 某文件是否已被分享过（用于在文件列表里标记 shared 字段）。 */
+  async sharedFileIds(fileIds: number[]): Promise<Set<number>> {
+    if (fileIds.length === 0) return new Set();
+    const rows = (await this.sql`
+      SELECT DISTINCT file_shares FROM shares
+      WHERE file_shares = ANY(${fileIds}::int[]) AND deleted_at IS NULL
+    `) as Record<string, unknown>[];
+    return new Set(rows.map((r) => toNum(r.file_shares)));
+  }
+
+  async softDelete(id: number): Promise<void> {
+    await this.sql`UPDATE shares SET deleted_at = now(), updated_at = now() WHERE id = ${id}`;
+  }
+
+  async softDeleteMany(ids: number[], userId: number): Promise<void> {
+    for (const id of ids) {
+      await this.sql`
+        UPDATE shares SET deleted_at = now(), updated_at = now()
+        WHERE id = ${id} AND user_shares = ${userId}
+      `;
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 元数据
+// ---------------------------------------------------------------------------
+
+export class MetadataRepo {
+  private sql: Sql;
+  constructor(env: Env) {
+    this.sql = getSql(env);
+  }
+
+  async listByFile(fileId: number, includePrivate: boolean): Promise<MetadataRow[]> {
+    const rows = (await this.sql`
+      SELECT * FROM metadata
+      WHERE file_id = ${fileId} AND deleted_at IS NULL
+        AND (${includePrivate}::boolean OR is_public = true)
+      ORDER BY name ASC
+    `) as Record<string, unknown>[];
+    return rows.map(normalizeMetadata);
+  }
+
+  async listByFiles(fileIds: number[], includePrivate: boolean): Promise<MetadataRow[]> {
+    if (fileIds.length === 0) return [];
+    const rows = (await this.sql`
+      SELECT * FROM metadata
+      WHERE file_id = ANY(${fileIds}::int[]) AND deleted_at IS NULL
+        AND (${includePrivate}::boolean OR is_public = true)
+      ORDER BY file_id ASC, name ASC
+    `) as Record<string, unknown>[];
+    return rows.map(normalizeMetadata);
+  }
+
+  async upsert(fileId: number, name: string, value: string, isPublic: boolean): Promise<void> {
+    await this.sql`
+      INSERT INTO metadata (file_id, name, value, is_public)
+      VALUES (${fileId}, ${name}, ${value}, ${isPublic})
+      ON CONFLICT (file_id, name)
+      DO UPDATE SET value = EXCLUDED.value, is_public = EXCLUDED.is_public,
+                    deleted_at = NULL, updated_at = now()
+    `;
+  }
+
+  async remove(fileId: number, name: string): Promise<void> {
+    await this.sql`
+      DELETE FROM metadata WHERE file_id = ${fileId} AND name = ${name}
+    `;
+  }
+
+  async removeAllForFile(fileId: number): Promise<void> {
+    await this.sql`DELETE FROM metadata WHERE file_id = ${fileId}`;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 直链
+// ---------------------------------------------------------------------------
+
+export class DirectLinkRepo {
+  private sql: Sql;
+  constructor(env: Env) {
+    this.sql = getSql(env);
+  }
+
+  async listByFile(fileId: number) {
+    const rows = (await this.sql`
+      SELECT * FROM direct_links WHERE file_id = ${fileId} AND deleted_at IS NULL ORDER BY id ASC
+    `) as Record<string, unknown>[];
+    return rows.map((r) => ({
+      id: toNum(r.id),
+      created_at: toDate(r.created_at) ?? new Date(),
+      name: String(r.name ?? ''),
+      downloads: toNum(r.downloads),
+      speed: toNum(r.speed),
+      file_id: toNum(r.file_id),
+    }));
+  }
+
+  async create(fileId: number, name: string, speed: number) {
+    const rows = (await this.sql`
+      INSERT INTO direct_links (name, downloads, speed, file_id)
+      VALUES (${name}, 0, ${speed}, ${fileId})
+      RETURNING *
+    `) as Record<string, unknown>[];
+    const r = rows[0]!;
+    return {
+      id: toNum(r.id),
+      created_at: toDate(r.created_at) ?? new Date(),
+      name: String(r.name ?? ''),
+      downloads: toNum(r.downloads),
+      speed: toNum(r.speed),
+      file_id: toNum(r.file_id),
+    };
+  }
+
+  async byId(id: number) {
+    const rows = (await this.sql`
+      SELECT * FROM direct_links WHERE id = ${id} AND deleted_at IS NULL LIMIT 1
+    `) as Record<string, unknown>[];
+    const r = rows[0];
+    if (!r) return null;
+    return {
+      id: toNum(r.id),
+      created_at: toDate(r.created_at) ?? new Date(),
+      name: String(r.name ?? ''),
+      downloads: toNum(r.downloads),
+      speed: toNum(r.speed),
+      file_id: toNum(r.file_id),
+    };
+  }
+
+  async incrementDownloads(id: number): Promise<void> {
+    await this.sql`UPDATE direct_links SET downloads = downloads + 1 WHERE id = ${id}`;
+  }
+
+  async softDelete(id: number): Promise<void> {
+    await this.sql`
+      UPDATE direct_links SET deleted_at = now(), updated_at = now() WHERE id = ${id}
+    `;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 任务
+// ---------------------------------------------------------------------------
+
+export class TaskRepo {
+  private sql: Sql;
+  constructor(env: Env) {
+    this.sql = getSql(env);
+  }
+
+  async create(args: {
+    type: string;
+    userId: number;
+    publicState: Record<string, unknown>;
+    privateState?: string | null;
+  }) {
+    const rows = (await this.sql`
+      INSERT INTO tasks (type, status, public_state, private_state, user_tasks)
+      VALUES (${args.type}, 'queued', ${JSON.stringify(args.publicState)}::jsonb,
+              ${args.privateState ?? null}, ${args.userId})
+      RETURNING *
+    `) as Record<string, unknown>[];
+    return normalizeTask(rows[0]!);
+  }
+
+  async byId(id: number): Promise<TaskRow | null> {
+    const rows = (await this.sql`
+      SELECT * FROM tasks WHERE id = ${id} AND deleted_at IS NULL LIMIT 1
+    `) as Record<string, unknown>[];
+    return rows[0] ? normalizeTask(rows[0]) : null;
+  }
+
+  async listByUser(args: {
+    userId: number;
+    pageSize: number;
+    types?: string[];
+  }): Promise<TaskRow[]> {
+    const rows = (await this.sql`
+      SELECT * FROM tasks
+      WHERE user_tasks = ${args.userId} AND deleted_at IS NULL
+        AND (${args.types ?? null}::text[] IS NULL OR type = ANY(${args.types ?? []}::text[]))
+      ORDER BY id DESC
+      LIMIT ${args.pageSize}
+    `) as Record<string, unknown>[];
+    return rows.map(normalizeTask);
+  }
+
+  async updateStatus(id: number, status: string, publicState?: Record<string, unknown>): Promise<void> {
+    if (publicState) {
+      await this.sql`
+        UPDATE tasks SET status = ${status}, public_state = ${JSON.stringify(publicState)}::jsonb,
+                         updated_at = now()
+        WHERE id = ${id}
+      `;
+    } else {
+      await this.sql`UPDATE tasks SET status = ${status}, updated_at = now() WHERE id = ${id}`;
+    }
+  }
+
+  async softDeleteMany(ids: number[]): Promise<void> {
+    for (const id of ids) {
+      await this.sql`UPDATE tasks SET deleted_at = now(), updated_at = now() WHERE id = ${id}`;
+    }
+  }
+
+  async countByStatus(): Promise<Record<string, number>> {
+    const rows = (await this.sql`
+      SELECT status, COUNT(*)::int AS total FROM tasks WHERE deleted_at IS NULL GROUP BY status
+    `) as Record<string, unknown>[];
+    const out: Record<string, number> = {};
+    for (const r of rows) out[String(r.status)] = toNum(r.total);
+    return out;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 工具
+// ---------------------------------------------------------------------------
+
+/**
+ * 把用户提供的排序字段限制在候选集合内。
+ * ORDER BY 无法参数化，所以必须走白名单，绝不能直接把用户输入拼进 SQL。
+ */
+export function whitelist(value: string | undefined | null, allowed: string[], fallback: string): string {
+  if (value && allowed.includes(value)) return value;
+  return fallback;
+}

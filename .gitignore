@@ -1,0 +1,24 @@
+# 依赖与构建产物
+node_modules/
+dist/
+dist-check/
+.wrangler/
+.wrangler-dist/
+
+# 本地机密（Neon 连接串等），**绝不要提交**
+.dev.vars
+.env
+.env.*
+
+# 官方前端构建产物（本地拷进来用于 [assets] 联调，不入库）
+frontend/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+
+# 日志与临时输出
+*.log

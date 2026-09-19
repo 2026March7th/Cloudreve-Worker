@@ -1,0 +1,76 @@
+#:schema node_modules/wrangler/config-schema.json
+name = "cloudreve-edge"
+main = "src/index.ts"
+compatibility_date = "2025-01-01"
+compatibility_flags = ["nodejs_compat"]
+
+# ---------------------------------------------------------------------------
+# 变量（非机密）。机密请用 `wrangler secret put <NAME>` 写入，不要写在这里。
+# ---------------------------------------------------------------------------
+[vars]
+# 站点对外地址，用于生成分享短链 / 下载直链 / 回调地址
+SITE_URL = "https://cloudreve-edge.example.workers.dev"
+# 官方前端的地址。**只在没有配置 [assets] 时才需要填**：
+# 填了就把非 /api 的请求原样反代过去（前端可独立部署在 Pages 等）。
+# 如果按下面的 [assets] 把官方前端构建产物随 Worker 一起发布，这里留空即可。
+FRONTEND_URL = ""
+# 日志级别: debug | info | warn | error
+LOG_LEVEL = "info"
+
+# ---------------------------------------------------------------------------
+# KV：会话黑名单、上传会话状态、验证码、实体 URL 缓存、OneDrive token 缓存
+# 创建：wrangler kv namespace create KV
+# ---------------------------------------------------------------------------
+[[kv_namespaces]]
+binding = "KV"
+id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
+preview_id = "REPLACE_WITH_YOUR_KV_PREVIEW_ID"
+
+# ---------------------------------------------------------------------------
+# R2：文件本体存储（作为内置的 "r2" 存储策略使用）
+# 创建：wrangler r2 bucket create cloudreve-edge
+# ---------------------------------------------------------------------------
+[[r2_buckets]]
+binding = "R2"
+bucket_name = "cloudreve-edge"
+
+# ---------------------------------------------------------------------------
+# 可选的 R2 公共访问域名，用于生成不带签名的直链
+# ---------------------------------------------------------------------------
+# [vars]
+# R2_PUBLIC_BASE = "https://files.example.com"
+
+# ---------------------------------------------------------------------------
+# 官方前端（cloudreve/frontend 的构建产物）
+#
+# 后端不内置任何自研前端。把官方前端构建产物放到 ./frontend 后取消下面的注释，
+# 静态文件与 SPA 回落就由平台的资源层直接处理，Worker 只处理 /api、/s、/f。
+#
+# 固定用上游 .gitmodules 里那个提交（在 master 分支上，该仓库没有 v4 分支），
+# 构建方式与上游 .build/build-assets.sh 一致：yarn，产物在 ./build。
+#
+#   git clone https://github.com/cloudreve/frontend.git
+#   cd frontend && git checkout 19da0fe1ecd40971fafa813983d769fdce41573c
+#   NODE_OPTIONS="--max-old-space-size=8192" yarn install && yarn run build
+#   cp -r build ../edge/frontend
+#
+# run_worker_first 保证 API / 短链 / 直链优先走 Worker，其余交给静态资源。
+# ---------------------------------------------------------------------------
+# [assets]
+# directory = "./frontend"
+# binding = "ASSETS"
+# not_found_handling = "single-page-application"
+# run_worker_first = ["/api/*", "/s/*", "/f/*"]
+
+# ---------------------------------------------------------------------------
+# 定时任务：回收站到期清理（对应原版的 trash_collector 队列任务）
+# 需要同步在 src/index.ts 的 scheduled() 里处理，已实现。
+# ---------------------------------------------------------------------------
+[triggers]
+crons = ["0 * * * *"]
+
+[observability]
+enabled = true
+
+[build]
+command = ""
