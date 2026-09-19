@@ -16,7 +16,7 @@ import { fail, ok, okWithCode } from '../lib/response';
 import { UserService } from '../services/user';
 import { PasskeyService } from '../services/passkey';
 import { OAuthService } from '../services/oauth';
-import { AppError, CodeNotFullySuccess, Err } from '../lib/errors';
+import { AppError, CodeNotFullySuccess, CodeNotFound, Err } from '../lib/errors';
 import { verifyCaptcha } from './site';
 
 export const sessionRoutes = new Hono<AppBindings>();
@@ -92,13 +92,19 @@ sessionRoutes.get('/prepare', async (c) => {
   if (!email) {
     return c.json(fail(c, Err.param('email is required')) as never);
   }
+  // 用户不存在时按上游返回 404（login.go:258 "User not found"），
+  // 不能吞掉 —— 前端对「查不到」和「无密码」的处理路径完全不同。
   const user = await ctx.users.byEmail(email);
+  if (!user) {
+    return c.json(fail(c, new AppError(CodeNotFound, 'User not found')) as never);
+  }
   return c.json(
     ok(c, {
-      // 站点设置 authn_enabled 决定登录页是否显示 Passkey 按钮
-      webauthn_enabled: ctx.settings.authnEnabled,
-      // 用户存在且设置了密码
-      password_enabled: Boolean(user?.password),
+      // 上游语义是「该用户**已注册过** passkey」（login.go:262，
+      // len(Passkey) > 0），不是站点设置 authn_enabled —— 搞混了前端
+      // 会在有密码的账号上误弹「无密码账号，请选择认证方式」。
+      webauthn_enabled: (await ctx.passkeys.listByUser(user.id)).length > 0,
+      password_enabled: Boolean(user.password),
     }) as never,
   );
 });
