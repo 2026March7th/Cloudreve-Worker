@@ -122,8 +122,22 @@ export function base64ToBytes(b64: string): Uint8Array<ArrayBuffer> {
   return out;
 }
 
+/** base64url **无填充**（JWT 用的是这种，RFC 7515 要求去掉 `=`）。 */
 export function bytesToBase64Url(bytes: Uint8Array): string {
   return bytesToBase64(bytes).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+/**
+ * base64url **带填充**。
+ *
+ * 只给 URL 签名用（`lib/sign.ts`）：上游用的是 Go 的 `base64.URLEncoding`，
+ * 它**保留** `=` 填充；而 JWT 用的 `base64.RawURLEncoding`（见 `pkg/auth/jwt.go`）
+ * 才去掉填充。两者不能混用 —— 32 字节的 HMAC-SHA256 摘要带填充是 44 字符
+ * （43 + `=`），不带是 43 字符，签名串因此对不上，跨端校验必然失败
+ * （例如从原版 Go 后端生成的直链由本 Worker 校验时）。
+ */
+export function bytesToBase64UrlPadded(bytes: Uint8Array): string {
+  return bytesToBase64(bytes).replace(/\+/g, '-').replace(/\//g, '_');
 }
 
 export function base64UrlToBytes(s: string): Uint8Array<ArrayBuffer> {

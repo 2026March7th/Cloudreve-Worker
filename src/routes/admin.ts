@@ -1,39 +1,54 @@
 /**
- * 管理后台路由。对应 Cloudreve v4 `routers/router.go` 的 admin 分组。
+ * 管理后台路由。对应 Cloudreve v4 `routers/router.go` 的 admin 分组
+ * （`router.go:872-1238`）。
+ *
+ * 本文件负责：概览、设置、用户组、存储策略（含 OneDrive OAuth）、测试发信。
+ * 内容类端点（用户 / 文件 / 实体 / 分享 / 任务 / 节点 / OAuth 应用）在
+ * `admin-content.ts`，通过 `adminRoutes.route('/', adminContentRoutes)` 挂进来，
+ * 共用下面这条管理员中间件。
  *
  * 已实现：
- *   GET    /api/v4/admin/summary              概览统计
- *   POST   /api/v4/admin/settings             读取设置
- *   PATCH  /api/v4/admin/settings             修改设置
- *   POST   /api/v4/admin/group                用户组列表
- *   GET    /api/v4/admin/group/:id            单个用户组
- *   PUT    /api/v4/admin/group                新建用户组
- *   PUT    /api/v4/admin/group/:id            更新用户组
- *   DELETE /api/v4/admin/group/:id            删除用户组
- *   POST   /api/v4/admin/user                 用户列表
- *   PATCH  /api/v4/admin/user/:id             修改用户
- *   DELETE /api/v4/admin/user/:id             封禁用户
- *   POST   /api/v4/admin/policy               存储策略列表
- *   PUT    /api/v4/admin/policy               新建策略
- *   PUT    /api/v4/admin/policy/:id           更新策略
- *   DELETE /api/v4/admin/policy/:id           删除策略
- *   POST   /api/v4/admin/queue                任务列表
+ *   GET    /api/v4/admin/summary                    概览统计
+ *   POST   /api/v4/admin/settings                   读取设置
+ *   PATCH  /api/v4/admin/settings                   修改设置
+ *   POST   /api/v4/admin/group                      用户组列表
+ *   GET    /api/v4/admin/group/:id                  单个用户组
+ *   PUT    /api/v4/admin/group                      新建用户组
+ *   PUT    /api/v4/admin/group/:id                  更新用户组
+ *   DELETE /api/v4/admin/group/:id                  删除用户组
+ *   POST   /api/v4/admin/policy                     存储策略列表
+ *   GET    /api/v4/admin/policy/:id                 存储策略详情
+ *   PUT    /api/v4/admin/policy                     新建策略
+ *   PUT    /api/v4/admin/policy/:id                 更新策略
+ *   DELETE /api/v4/admin/policy/:id                 删除策略
+ *   POST   /api/v4/admin/policy/cors                一键建 CORS
+ *   POST   /api/v4/admin/policy/oauth/signin        OneDrive 授权链接
+ *   GET    /api/v4/admin/policy/oauth/redirect      OAuth 回调地址
+ *   GET    /api/v4/admin/policy/oauth/status/:id    授权凭证状态
+ *   POST   /api/v4/admin/policy/oauth/callback      处理 OAuth 回调
+ *   GET    /api/v4/admin/policy/oauth/root/:id      SharePoint 站点根
+ *   POST   /api/v4/admin/tool/mail                  测试发信
+ *   DELETE /api/v4/admin/tool/entityUrlCache        清理直链缓存（边缘版无缓存，空操作）
  *
- * 未实现（返回「未启用」）：邮件测试、WOPI 探测、缩略图生成器测试、
- * 实体 URL 缓存清理、任务清理与批量删除、文件导入。
+ * 仍未实现（返回「未启用」40019）：WOPI 探测、缩略图生成器测试。
+ * 集群节点相关操作同样返回 40019 —— 边缘版是单体 Worker，没有节点可管。
  *
  * 付费/订单/兑换码相关的一切在原版社区版里就不存在，边缘版同样没有。
  */
 import { Hono } from 'hono';
 import type { AppBindings } from '../middleware/app';
 import { ctxOf } from '../middleware/app';
+import { permissionsOf } from '../services/context';
 import { fail, ok } from '../lib/response';
 import { UserService } from '../services/user';
+import { MailService } from '../services/mail';
 import { BooleanSet, GroupPermission } from '../lib/boolset';
 import { AppError, CodeFeatureNotEnabled, Err } from '../lib/errors';
 import { invalidateSettings } from '../settings/provider';
 import { SUPPORTED_POLICY_TYPES, isPolicyTypeSupported } from '../storage';
 import { BACKEND_VERSION } from './site';
+import { adminContentRoutes } from './admin-content';
+import { numericId, unwrapBody } from './shared';
 import { toByteaLiteral } from '../db';
 import type { HashIDCodec } from '../lib/hashid';
 import type { GroupRow, StoragePolicyRow } from '../db/types';
@@ -47,6 +62,10 @@ adminRoutes.use('*', async (c, next) => {
   if (!ctx.isAdmin) return c.json(fail(c, Err.adminRequired()) as never);
   await next();
 });
+
+// 内容类管理端点（用户 / 文件 / 实体 / 分享 / 任务 / 节点 / OAuth 应用）。
+// 挂在同一前缀下，上面那条管理员中间件对挂载进来的路由同样生效。
+adminRoutes.route('/', adminContentRoutes);
 
 /** 概览 */
 adminRoutes.get('/summary', async (c) => {
@@ -122,47 +141,86 @@ adminRoutes.patch('/settings', async (c) => {
 // 用户组
 // ---------------------------------------------------------------------------
 
-function groupToResponse(codec: HashIDCodec, group: GroupRow) {
-  const perms = group.permissions instanceof Uint8Array
-    ? new BooleanSet(group.permissions)
-    : BooleanSet.fromBase64(group.permissions as unknown as string);
-
-  return {
-    id: codec.encodeGroupID(group.id),
+/**
+ * 用户组的对外形态。
+ *
+ * 字段名照抄前端 `GroupEnt`（`api/dashboard.ts:43`）与上游 `ent.Group`：
+ *   - `id` 是**数字**（`CommonMixin.id: number`），hashid 另存 `hash_id`；
+ *   - 权限位集叫 `permissions`（复数），不是 `permission`；
+ *   - 绑定的策略走 `edges.storage_policies`，前端从 `?.id` 取数字，
+ *     列表里的 `storage_policy_id` 它也读；
+ *   - `total_users` 与 `pagination` 由 ListGroup 一并返回。
+ */
+function groupToResponse(
+  codec: HashIDCodec,
+  group: GroupRow,
+  extras: { storagePolicy?: StoragePolicyRow | null; totalUsers?: number } = {},
+) {
+  const out: Record<string, unknown> = {
+    id: group.id,
+    hash_id: codec.encodeGroupID(group.id),
+    created_at: group.created_at.toISOString(),
+    updated_at: group.updated_at.toISOString(),
+    deleted_at: group.deleted_at ? group.deleted_at.toISOString() : null,
     name: group.name,
-    max_storage: group.max_storage === null || group.max_storage === undefined
-      ? 0
-      : Number(group.max_storage),
+    max_storage:
+      group.max_storage === null || group.max_storage === undefined
+        ? 0
+        : Number(group.max_storage),
     speed_limit: group.speed_limit ?? 0,
-    permission: perms.toBase64(),
+    permissions: permissionsOf(group).toBase64(),
     settings: group.settings ?? {},
-    storage_policy_id: group.storage_policy_id
-      ? codec.encodePolicyID(group.storage_policy_id)
-      : '',
+    storage_policy_id: group.storage_policy_id ?? 0,
+    edges: {
+      storage_policies: extras.storagePolicy
+        ? policyToResponse(codec, extras.storagePolicy)
+        : undefined,
+    },
   };
+  if (extras.totalUsers !== undefined) out.total_users = extras.totalUsers;
+  return out;
+}
+
+/** 组响应里附带的策略边，按 storage_policy_id 现查。 */
+async function groupExtras(ctx: ReturnType<typeof ctxOf>, group: GroupRow) {
+  const policy = group.storage_policy_id ? await ctx.policies.byId(group.storage_policy_id) : null;
+  return { storagePolicy: policy, totalUsers: await ctx.groups.countUsers(group.id) };
 }
 
 adminRoutes.post('/group', async (c) => {
   const ctx = ctxOf(c);
+  const body = (await c.req.json().catch(() => ({}))) as {
+    page?: number;
+    page_size?: number;
+  };
   const groups = await ctx.groups.list();
   const out = [];
   for (const g of groups) {
-    const item = groupToResponse(ctx.codec, g);
-    out.push({ ...item, user_count: await ctx.groups.countUsers(g.id) });
+    out.push(groupToResponse(ctx.codec, g, await groupExtras(ctx, g)));
   }
-  return c.json(ok(c, { groups: out }) as never);
+  return c.json(
+    ok(c, {
+      groups: out,
+      pagination: {
+        page: Number(body.page ?? 0) || 0,
+        page_size: Number(body.page_size ?? 20) || 20,
+        total_items: groups.length,
+      },
+    }) as never,
+  );
 });
 
 adminRoutes.get('/group/:id', async (c) => {
   const ctx = ctxOf(c);
-  const id = ctx.codec.decodeGroupID(c.req.param('id'));
+  const id = numericId(c.req.param('id'), (v) => ctx.codec.decodeGroupID(v));
   if (id === null) return c.json(fail(c, new AppError(40039, 'Group not found')) as never);
   const group = await ctx.groups.byId(id);
   if (!group) return c.json(fail(c, new AppError(40039, 'Group not found')) as never);
-  return c.json(ok(c, groupToResponse(ctx.codec, group)) as never);
+  return c.json(ok(c, groupToResponse(ctx.codec, group, await groupExtras(ctx, group))) as never);
 });
 
-/** 从请求体解析权限位集：接受 base64 字符串或权限位号数组。 */
+
+/** 从请求体解析权限位集：接受 base64 字符串（前端 Boolset）或权限位号数组。 */
 function parsePermission(input: unknown, fallback: BooleanSet): BooleanSet {
   if (Array.isArray(input)) {
     const bs = new BooleanSet();
@@ -175,16 +233,39 @@ function parsePermission(input: unknown, fallback: BooleanSet): BooleanSet {
   return fallback;
 }
 
+/**
+ * 从组请求体里取要绑定的策略 ID。
+ *
+ * 前端 `GroupSettingWrapper.groupValueFilter` 一定会填
+ * `edges.storage_policies.id`，没选时是 `0`；`0` 表示「不绑定任何策略」。
+ * 顺手兼容顶层 `storage_policy_id`（上游 ent.Group 的字段名）。
+ */
+function policyIdFromGroupBody(
+  body: Record<string, unknown>,
+  codec: HashIDCodec,
+): number | null {
+  const edges = body.edges as { storage_policies?: { id?: unknown } } | undefined;
+  const fromEdges = edges?.storage_policies?.id;
+  if (fromEdges !== undefined && fromEdges !== null) {
+    const n = Number(fromEdges);
+    return Number.isFinite(n) && n > 0 ? n : null;
+  }
+
+  const raw = body.storage_policy_id;
+  if (typeof raw === 'number') return raw > 0 ? raw : null;
+  if (typeof raw === 'string' && raw) {
+    return numericId(raw, (v) => codec.decodePolicyID(v));
+  }
+  return null;
+}
+
 adminRoutes.put('/group', async (c) => {
   const ctx = ctxOf(c);
-  const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
+  const raw = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
+  const body = unwrapBody<Record<string, unknown>>(raw, 'group');
   if (!body.name) return c.json(fail(c, Err.param('name is required')) as never);
 
-  const perms = parsePermission(body.permission, new BooleanSet());
-  let policyId: number | null = null;
-  if (typeof body.storage_policy_id === 'string' && body.storage_policy_id) {
-    policyId = ctx.codec.decodePolicyID(body.storage_policy_id);
-  }
+  const perms = parsePermission(body.permissions, new BooleanSet());
 
   try {
     const group = await ctx.groups.create({
@@ -193,9 +274,9 @@ adminRoutes.put('/group', async (c) => {
       speedLimit: body.speed_limit !== undefined ? Number(body.speed_limit) : null,
       permissions: perms.toBytes(),
       settings: (body.settings as Record<string, unknown>) ?? {},
-      storagePolicyId: policyId,
+      storagePolicyId: policyIdFromGroupBody(body, ctx.codec),
     });
-    return c.json(ok(c, groupToResponse(ctx.codec, group)) as never);
+    return c.json(ok(c, groupToResponse(ctx.codec, group, await groupExtras(ctx, group))) as never);
   } catch (e) {
     return c.json(fail(c, e) as never);
   }
@@ -203,12 +284,13 @@ adminRoutes.put('/group', async (c) => {
 
 adminRoutes.put('/group/:id', async (c) => {
   const ctx = ctxOf(c);
-  const id = ctx.codec.decodeGroupID(c.req.param('id'));
+  const id = numericId(c.req.param('id'), (v) => ctx.codec.decodeGroupID(v));
   if (id === null) return c.json(fail(c, new AppError(40039, 'Group not found')) as never);
   const group = await ctx.groups.byId(id);
   if (!group) return c.json(fail(c, new AppError(40039, 'Group not found')) as never);
 
-  const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
+  const raw = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
+  const body = unwrapBody<Record<string, unknown>>(raw, 'group');
   const patch: Parameters<typeof ctx.groups.patch>[1] = {};
 
   if (body.name !== undefined) patch.name = String(body.name);
@@ -219,20 +301,20 @@ adminRoutes.put('/group/:id', async (c) => {
     patch.maxStorage = v < 0 ? null : v;
   }
   if (body.speed_limit !== undefined) patch.speedLimit = Number(body.speed_limit);
-  if (body.permission !== undefined) {
-    patch.permissions = parsePermission(body.permission, new BooleanSet()).toBytes();
+  if (body.permissions !== undefined) {
+    patch.permissions = parsePermission(body.permissions, new BooleanSet()).toBytes();
   }
   if (body.settings !== undefined) patch.settings = body.settings as Record<string, unknown>;
-  if (body.storage_policy_id !== undefined) {
-    const raw = body.storage_policy_id;
-    patch.storagePolicyId =
-      typeof raw === 'string' && raw ? ctx.codec.decodePolicyID(raw) : null;
+  if (body.edges !== undefined || body.storage_policy_id !== undefined) {
+    patch.storagePolicyId = policyIdFromGroupBody(body, ctx.codec);
   }
 
   try {
     await ctx.groups.patch(id, patch);
     const updated = await ctx.groups.byId(id);
-    return c.json(ok(c, groupToResponse(ctx.codec, updated!)) as never);
+    return c.json(
+      ok(c, groupToResponse(ctx.codec, updated!, await groupExtras(ctx, updated!))) as never,
+    );
   } catch (e) {
     return c.json(fail(c, e) as never);
   }
@@ -240,7 +322,7 @@ adminRoutes.put('/group/:id', async (c) => {
 
 adminRoutes.delete('/group/:id', async (c) => {
   const ctx = ctxOf(c);
-  const id = ctx.codec.decodeGroupID(c.req.param('id'));
+  const id = numericId(c.req.param('id'), (v) => ctx.codec.decodeGroupID(v));
   if (id === null) return c.json(fail(c, new AppError(40039, 'Group not found')) as never);
 
   // 系统内置组（1=管理员 2=默认用户 3=匿名）禁止删除，与原版一致
@@ -310,46 +392,181 @@ adminRoutes.delete('/user/:id', async (c) => {
   }
 });
 
+/**
+ * 生成一条密码重置链接并直接返回。**边缘版新增，上游没有这个端点。**
+ *
+ * 存在的理由：邮件是外部依赖（Resend / 收件方），一旦发不出去，
+ * Workers 上既没有 shell 也没有能翻的本地数据库文件，管理员就彻底没法帮用户
+ * 重置密码。返回的链接走的是同一套 KV 令牌（`user_reset_<uid>`），
+ * 和邮件里那条完全等价，可以手工转交。
+ */
+adminRoutes.post('/user/:id/reset-link', async (c) => {
+  const ctx = ctxOf(c);
+  const uid = ctx.codec.decodeUserID(c.req.param('id'));
+  if (uid === null) return c.json(fail(c, Err.userNotFound()) as never);
+
+  const user = await ctx.users.byId(uid);
+  if (!user) return c.json(fail(c, Err.userNotFound()) as never);
+
+  try {
+    // 复用邮箱那条路：同样拒绝被封禁 / 未激活的账号
+    const res = await new UserService(ctx).createResetUrl(user.email);
+    return c.json(ok(c, res) as never);
+  } catch (e) {
+    return c.json(fail(c, e) as never);
+  }
+});
+
 // ---------------------------------------------------------------------------
 // 存储策略
 // ---------------------------------------------------------------------------
 
-function policyToResponse(codec: HashIDCodec, policy: StoragePolicyRow, includeSecrets = false) {
+/**
+ * 存储策略的对外形态。字段照抄上游 `ent.StoragePolicy` + `GetStoragePolicyResponse`：
+ *
+ *   - `id` 是**数字**（上游 `ID int`，前端 `CommonMixin.id: number`），
+ *     路径参数也一样是数字；hashid 另存 `hash_id`（上游不下发，这里补上便于分享）；
+ *   - `access_key` / `secret_key` **原样返回**。上游 `GetPolicyByID` 直接吐
+ *     ent 实体，没有脱敏，而且前端要靠 `access_key` 判断 OneDrive 是否已授权
+ *     （`OdSignInStatus.tsx:25`），靠 `secret_key` 回填 App Secret。
+ *     这条端点有管理员门禁，与上游的暴露面一致；
+ *   - `edges.groups` 是「哪些用户组绑了这条策略」，前端用它决定是否提示
+ *     「没有组绑定此策略」（`StoragePolicyForm.tsx:21`）；
+ *   - `countEntity` 查询参数带上时才回 `entities_count` / `entities_size`。
+ */
+function policyToResponse(
+  codec: HashIDCodec,
+  policy: StoragePolicyRow,
+  extras: {
+    entitiesCount?: number;
+    entitiesSize?: number;
+    groups?: { id: number; name: string }[];
+  } = {},
+) {
   const out: Record<string, unknown> = {
-    id: codec.encodePolicyID(policy.id),
+    id: policy.id,
+    hash_id: codec.encodePolicyID(policy.id),
+    created_at: policy.created_at.toISOString(),
+    updated_at: policy.updated_at.toISOString(),
+    deleted_at: policy.deleted_at ? policy.deleted_at.toISOString() : null,
     name: policy.name,
     type: policy.type,
     server: policy.server ?? '',
     bucket_name: policy.bucket_name ?? '',
     is_private: policy.is_private === true,
+    access_key: policy.access_key ?? '',
+    secret_key: policy.secret_key ?? '',
     max_size: Number(policy.max_size ?? 0),
     dir_name_rule: policy.dir_name_rule ?? '',
     file_name_rule: policy.file_name_rule ?? '',
     settings: policy.settings ?? {},
+    node_id: policy.node_id ?? 0,
     supported: isPolicyTypeSupported(policy.type),
+    edges: {
+      groups: extras.groups ?? [],
+      users: [],
+      files: [],
+      entities: [],
+      node: null,
+    },
   };
-  if (includeSecrets) {
-    // 与原版一致：密钥字段只在创建/更新时写入，读取时留空
-    out.access_key = '';
-    out.secret_key = '';
-  }
+  if (extras.entitiesCount !== undefined) out.entities_count = extras.entitiesCount;
+  if (extras.entitiesSize !== undefined) out.entities_size = extras.entitiesSize;
   return out;
+}
+
+/** 绑定了该策略的用户组（上游靠 `LoadStoragePolicyGroup{}` 预加载 `edges.groups`）。 */
+async function policyGroups(
+  ctx: ReturnType<typeof ctxOf>,
+  policyId: number,
+): Promise<{ id: number; name: string }[]> {
+  const sql = (await import('../db')).getSql(ctx.env);
+  const rows = (await sql`
+    SELECT id, name FROM groups WHERE storage_policy_id = ${policyId} AND deleted_at IS NULL ORDER BY id ASC
+  `) as { id: unknown; name: string }[];
+  return rows.map((r) => ({ id: Number(r.id), name: r.name }));
+}
+
+/** 策略下的实体总数与总大小，对应上游 `CountEntityByStoragePolicyID`。 */
+async function policyEntityStats(
+  ctx: ReturnType<typeof ctxOf>,
+  policyId: number,
+): Promise<{ count: number; size: number }> {
+  const sql = (await import('../db')).getSql(ctx.env);
+  const rows = (await sql`
+    SELECT COUNT(*)::int AS total, COALESCE(SUM(size), 0) AS total_size
+    FROM entities WHERE storage_policy_entities = ${policyId} AND deleted_at IS NULL
+  `) as Record<string, unknown>[];
+  return {
+    count: Number(rows[0]?.total ?? 0),
+    size: Number(rows[0]?.total_size ?? 0),
+  };
 }
 
 adminRoutes.post('/policy', async (c) => {
   const ctx = ctxOf(c);
+  const body = (await c.req.json().catch(() => ({}))) as { page?: number; page_size?: number };
   const policies = await ctx.policies.list();
   return c.json(
     ok(c, {
       policies: policies.map((p) => policyToResponse(ctx.codec, p)),
+      // 前端 `ListStoragePolicyResponse` 要求 pagination 存在
+      pagination: {
+        page: Number(body.page ?? 0) || 0,
+        page_size: Number(body.page_size ?? 20) || 20,
+        total_items: policies.length,
+      },
       supported_types: SUPPORTED_POLICY_TYPES,
     }) as never,
   );
 });
 
+/** 策略详情。对应上游 `SingleStoragePolicyService.Get`（`service/admin/policy.go:229`）。 */
+adminRoutes.get('/policy/:id', async (c) => {
+  const ctx = ctxOf(c);
+  const id = numericId(c.req.param('id'), (v) => ctx.codec.decodePolicyID(v));
+  if (id === null) return c.json(fail(c, new AppError(40035, 'Policy not found')) as never);
+
+  const policy = await ctx.policies.byId(id);
+  if (!policy) return c.json(fail(c, new AppError(40035, 'Policy not found')) as never);
+
+  const extras: Parameters<typeof policyToResponse>[2] = {
+    groups: await policyGroups(ctx, id),
+  };
+  // 只有带上 countEntity 才统计，与上游一致
+  if (c.req.query('countEntity') !== undefined) {
+    const stats = await policyEntityStats(ctx, id);
+    extras.entitiesCount = stats.count;
+    extras.entitiesSize = stats.size;
+  }
+
+  return c.json(ok(c, policyToResponse(ctx.codec, policy, extras)) as never);
+});
+
+/**
+ * 把策略请求体（`{policy: {...}}`，前端一定包一层）映射成仓储层的创建参数。
+ * 字段名与上游 `ent.StoragePolicy` 一致。
+ */
+function policyCreateArgs(body: Record<string, unknown>, type: string) {
+  return {
+    name: String(body.name),
+    type,
+    server: (body.server as string) || null,
+    bucketName: (body.bucket_name as string) || null,
+    isPrivate: body.is_private === undefined ? null : Boolean(body.is_private),
+    accessKey: (body.access_key as string) || null,
+    secretKey: (body.secret_key as string) || null,
+    maxSize: body.max_size !== undefined ? Number(body.max_size) : null,
+    dirNameRule: (body.dir_name_rule as string) || null,
+    fileNameRule: (body.file_name_rule as string) || null,
+    settings: (body.settings as Record<string, unknown>) ?? {},
+  };
+}
+
 adminRoutes.put('/policy', async (c) => {
   const ctx = ctxOf(c);
-  const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
+  const raw = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
+  const body = unwrapBody<Record<string, unknown>>(raw, 'policy');
   if (!body.name || !body.type) {
     return c.json(fail(c, Err.param('name and type are required')) as never);
   }
@@ -360,20 +577,8 @@ adminRoutes.put('/policy', async (c) => {
     );
   }
   try {
-    const policy = await ctx.policies.create({
-      name: String(body.name),
-      type,
-      server: (body.server as string) || null,
-      bucketName: (body.bucket_name as string) || null,
-      isPrivate: body.is_private as boolean | undefined,
-      accessKey: (body.access_key as string) || null,
-      secretKey: (body.secret_key as string) || null,
-      maxSize: body.max_size !== undefined ? Number(body.max_size) : null,
-      dirNameRule: (body.dir_name_rule as string) || null,
-      fileNameRule: (body.file_name_rule as string) || null,
-      settings: (body.settings as Record<string, unknown>) ?? {},
-    });
-    return c.json(ok(c, policyToResponse(ctx.codec, policy, true)) as never);
+    const policy = await ctx.policies.create(policyCreateArgs(body, type));
+    return c.json(ok(c, policyToResponse(ctx.codec, policy)) as never);
   } catch (e) {
     return c.json(fail(c, e) as never);
   }
@@ -381,12 +586,13 @@ adminRoutes.put('/policy', async (c) => {
 
 adminRoutes.put('/policy/:id', async (c) => {
   const ctx = ctxOf(c);
-  const id = ctx.codec.decodePolicyID(c.req.param('id'));
+  const id = numericId(c.req.param('id'), (v) => ctx.codec.decodePolicyID(v));
   if (id === null) return c.json(fail(c, new AppError(40035, 'Policy not found')) as never);
   const policy = await ctx.policies.byId(id);
   if (!policy) return c.json(fail(c, new AppError(40035, 'Policy not found')) as never);
 
-  const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
+  const raw = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
+  const body = unwrapBody<Record<string, unknown>>(raw, 'policy');
   if (body.type !== undefined && !isPolicyTypeSupported(String(body.type))) {
     return c.json(
       fail(c, new AppError(40006, `Policy type "${body.type}" is not supported`)) as never,
@@ -408,15 +614,23 @@ adminRoutes.put('/policy/:id', async (c) => {
         ...(body.settings !== undefined ? { settings: body.settings } : {}),
       },
       {
-        // 空字符串表示「不改动」——避免前端回填空值把密钥清掉
-        ...(body.access_key ? { accessKey: String(body.access_key) } : {}),
-        ...(body.secret_key ? { secretKey: String(body.secret_key) } : {}),
+        // 空值表示「不改动」——前端会把读到的值原样回填，这里防的是空串把密钥冲掉
+        ...(body.access_key !== undefined && body.access_key !== null
+          ? { accessKey: String(body.access_key) }
+          : {}),
+        ...(body.secret_key !== undefined && body.secret_key !== null
+          ? { secretKey: String(body.secret_key) }
+          : {}),
       },
     );
     // 策略改动后，指向该策略的 OneDrive 凭证缓存需要失效
     await ctx.env.KV.delete(`cred_od_${id}`);
+
+    // 上游 Update 之后紧接着调 Get，这里照做：返回带 edges 的详情
     const updated = await ctx.policies.byId(id);
-    return c.json(ok(c, policyToResponse(ctx.codec, updated!, true)) as never);
+    return c.json(
+      ok(c, policyToResponse(ctx.codec, updated!, { groups: await policyGroups(ctx, id) })) as never,
+    );
   } catch (e) {
     return c.json(fail(c, e) as never);
   }
@@ -424,8 +638,13 @@ adminRoutes.put('/policy/:id', async (c) => {
 
 adminRoutes.delete('/policy/:id', async (c) => {
   const ctx = ctxOf(c);
-  const id = ctx.codec.decodePolicyID(c.req.param('id'));
+  const id = numericId(c.req.param('id'), (v) => ctx.codec.decodePolicyID(v));
   if (id === null) return c.json(fail(c, new AppError(40035, 'Policy not found')) as never);
+
+  // 默认策略（id=1）禁止删除，与上游 `SingleStoragePolicyService.Delete` 一致
+  if (id === 1) {
+    return c.json(fail(c, new AppError(40036, 'Cannot delete the default storage policy')) as never);
+  }
 
   const fileCount = await ctx.policies.countFiles(id);
   if (fileCount > 0) {
@@ -439,10 +658,183 @@ adminRoutes.delete('/policy/:id', async (c) => {
   return c.json(ok(c) as never);
 });
 
-/** 生成 OneDrive 授权链接（后台配置策略时用）。 */
+// ---------------------------------------------------------------------------
+// 存储策略 · CORS 与 OneDrive OAuth
+// ---------------------------------------------------------------------------
+
+/** 回调地址：站点根 + `/admin/policy/oauth`，强制 https。对应上游 `MasterPolicyOAuthCallback`。 */
+function oauthCallbackUrlFor(siteUrl: string): string {
+  let base: URL;
+  try {
+    base = new URL(siteUrl);
+  } catch {
+    base = new URL('https://localhost');
+  }
+  base.protocol = 'https:';
+  return new URL('/admin/policy/oauth', base).toString();
+}
+
+/**
+ * 一键建 CORS。上游对 oss/cos/s3/ks3/obs 分别调驱动；边缘版这两种策略类型
+ * （r2 / onedrive）都没有「桶 CORS」这个概念，所以按上游 `default` 分支
+ * 返回参数错误，而不是假装成功。
+ */
+adminRoutes.post('/policy/cors', async (c) => {
+  const raw = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
+  const body = unwrapBody<Record<string, unknown>>(raw, 'policy');
+  return c.json(
+    fail(
+      c,
+      Err.param(
+        `CORS setup is not available for policy type "${String(body.type ?? '')}"`,
+      ),
+    ) as never,
+  );
+});
+
+/** 获取 OAuth 回调地址。对应 `AdminGetPolicyOAuthCallbackURL`。 */
+adminRoutes.get('/policy/oauth/redirect', async (c) => {
+  const ctx = ctxOf(c);
+  return c.json(ok(c, oauthCallbackUrlFor(ctx.settings.siteUrl)) as never);
+});
+
+/**
+ * 取 OneDrive 授权页 URL。对应上游 `GetOauthRedirectService.GetOAuth`。
+ *
+ * 上游在这里**顺手把表单上的 App ID / Secret 存进库里**，并把 `od_redirect`
+ * 刷成当前站点地址（用户可能刚改过域名）。授权页是拿新参数生成的，
+ * 所以这一步不能省——否则回调会因为 redirect_uri 对不上被微软拒绝。
+ */
+adminRoutes.post('/policy/oauth/signin', async (c) => {
+  const ctx = ctxOf(c);
+  const body = (await c.req.json().catch(() => ({}))) as {
+    id?: unknown;
+    secret?: unknown;
+    app_id?: unknown;
+  };
+
+  const id = Number(body.id);
+  if (!Number.isFinite(id) || id <= 0) {
+    return c.json(fail(c, Err.param('Invalid policy ID')) as never);
+  }
+
+  const policy = await ctx.policies.byId(id);
+  if (!policy || policy.type !== 'onedrive') {
+    return c.json(fail(c, new AppError(40035, 'Policy not found')) as never);
+  }
+
+  const redirect = oauthCallbackUrlFor(ctx.settings.siteUrl);
+  const settings = { ...(policy.settings ?? {}), od_redirect: redirect };
+
+  try {
+    await ctx.policies.update(
+      id,
+      { settings, bucket_name: String(body.app_id ?? '') },
+      { secretKey: String(body.secret ?? '') },
+    );
+    await ctx.env.KV.delete(`cred_od_${id}`);
+
+    const updated = await ctx.policies.byId(id);
+    const { OneDriveDriver } = await import('../storage/onedrive');
+    const driver = new OneDriveDriver(ctx.env, updated!);
+    // scope 与上游一致
+    return c.json(ok(c, driver.authorizeUrl(['offline_access', 'files.readwrite.all'])) as never);
+  } catch (e) {
+    return c.json(fail(c, e) as never);
+  }
+});
+
+/** 查看授权凭证是否有效。对应 `GetOauthCredentialStatus`。 */
+adminRoutes.get('/policy/oauth/status/:id', async (c) => {
+  const ctx = ctxOf(c);
+  const id = numericId(c.req.param('id'), (v) => ctx.codec.decodePolicyID(v));
+  if (id === null) return c.json(fail(c, new AppError(40035, 'Policy not found')) as never);
+
+  const policy = await ctx.policies.byId(id);
+  if (!policy || policy.type !== 'onedrive') {
+    return c.json(fail(c, new AppError(40035, 'Policy not found')) as never);
+  }
+
+  try {
+    const { OneDriveDriver } = await import('../storage/onedrive');
+    const status = await new OneDriveDriver(ctx.env, policy).credentialStatus();
+    return c.json(ok(c, status) as never);
+  } catch (e) {
+    return c.json(fail(c, e) as never);
+  }
+});
+
+/**
+ * 处理微软回调。对应 `FinishOauthCallbackService`。
+ *
+ * `state` 就是策略 ID（授权 URL 里写进去的）。换到 token 后要把 refresh_token
+ * **写回 `policy.access_key`**——上游在 `Credential.Refresh()` 里同样这么干
+ * （`onedrive/oauth.go:122 UpdateAccessKey`）。不写回的话 Worker 重启、
+ * KV 过期之后就再也刷不出新 token 了。
+ */
+adminRoutes.post('/policy/oauth/callback', async (c) => {
+  const ctx = ctxOf(c);
+  const body = (await c.req.json().catch(() => ({}))) as { code?: unknown; state?: unknown };
+  if (!body.code || !body.state) {
+    return c.json(fail(c, Err.param('code and state are required')) as never);
+  }
+
+  const id = Number(body.state);
+  if (!Number.isFinite(id) || id <= 0) {
+    return c.json(fail(c, Err.param('Invalid state')) as never);
+  }
+
+  const policy = await ctx.policies.byId(id);
+  if (!policy) return c.json(fail(c, new AppError(40035, 'Policy not found')) as never);
+  if (policy.type !== 'onedrive') {
+    return c.json(fail(c, Err.param('Invalid policy type')) as never);
+  }
+
+  try {
+    const { OneDriveDriver } = await import('../storage/onedrive');
+    const credential = await new OneDriveDriver(ctx.env, policy).exchangeCode(String(body.code));
+    await ctx.policies.update(id, {}, { accessKey: credential.refresh_token });
+    return c.json(ok(c) as never);
+  } catch (e) {
+    return c.json(fail(c, Err.param(e instanceof Error ? e.message : String(e))) as never);
+  }
+});
+
+/**
+ * SharePoint 站点 URL → 驱动根（`<siteId>/drive`）。对应 `GetSharePointDriverRoot`。
+ * 结果会被前端塞进 `settings.od_driver`。
+ */
+adminRoutes.get('/policy/oauth/root/:id', async (c) => {
+  const ctx = ctxOf(c);
+  const id = numericId(c.req.param('id'), (v) => ctx.codec.decodePolicyID(v));
+  if (id === null) return c.json(fail(c, new AppError(40035, 'Policy not found')) as never);
+
+  const policy = await ctx.policies.byId(id);
+  if (!policy) return c.json(fail(c, new AppError(40035, 'Policy not found')) as never);
+  if (policy.type !== 'onedrive') {
+    return c.json(fail(c, Err.param('Invalid policy type')) as never);
+  }
+
+  const url = c.req.query('url');
+  if (!url) return c.json(fail(c, Err.param('url is required')) as never);
+
+  try {
+    const { OneDriveDriver } = await import('../storage/onedrive');
+    const root = await new OneDriveDriver(ctx.env, policy).getSiteIdByUrl(url);
+    return c.json(ok(c, root) as never);
+  } catch (e) {
+    return c.json(fail(c, e) as never);
+  }
+});
+
+/**
+ * 生成 OneDrive 授权链接。**边缘版保留的旧端点，上游没有。**
+ * 与 `POST /policy/oauth/signin` 等价，只是不接收 App ID / Secret，
+ * 直接用库里已存的凭据。留着是为了不破坏已有的运维脚本。
+ */
 adminRoutes.get('/policy/:id/oauth', async (c) => {
   const ctx = ctxOf(c);
-  const id = ctx.codec.decodePolicyID(c.req.param('id'));
+  const id = numericId(c.req.param('id'), (v) => ctx.codec.decodePolicyID(v));
   if (id === null) return c.json(fail(c, new AppError(40035, 'Policy not found')) as never);
   const policy = await ctx.policies.byId(id);
   if (!policy) return c.json(fail(c, new AppError(40035, 'Policy not found')) as never);
@@ -452,36 +844,57 @@ adminRoutes.get('/policy/:id/oauth', async (c) => {
 
   const { OneDriveDriver } = await import('../storage/onedrive');
   const driver = new OneDriveDriver(ctx.env, policy);
-  // scope 与原版 service/admin/policy.go 一致
-  return c.json(ok(c, { url: driver.authorizeUrl(['offline_access', 'files.readwrite.all']) }) as never);
+  return c.json(ok(c, driver.authorizeUrl(['offline_access', 'files.readwrite.all'])) as never);
 });
 
-/** 任务列表 */
-adminRoutes.post('/queue', async (c) => {
+
+/**
+ * 测试发信。对应上游 `routers/router.go:939 tool.POST("mail")` →
+ * `service/admin/tools.go:137 TestSMTPService.Test`。
+ *
+ * 请求体：`{ settings: {...}, to: "someone@example.com" }`。
+ * `settings` 是**表单里当前的值**（未保存也生效）—— 这是「测试」的全部意义：
+ * 验证你刚填的那套参数能不能发出去。所以整份 settings 都要透传给服务层，
+ * 而不是只挑几个发件人字段。
+ *
+ * 端口非法报 40001，其余失败报 50005（都对齐上游）。
+ */
+adminRoutes.post('/tool/mail', async (c) => {
   const ctx = ctxOf(c);
-  const body = (await c.req.json().catch(() => ({}))) as { page_size?: number };
-  const byStatus = await ctx.tasks.countByStatus();
-  return c.json(
-    ok(c, {
-      tasks: [],
-      pagination: { page: 0, page_size: Number(body.page_size ?? 20) || 20, total_items: 0 },
-      metrics: { by_status: byStatus },
-    }) as never,
-  );
+  const body = (await c.req.json().catch(() => ({}))) as {
+    settings?: Record<string, string>;
+    to?: string;
+  };
+
+  if (!body.to) return c.json(fail(c, Err.param('Recipient is required')) as never);
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(body.to)) {
+    return c.json(fail(c, Err.param('Invalid email address')) as never);
+  }
+
+  try {
+    await new MailService(ctx).sendTestEmail(body.to, body.settings ?? {});
+    return c.json(ok(c) as never);
+  } catch (e) {
+    return c.json(fail(c, e) as never);
+  }
 });
+
+/**
+ * 实体直链缓存清理。对应上游 `AdminClearEntityUrlCache`。
+ *
+ * 上游把带签名的直链缓存进 KV，所以这个按钮有意义。边缘版**不缓存直链**
+ * （每次现算，见 `services/download.ts`），因此这里确实是无事可做 ——
+ * 返回成功是如实回答，不是假装。
+ */
+adminRoutes.delete('/tool/entityUrlCache', async (c) => c.json(ok(c) as never));
 
 // ---------------------------------------------------------------------------
 // 未实现的工具端点
 // ---------------------------------------------------------------------------
 
 const NOT_IMPLEMENTED_ADMIN: Record<string, string> = {
-  '/tool/mail': 'SMTP delivery is not implemented in the edge build',
   '/tool/wopi': 'WOPI discovery is not implemented in the edge build',
   '/tool/thumbExecutable': 'Thumbnail generation is not implemented in the edge build',
-  '/tool/entityUrlCache': 'Entity URL cache clearing is not implemented in the edge build',
-  '/queue/:id': 'Task inspection is not implemented in the edge build',
-  '/queue/batch/delete': 'Task management is not implemented in the edge build',
-  '/queue/cleanup': 'Task cleanup is not implemented in the edge build',
 };
 
 for (const [path, message] of Object.entries(NOT_IMPLEMENTED_ADMIN)) {

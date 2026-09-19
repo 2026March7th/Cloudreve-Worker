@@ -182,6 +182,22 @@ export class UserRepo {
     return rows[0] ? normalizeUser(rows[0]) : null;
   }
 
+  /**
+   * 按关键字搜索活跃用户（nick / email 模糊匹配）。
+   * 对应上游 `userClient.SearchActive`（inventory/user.go:467）。
+   */
+  async searchActive(keyword: string, limit: number): Promise<UserRow[]> {
+    const pattern = `%${keyword.replaceAll('\\', '\\\\').replaceAll('%', '\\%').replaceAll('_', '\\_')}%`;
+    const rows = (await this.sql`
+      SELECT * FROM users
+      WHERE (email ILIKE ${pattern} OR nick ILIKE ${pattern})
+        AND status = 'active' AND deleted_at IS NULL
+      ORDER BY id ASC
+      LIMIT ${limit}
+    `) as Record<string, unknown>[];
+    return rows.map(normalizeUser);
+  }
+
   /** 取用户并带上所属用户组（权限判定几乎都要用到 group）。 */
   async byIdWithGroup(id: number): Promise<UserWithGroup | null> {
     const rows = (await this.sql`
@@ -219,11 +235,21 @@ export class UserRepo {
     passwordDigest: string | null;
     groupId: number;
     status?: string;
+    /** 注册时前端带过来的界面语言，写进 `settings.email_language`（邮件按它选模板）。 */
+    language?: string | null;
   }): Promise<UserRow> {
     // 新建用户的默认设置照抄原版 `inventory/user.go:381`：
     // `types.UserSetting{VersionRetention: true, VersionRetentionMax: 10}`。
     // 版本裁剪（`upload.capVersionEntities`）读的就是这两个字段。
-    const defaultSettings = JSON.stringify({ version_retention: true, version_retention_max: 10 });
+    //
+    // 语言字段的 JSON 名是 `email_language`（`inventory/types/types.go:16`），
+    // 与 Go 字段名 `Language` 不一致，别照名字直译写成 `language`。
+    const defaults: Record<string, unknown> = {
+      version_retention: true,
+      version_retention_max: 10,
+    };
+    if (args.language) defaults.email_language = args.language;
+    const defaultSettings = JSON.stringify(defaults);
     const rows = (await this.sql`
       INSERT INTO users (email, nick, password, group_users, status, storage, settings)
       VALUES (${args.email}, ${args.nick}, ${args.passwordDigest}, ${args.groupId},
@@ -723,6 +749,91 @@ export class FileRepo {
     )) as Record<string, unknown>[];
 
     return { files: rows.map(normalizeFile), total: toNum(countRows[0]?.total) };
+  }
+
+  /**
+   * 按文件名搜索当前用户的文件（跨目录，排除回收站）。
+   *
+   * 说明清楚一点：**这不是原版的全文检索**。原版 `GET /file/search` 走
+   * `pkg/filemanager/manager/fulltextindex.go`，依赖 Tika 之类的正文抽取器
+   * 建索引，边缘版没有抽取器也没有索引服务，所以退化为文件名 ILIKE 匹配，
+   * 命中项的 `content`（正文片段）恒为空串。
+   *
+   * 回收站的判定与 `list()` 一致：`file_children IS NULL AND name <> ''`
+   * （见 `moveToTrash`）。这里用 `file_children IS NOT NULL` 把它排除掉。
+   */
+  async searchByName(args: {
+    ownerId: number;
+    keyword: string;
+    offset: number;
+    limit: number;
+  }): Promise<{ files: FileRow[]; total: number }> {
+    // ILIKE 里 `%` 和 `_` 是通配符，用户搜字面量时必须转义，否则搜 "a_b" 会命中 "axb"
+    const escaped = args.keyword.replace(/[\\%_]/g, (m) => `\\${m}`);
+
+    const rows = (await this.sql(
+      `SELECT f.* FROM files f
+       WHERE f.owner_id = $1
+         AND f.file_children IS NOT NULL
+         AND f.name ILIKE '%' || $2 || '%' ESCAPE '\\'
+       ORDER BY f.name ASC, f.id ASC
+       LIMIT $3 OFFSET $4`,
+      [args.ownerId, escaped, args.limit, Math.max(0, args.offset)],
+    )) as Record<string, unknown>[];
+
+    const countRows = (await this.sql(
+      `SELECT COUNT(*)::int AS total FROM files f
+       WHERE f.owner_id = $1
+         AND f.file_children IS NOT NULL
+         AND f.name ILIKE '%' || $2 || '%' ESCAPE '\\'`,
+      [args.ownerId, escaped],
+    )) as Record<string, unknown>[];
+
+    return { files: rows.map(normalizeFile), total: toNum(countRows[0]?.total) };
+  }
+
+  /**
+   * 统计可建全文索引的文件数。对应上游 `FileClient.CountIndexableFiles`。
+   *
+   * 「可索引」的判定：有主实体、不在回收站（`file_children IS NOT NULL`）、
+   * 扩展名在抽取器白名单里。
+   */
+  async countIndexableFiles(ownerId: number, exts: string[]): Promise<number> {
+    if (!exts.length) return 0;
+    const rows = (await this.sql(
+      `SELECT COUNT(*)::int AS total FROM files f
+       WHERE f.owner_id = $1
+         AND f.file_children IS NOT NULL
+         AND f.primary_entity IS NOT NULL
+         AND lower(substring(f.name from '\\.([^.]*)$')) = ANY($2::text[])`,
+      [ownerId, exts],
+    )) as Record<string, unknown>[];
+    return toNum(rows[0]?.total);
+  }
+
+  /**
+   * 分页列举可建索引的文件（按 id 升序游标推进）。
+   * 对应上游 `FileClient.ListIndexableFiles`，用于重建索引任务分批推进。
+   */
+  async listIndexableFiles(args: {
+    ownerId: number;
+    afterId: number;
+    limit: number;
+    exts: string[];
+  }): Promise<FileRow[]> {
+    if (!args.exts.length) return [];
+    const rows = (await this.sql(
+      `SELECT f.* FROM files f
+       WHERE f.owner_id = $1
+         AND f.file_children IS NOT NULL
+         AND f.primary_entity IS NOT NULL
+         AND f.id > $2
+         AND lower(substring(f.name from '\\.([^.]*)$')) = ANY($3::text[])
+       ORDER BY f.id ASC
+       LIMIT $4`,
+      [args.ownerId, Math.max(0, args.afterId), args.exts, args.limit],
+    )) as Record<string, unknown>[];
+    return rows.map(normalizeFile);
   }
 
   /**
@@ -1292,6 +1403,37 @@ export class TaskRepo {
     return rows.map(normalizeTask);
   }
 
+  /**
+   * 找一个尚未结束的同类任务（重建索引这类分批作业要靠它接着推进）。
+   *
+   * Workers 没有后台 goroutine，一次请求只能跑一批，所以「继续」靠前端再点一次
+   * 按钮 —— 复用同一个 task 记录，进度才不会每次都从零开始。
+   */
+  async findActiveByType(type: string, userId: number): Promise<TaskRow | null> {
+    const rows = (await this.sql`
+      SELECT * FROM tasks
+      WHERE type = ${type} AND user_tasks = ${userId} AND deleted_at IS NULL
+        AND status IN ('queued', 'processing')
+      ORDER BY id DESC
+      LIMIT 1
+    `) as Record<string, unknown>[];
+    return rows[0] ? normalizeTask(rows[0]) : null;
+  }
+
+  /** 同时更新状态、公开状态与私有状态（私有状态存分批游标）。 */
+  async updateState(
+    id: number,
+    status: string,
+    publicState: Record<string, unknown>,
+    privateState: string,
+  ): Promise<void> {
+    await this.sql`
+      UPDATE tasks SET status = ${status}, public_state = ${JSON.stringify(publicState)}::jsonb,
+                       private_state = ${privateState}, updated_at = now()
+      WHERE id = ${id}
+    `;
+  }
+
   async updateStatus(id: number, status: string, publicState?: Record<string, unknown>): Promise<void> {
     if (publicState) {
       await this.sql`
@@ -1317,6 +1459,223 @@ export class TaskRepo {
     const out: Record<string, number> = {};
     for (const r of rows) out[String(r.status)] = toNum(r.total);
     return out;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// WebDAV 账号
+// ---------------------------------------------------------------------------
+
+export interface DavAccountRow {
+  id: number;
+  created_at: Date;
+  updated_at: Date;
+  deleted_at: Date | null;
+  name: string;
+  uri: string;
+  password: string;
+  options: Uint8Array;
+  owner_id: number;
+}
+
+function normalizeDavAccount(r: Record<string, unknown>): DavAccountRow {
+  return {
+    id: toNum(r.id),
+    created_at: toDate(r.created_at) ?? new Date(),
+    updated_at: toDate(r.updated_at) ?? new Date(),
+    deleted_at: toDate(r.deleted_at),
+    name: String(r.name ?? ''),
+    uri: String(r.uri ?? ''),
+    password: String(r.password ?? ''),
+    options:
+      r.options instanceof Uint8Array
+        ? r.options
+        : new Uint8Array(Buffer.from(String(r.options ?? ''), 'base64')),
+    owner_id: toNum(r.owner_id),
+  };
+}
+
+export class DavAccountRepo {
+  private sql: Sql;
+  constructor(env: Env) {
+    this.sql = getSql(env);
+  }
+
+  async create(args: {
+    ownerId: number;
+    name: string;
+    uri: string;
+    password: string;
+    options: Uint8Array;
+  }): Promise<DavAccountRow> {
+    const rows = (await this.sql`
+      INSERT INTO dav_accounts (name, uri, password, options, owner_id)
+      VALUES (${args.name}, ${args.uri}, ${args.password}, ${args.options}, ${args.ownerId})
+      RETURNING *
+    `) as Record<string, unknown>[];
+    return normalizeDavAccount(rows[0]!);
+  }
+
+  async list(args: { ownerId: number; page: number; pageSize: number }): Promise<{
+    accounts: DavAccountRow[];
+    total: number;
+  }> {
+    const rows = (await this.sql`
+      SELECT * FROM dav_accounts
+      WHERE owner_id = ${args.ownerId} AND deleted_at IS NULL
+      ORDER BY id ASC
+      LIMIT ${args.pageSize} OFFSET ${args.page * args.pageSize}
+    `) as Record<string, unknown>[];
+    const countRows = (await this.sql`
+      SELECT COUNT(*)::int AS total FROM dav_accounts
+      WHERE owner_id = ${args.ownerId} AND deleted_at IS NULL
+    `) as Record<string, unknown>[];
+    return { accounts: rows.map(normalizeDavAccount), total: toNum(countRows[0]?.total) };
+  }
+
+  async byIdAndUser(id: number, ownerId: number): Promise<DavAccountRow | null> {
+    const rows = (await this.sql`
+      SELECT * FROM dav_accounts
+      WHERE id = ${id} AND owner_id = ${ownerId} AND deleted_at IS NULL
+      LIMIT 1
+    `) as Record<string, unknown>[];
+    return rows[0] ? normalizeDavAccount(rows[0]) : null;
+  }
+
+  async update(
+    id: number,
+    patch: { name: string; uri: string; options: Uint8Array },
+  ): Promise<DavAccountRow> {
+    const rows = (await this.sql`
+      UPDATE dav_accounts SET name = ${patch.name}, uri = ${patch.uri},
+                              options = ${patch.options}, updated_at = now()
+      WHERE id = ${id} AND deleted_at IS NULL
+      RETURNING *
+    `) as Record<string, unknown>[];
+    return normalizeDavAccount(rows[0]!);
+  }
+
+  async remove(id: number): Promise<void> {
+    await this.sql`UPDATE dav_accounts SET deleted_at = now(), updated_at = now() WHERE id = ${id}`;
+  }
+
+  /**
+   * Basic Auth 查询：账号名 + 密码 → 属主用户（必须已激活）。
+   * 对应上游 `UserClient.GetActiveByDavAccount`。
+   */
+  async byNameAndPassword(
+    name: string,
+    password: string,
+  ): Promise<{ account: DavAccountRow; user: UserRow } | null> {
+    const rows = (await this.sql`
+      SELECT * FROM dav_accounts
+      WHERE name = ${name} AND password = ${password}
+        AND deleted_at IS NULL
+      LIMIT 1
+    `) as Record<string, unknown>[];
+    if (!rows[0]) return null;
+    const account = normalizeDavAccount(rows[0]);
+    const userRows = (await this.sql`
+      SELECT * FROM users WHERE id = ${account.owner_id} AND status = 'active' LIMIT 1
+    `) as Record<string, unknown>[];
+    if (!userRows[0]) return null;
+    return { account, user: normalizeUser(userRows[0]) };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Passkey（WebAuthn 凭据）
+// ---------------------------------------------------------------------------
+
+export interface PasskeyRow {
+  id: number;
+  created_at: Date;
+  updated_at: Date;
+  deleted_at: Date | null;
+  user_id: number;
+  /** base64 标准字母表编码的凭据 ID（对齐上游 CredentialID 存储方式）。 */
+  credential_id: string;
+  name: string;
+  /** webauthn.Credential 的序列化形态：id / publicKey(COSE, b64) / signCount / aaguid。 */
+  credential: Record<string, unknown>;
+  used_at: Date | null;
+}
+
+function normalizePasskey(r: Record<string, unknown>): PasskeyRow {
+  const cred = r.credential;
+  return {
+    id: toNum(r.id),
+    created_at: toDate(r.created_at) ?? new Date(),
+    updated_at: toDate(r.updated_at) ?? new Date(),
+    deleted_at: toDate(r.deleted_at),
+    user_id: toNum(r.user_id),
+    credential_id: String(r.credential_id ?? ''),
+    name: String(r.name ?? ''),
+    credential:
+      typeof cred === 'string' ? (JSON.parse(cred) as Record<string, unknown>) : (cred ?? {}) as Record<string, unknown>,
+    used_at: toDate(r.used_at),
+  };
+}
+
+export class PasskeyRepo {
+  private sql: Sql;
+  constructor(env: Env) {
+    this.sql = getSql(env);
+  }
+
+  async create(args: {
+    userId: number;
+    credentialId: string;
+    name: string;
+    credential: Record<string, unknown>;
+  }): Promise<PasskeyRow> {
+    const rows = (await this.sql`
+      INSERT INTO passkeys (user_id, credential_id, name, credential)
+      VALUES (${args.userId}, ${args.credentialId}, ${args.name}, ${JSON.stringify(args.credential)}::jsonb)
+      RETURNING *
+    `) as Record<string, unknown>[];
+    return normalizePasskey(rows[0]!);
+  }
+
+  async listByUser(userId: number): Promise<PasskeyRow[]> {
+    const rows = (await this.sql`
+      SELECT * FROM passkeys
+      WHERE user_id = ${userId} AND deleted_at IS NULL
+      ORDER BY id ASC
+    `) as Record<string, unknown>[];
+    return rows.map(normalizePasskey);
+  }
+
+  async byCredentialId(userId: number, credentialId: string): Promise<PasskeyRow | null> {
+    const rows = (await this.sql`
+      SELECT * FROM passkeys
+      WHERE user_id = ${userId} AND credential_id = ${credentialId} AND deleted_at IS NULL
+      LIMIT 1
+    `) as Record<string, unknown>[];
+    return rows[0] ? normalizePasskey(rows[0]) : null;
+  }
+
+  async markUsed(userId: number, credentialId: string): Promise<void> {
+    await this.sql`
+      UPDATE passkeys SET used_at = now(), updated_at = now()
+      WHERE user_id = ${userId} AND credential_id = ${credentialId}
+    `;
+  }
+
+  async updateCounter(userId: number, credentialId: string, signCount: number): Promise<void> {
+    await this.sql`
+      UPDATE passkeys
+      SET credential = jsonb_set(credential, '{signCount}', ${JSON.stringify(signCount)}::jsonb, true),
+          updated_at = now()
+      WHERE user_id = ${userId} AND credential_id = ${credentialId}
+    `;
+  }
+
+  async remove(userId: number, credentialId: string): Promise<void> {
+    await this.sql`
+      UPDATE passkeys SET deleted_at = now(), updated_at = now()
+      WHERE user_id = ${userId} AND credential_id = ${credentialId}
+    `;
   }
 }
 

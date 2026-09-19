@@ -24,10 +24,14 @@
  *   DELETE /api/v4/file/source/:id           删除直链
  */
 import { Hono } from 'hono';
+import type { Context } from 'hono';
 import type { AppBindings, AppRequest } from '../middleware/app';
 import { ctxOf } from '../middleware/app';
 import { fail, ok } from '../lib/response';
+import type { AppContext } from '../services/context';
+import type { FileRow } from '../db/types';
 import { FileSystemService } from '../services/fs';
+import { SearchService } from '../services/search';
 import { UploadService } from '../services/upload';
 import { DownloadService } from '../services/download';
 import { UserService } from '../services/user';
@@ -323,6 +327,7 @@ fileRoutes.put('/content', async (c) => {
   try {
     const service = new FileSystemService(ctx);
     const upload = new UploadService(ctx, service);
+    upload.onUploadFinished = (file) => hookFtsIndex(c, ctx, file);
     await upload.overwriteContent(
       URI.parse(rawUri),
       body,
@@ -495,6 +500,7 @@ fileRoutes.post('/upload/:sessionId/:index', async (c) => {
   try {
     const service = new FileSystemService(ctx);
     const upload = new UploadService(ctx, service);
+    upload.onUploadFinished = (file) => hookFtsIndex(c, ctx, file);
     await upload.uploadChunk(sessionId, index, body, contentLength);
     return c.json(ok(c) as never);
   } catch (e) {
@@ -580,17 +586,151 @@ fileRoutes.delete('/source/:id', async (c) => {
 });
 
 // ---------------------------------------------------------------------------
+// 版本管理
+//
+// 历史版本列表不在这里 —— 它由 `GET /file/info?extended=true` 的
+// `extended_info.entities` 下发（对齐 `service/explorer/response.go:280-287`），
+// 这两个端点只负责「切当前版本」和「删某个版本」。
+// ---------------------------------------------------------------------------
+
+/** 把文件的当前版本切换成指定历史版本。 */
+fileRoutes.post('/version/current', async (c) => {
+  const ctx = ctxOf(c);
+  if (!ctx.user) return c.json(fail(c, Err.loginRequired()) as never);
+  const body = (await c.req.json().catch(() => ({}))) as { uri?: string; version?: string };
+  if (!body.uri || !body.version) {
+    return c.json(fail(c, Err.param('uri and version are required')) as never);
+  }
+
+  const versionId = ctx.codec.decodeEntityID(body.version);
+  if (versionId === null) {
+    return c.json(fail(c, Err.param('unknown version id')) as never);
+  }
+
+  try {
+    await new FileSystemService(ctx).setCurrentVersion(URI.parse(body.uri), versionId);
+    return c.json(ok(c) as never);
+  } catch (e) {
+    return c.json(fail(c, e) as never);
+  }
+});
+
+/** 删除文件的某个历史版本。 */
+fileRoutes.delete('/version', async (c) => {
+  const ctx = ctxOf(c);
+  if (!ctx.user) return c.json(fail(c, Err.loginRequired()) as never);
+  const body = (await c.req.json().catch(() => ({}))) as { uri?: string; version?: string };
+  if (!body.uri || !body.version) {
+    return c.json(fail(c, Err.param('uri and version are required')) as never);
+  }
+
+  const versionId = ctx.codec.decodeEntityID(body.version);
+  if (versionId === null) {
+    return c.json(fail(c, Err.param('unknown version id')) as never);
+  }
+
+  try {
+    await new FileSystemService(ctx).deleteVersion(URI.parse(body.uri), versionId);
+    return c.json(ok(c) as never);
+  } catch (e) {
+    return c.json(fail(c, e) as never);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 上传收尾钩子：全文索引
+// ---------------------------------------------------------------------------
+
+/**
+ * 上传完成后把文件送进全文索引。
+ *
+ * 用 `waitUntil` 挂在请求生命周期上：响应不等它，但 Workers 会保证它跑完，
+ * 不出现「上传成功响应已回、索引却因请求结束被掐断」的半途状态。
+ * 索引失败只记日志 —— 上传本身已经成功，不该因此报错。
+ */
+function hookFtsIndex(
+  c: Context<AppBindings>,
+  ctx: AppContext,
+  file: FileRow,
+): void {
+  const search = new SearchService(ctx);
+  if (!search.available) return;
+  c.executionCtx.waitUntil(
+    search.indexFile(file).catch((e) => console.error('FTS index after upload failed', e)),
+  );
+}
+
+// ---------------------------------------------------------------------------
+// 搜索
+// ---------------------------------------------------------------------------
+
+/**
+ * 搜索文件。对应上游 `service/explorer/file.go` → `manager.SearchFullText`。
+ *
+ * 与原版**同构**：配了 Meilisearch + Tika 就走真正的全文检索（正文片段带高亮），
+ * 没配则回落到文件名匹配 —— 保证「开了能用，没开也能搜」，不会突然搜不到。
+ *
+ * 响应结构 `{ hits: [{ file, content }], total }` 两种路径完全一致。
+ */
+fileRoutes.get('/search', async (c) => {
+  const ctx = ctxOf(c);
+  if (!guard(c)) return c.json(fail(c, Err.loginRequired()) as never);
+
+  const query = (c.req.query('query') ?? '').trim();
+  if (!query) return c.json(ok(c, { hits: [], total: 0 }) as never);
+
+  const offset = Math.max(0, Number(c.req.query('offset') ?? 0) || 0);
+  const limit = 50;
+  const service = new FileSystemService(ctx);
+  const search = new SearchService(ctx);
+
+  if (search.available) {
+    try {
+      const found = await search.search(query, offset);
+      const hits = [];
+      for (const hit of found.hits) {
+        const file = await ctx.files.byId(hit.fileId);
+        // 索引里可能残留已删除 / 已进回收站的文件，这里按原版规则过滤
+        if (!file || file.owner_id !== ctx.user!.id) continue;
+        if (service.isInTrash(file)) continue;
+        hits.push({ file: await service.buildFileResponse(file), content: hit.text });
+      }
+      return c.json(ok(c, { hits, total: found.total }) as never);
+    } catch (e) {
+      // 索引服务挂了不该让整个搜索不可用，静默回落到文件名匹配
+      console.error('full text search failed, falling back to name match', e);
+    }
+  }
+
+  try {
+    const { files, total } = await ctx.files.searchByName({
+      ownerId: ctx.user!.id,
+      keyword: query,
+      offset,
+      limit,
+    });
+    const hits = [];
+    for (const file of files) {
+      hits.push({
+        file: await service.buildFileResponse(file),
+        content: '',
+      });
+    }
+    return c.json(ok(c, { hits, total }) as never);
+  } catch (e) {
+    return c.json(fail(c, e) as never);
+  }
+});
+
+// ---------------------------------------------------------------------------
 // 未实现的端点：明确返回「未启用」，避免前端拿到 404 后误判
 // ---------------------------------------------------------------------------
 
 const NOT_IMPLEMENTED: Record<string, string> = {
   '/archive': 'Archive listing is not implemented in the edge build',
   '/events': 'Server-sent events are not implemented in the edge build',
-  '/search': 'Full text search is not implemented in the edge build',
   '/wopi': 'WOPI is not implemented in the edge build',
   '/viewerSession': 'Viewer sessions are not implemented in the edge build',
-  '/version/current': 'File version switching is not implemented in the edge build',
-  '/version': 'File version management is not implemented in the edge build',
 };
 
 fileRoutes.all('/archive/:sessionID/archive.zip', (c) =>

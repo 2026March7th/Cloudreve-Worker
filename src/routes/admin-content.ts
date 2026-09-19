@@ -1,0 +1,1483 @@
+﻿/**
+ * 管理后台「内容」端点。对应上游 `routers/router.go` 的
+ * `admin/user`、`admin/file`、`admin/entity`、`admin/share`、`admin/queue`、
+ * `admin/node`、`admin/oauthClient` 七个分组（`router.go:1048-1237`）。
+ *
+ * 这些路由挂载在 `adminRoutes` 的 `/` 下，所以这里写的是**去掉 `/admin` 前缀**
+ * 的相对路径；管理员门禁由父路由那条 `use('*')` 中间件统一负责。
+ *
+ * 契约口径（都回过源码，不是猜的）：
+ *   - 列表请求体统一是上游 `AdminListService`：
+ *     `{ page, page_size, order_by, order_direction, conditions, searches }`
+ *     （`service/admin/list.go:9`）。`conditions` 的键名来自各 service 文件里的
+ *     `*Condition = "..."` 常量。
+ *   - 列表响应统一是 `{ <实体复数>, pagination }`（`service/admin/response.go`）。
+ *   - 详情 / 更新用 `PUT { "user": {...} }` 这种信封（`UpsertUserService`），
+ *     路径里的 id 是**数字**（前端 `CommonMixin.id: number`）。
+ *   - 批量删除用 `POST .../batch/delete { ids: number[] }`（`BatchIDService`）。
+ *
+ * SQL 写法遵循本仓库既有约定（`db/repo.ts`）：`sql(字符串, 参数数组)` 加
+ * 编号占位符。**不要**用 `${}` 插值拼 SQL —— Neon 的 `neon()` 没有 fragment
+ * 辅助函数，`sql.unsafe()` 是「执行查询」而不是「生成片段」，混用会误执行。
+ * 只有 ORDER BY 的列名与方向走白名单后直接拼接。
+ */
+import { Hono } from 'hono';
+import type { Context } from 'hono';
+import type { AppBindings } from '../middleware/app';
+import { ctxOf } from '../middleware/app';
+import { fail, ok } from '../lib/response';
+import { AppError, CodeFeatureNotEnabled, CodeInvalidActionOnSystemNode, CodeNodeUsedByStoragePolicy, Err } from '../lib/errors';
+import { BACKEND_VERSION } from './site';
+import { digestPassword, randomString } from '../lib/crypto';
+import { getSql, type Sql } from '../db';
+import type { HashIDCodec } from '../lib/hashid';
+import { numericId, paginationArgs, paginationOf, unwrapBody } from './shared';
+
+export const adminContentRoutes = new Hono<AppBindings>();
+
+/** 每个管理员请求共用的东西，省得每处都取一遍。 */
+interface Ctx {
+  c: Context<AppBindings>;
+  sql: Sql;
+  codec: HashIDCodec;
+  ctx: ReturnType<typeof ctxOf>;
+}
+
+function withCtx(c: Context<AppBindings>): Ctx {
+  const ctx = ctxOf(c);
+  return { c, sql: getSql(ctx.env), codec: ctx.codec, ctx };
+}
+
+const iso = (v: unknown): string | null => {
+  if (!v) return null;
+  const d = v instanceof Date ? v : new Date(v as string);
+  return Number.isNaN(d.getTime()) ? null : d.toISOString();
+};
+const num = (v: unknown, fallback = 0): number => {
+  if (v === null || v === undefined) return fallback;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : fallback;
+};
+const jsonArray = (v: unknown): unknown[] => (Array.isArray(v) ? v : []);
+
+/** 一组编号去重、丢掉非法值。 */
+function idList(input: unknown): number[] {
+  if (!Array.isArray(input)) return [];
+  const out = new Set<number>();
+  for (const v of input) {
+    const n = Number(v);
+    if (Number.isFinite(n) && n > 0) out.add(n);
+  }
+  return [...out];
+}
+
+/** 逐条执行一条带 `$1` 占位符的语句，用于批量删除（本仓库不用数组参数）。 */
+async function forEachId(sql: Sql, template: (index: number) => string, ids: number[]) {
+  for (let i = 0; i < ids.length; i += 1) {
+    await sql(template(i), [ids[i]]);
+  }
+}
+
+/** 条件字典里的字符串。 */
+function condStr(conditions: Record<string, string> | undefined, key: string): string {
+  return conditions?.[key] ?? '';
+}
+
+/** 条件字典里的数字 id，空/非法一律 null。 */
+function condNum(conditions: Record<string, string> | undefined, key: string): number | null {
+  const raw = conditions?.[key];
+  if (!raw) return null;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : null;
+}
+
+/** 条件字典里的布尔，对应上游 `setting.IsTrueValue`。 */
+function condBool(conditions: Record<string, string> | undefined, key: string): boolean {
+  const raw = conditions?.[key];
+  if (!raw) return false;
+  return ['true', '1', 'yes', 'on'].includes(raw.trim().toLowerCase());
+}
+
+/** ORDER BY 的列名白名单。 */
+function orderColumn(raw: unknown, allowed: readonly string[], fallback = 'id'): string {
+  const v = typeof raw === 'string' ? raw : '';
+  return allowed.includes(v) ? v : fallback;
+}
+
+/** 排序方向只认 desc，其余按 asc（与上游 `getOrderTerm` 一致）。 */
+function orderDirection(raw: unknown): 'ASC' | 'DESC' {
+  return typeof raw === 'string' && raw.toLowerCase() === 'desc' ? 'DESC' : 'ASC';
+}
+
+/** 解析请求体。 */
+async function readBody(c: Context<AppBindings>): Promise<Record<string, unknown>> {
+  return (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
+}
+
+// ---------------------------------------------------------------------------
+// 用户
+// ---------------------------------------------------------------------------
+
+/** 用户对外形态，对齐前端 `User`（`api/dashboard.ts:249`）。 */
+function userToResponse(
+  codec: HashIDCodec,
+  user: Record<string, unknown>,
+  group: Record<string, unknown> | null,
+  policy: { id: number; name: string; type: string } | null,
+) {
+  const id = num(user.id);
+  return {
+    id,
+    hash_id: codec.encodeUserID(id),
+    created_at: iso(user.created_at),
+    updated_at: iso(user.updated_at),
+    deleted_at: iso(user.deleted_at),
+    email: String(user.email ?? ''),
+    nick: String(user.nick ?? ''),
+    status: String(user.status ?? 'active'),
+    storage: num(user.storage),
+    avatar: (user.avatar as string) ?? '',
+    group_users: num(user.group_users),
+    settings: user.settings ?? {},
+    // 前端 `UserRow` 靠它决定是否显示「已开启两步验证」角标
+    two_fa_enabled: Boolean(user.two_factor_secret),
+    edges: {
+      group: group
+        ? {
+            id: num(group.id),
+            hash_id: codec.encodeGroupID(num(group.id)),
+            name: String(group.name ?? ''),
+            max_storage: num(group.max_storage),
+            speed_limit: num(group.speed_limit),
+          }
+        : undefined,
+      storage_policy: policy ?? undefined,
+      openid: [],
+      passkey: [],
+    },
+  };
+}
+
+/** 取用户详情要用到的组与策略，顺手拼成 edges 里的形状。 */
+async function userEdges(ctx: ReturnType<typeof ctxOf>, groupId: number) {
+  const group = groupId ? await ctx.groups.byId(groupId) : null;
+  const policyId = group?.storage_policy_id ?? null;
+  const policy = policyId ? await ctx.policies.byId(policyId) : null;
+  return {
+    group: (group as unknown as Record<string, unknown> | null) ?? null,
+    policy: policy ? { id: policy.id, name: policy.name, type: policy.type } : null,
+  };
+}
+
+/** `POST /admin/user` —— 用户列表。条件键 `user_email` / `user_nick` / `user_group` / `user_status`。 */
+adminContentRoutes.post('/user', async (c) => {
+  const { sql, codec, ctx } = withCtx(c);
+  const body = await readBody(c);
+  const { page, pageSize, offset } = paginationArgs(body);
+  const conditions = (body.conditions ?? {}) as Record<string, string>;
+
+  const email = condStr(conditions, 'user_email');
+  const nick = condStr(conditions, 'user_nick');
+  const status = condStr(conditions, 'user_status');
+  const groupId = condNum(conditions, 'user_group');
+  const orderCol = orderColumn(
+    body.order_by,
+    ['id', 'email', 'nick', 'created_at', 'updated_at', 'storage', 'group_users', 'status'],
+  );
+  const orderDir = orderDirection(body.order_direction);
+
+  const where = `deleted_at IS NULL
+      AND ($1::text = '' OR email ILIKE '%' || $1 || '%')
+      AND ($2::text = '' OR nick  ILIKE '%' || $2 || '%')
+      AND ($3::text = '' OR status = $3)
+      AND ($4::int IS NULL OR group_users = $4)`;
+  const params = [email, nick, status, groupId];
+
+  const rows = (await sql(
+    `SELECT * FROM users WHERE ${where} ORDER BY ${orderCol} ${orderDir} LIMIT $5 OFFSET $6`,
+    [...params, pageSize, offset],
+  )) as Record<string, unknown>[];
+  const countRows = (await sql(
+    `SELECT COUNT(*)::int AS total FROM users WHERE ${where}`,
+    params,
+  )) as Record<string, unknown>[];
+
+  const out = [];
+  for (const u of rows) {
+    const edges = await userEdges(ctx, num(u.group_users));
+    out.push(userToResponse(codec, u, edges.group, edges.policy));
+  }
+
+  return c.json(
+    ok(c, { users: out, pagination: paginationOf(page, pageSize, num(countRows[0]?.total)) }) as never,
+  );
+});
+
+/** `GET /admin/user/:id` —— 用户详情。 */
+adminContentRoutes.get('/user/:id', async (c) => {
+  const { sql, codec, ctx } = withCtx(c);
+  const id = numericId(c.req.param('id'), (v) => codec.decodeUserID(v));
+  if (id === null) return c.json(fail(c, Err.userNotFound()) as never);
+
+  const rows = (await sql('SELECT * FROM users WHERE id = $1 AND deleted_at IS NULL LIMIT 1', [
+    id,
+  ])) as Record<string, unknown>[];
+  if (!rows[0]) return c.json(fail(c, Err.userNotFound()) as never);
+
+  const user = rows[0];
+  const edges = await userEdges(ctx, num(user.group_users));
+  return c.json(
+    ok(c, {
+      ...userToResponse(codec, user, edges.group, edges.policy),
+      capacity: { total: num(edges.group?.max_storage), used: num(user.storage) },
+    }) as never,
+  );
+});
+
+/**
+ * `PUT /admin/user` 与 `PUT /admin/user/:id` —— 创建 / 更新用户。
+ * 请求体是 `{ user: {...}, password?, two_fa? }`（`UpsertUserService`）。
+ *
+ * 两个细节：
+ *   - 前端把新密码放在 `user.password` 里，也放在顶层 `password`，两处都认；
+ *   - `two_fa: "clear"` 是「重置两步验证」的表达（`UserDialog.tsx:95`），
+ *     即清空 TOTP 密钥。
+ */
+async function upsertUser(c: Context<AppBindings>, id: number | null) {
+  const { sql, codec, ctx } = withCtx(c);
+  const raw = await readBody(c);
+  const body = unwrapBody<Record<string, unknown>>(raw, 'user');
+  const password = String(body.password ?? raw.password ?? '');
+
+  if (id === null) {
+    const email = String(body.email ?? '').trim();
+    if (!email) throw Err.param('Email is required');
+    if (!password) throw Err.param('Password is required');
+    if (password.length < 6) throw Err.param('Password is too short');
+
+    const exists = (await sql(
+      'SELECT id FROM users WHERE email = $1 AND deleted_at IS NULL LIMIT 1',
+      [email],
+    )) as Record<string, unknown>[];
+    if (exists[0]) throw new AppError(40032, 'This email is already used');
+
+    const gid = num(body.group_users, 2) || 2;
+    if (!(await ctx.groups.byId(gid))) throw new AppError(40039, 'Group not found');
+
+    const digest = await digestPassword(password);
+    const rows = (await sql(
+      `INSERT INTO users (email, nick, password, status, storage, group_users, settings)
+       VALUES ($1, $2, $3, $4, 0, $5, '{}'::jsonb) RETURNING *`,
+      [email, String(body.nick ?? email.split('@')[0]), digest, String(body.status ?? 'active'), gid],
+    )) as Record<string, unknown>[];
+    const edges = await userEdges(ctx, gid);
+    return userToResponse(codec, rows[0]!, edges.group, edges.policy);
+  }
+
+  const rows = (await sql('SELECT * FROM users WHERE id = $1 AND deleted_at IS NULL LIMIT 1', [
+    id,
+  ])) as Record<string, unknown>[];
+  if (!rows[0]) throw Err.userNotFound();
+
+  if (body.email !== undefined) {
+    await sql('UPDATE users SET email = $2, updated_at = now() WHERE id = $1', [
+      id,
+      String(body.email),
+    ]);
+  }
+  if (body.nick !== undefined) {
+    await sql('UPDATE users SET nick = $2, updated_at = now() WHERE id = $1', [id, String(body.nick)]);
+  }
+  if (body.status !== undefined) {
+    const status = String(body.status);
+    if (!['active', 'inactive', 'manual_banned', 'sys_banned'].includes(status)) {
+      throw Err.param('Invalid status');
+    }
+    await sql('UPDATE users SET status = $2, updated_at = now() WHERE id = $1', [id, status]);
+  }
+  if (body.group_users !== undefined) {
+    const gid = num(body.group_users);
+    if (id === 1 && gid !== 1) {
+      throw new AppError(40042, 'Cannot change the group of the default user');
+    }
+    if (gid > 0) {
+      if (!(await ctx.groups.byId(gid))) throw new AppError(40039, 'Group not found');
+      await ctx.users.updateGroup(id, gid);
+    }
+  }
+  if (password) {
+    if (password.length < 6) throw Err.param('Password is too short');
+    await ctx.users.updatePassword(id, await digestPassword(password));
+  }
+  if (raw.two_fa === 'clear') {
+    await ctx.users.setTwoFactorSecret(id, null);
+  }
+
+  const after = (await sql('SELECT * FROM users WHERE id = $1 LIMIT 1', [id])) as Record<
+    string,
+    unknown
+  >[];
+  const edges = await userEdges(ctx, num(after[0]?.group_users));
+  return userToResponse(codec, after[0]!, edges.group, edges.policy);
+}
+
+adminContentRoutes.put('/user', async (c) => {
+  try {
+    return c.json(ok(c, await upsertUser(c, null)) as never);
+  } catch (e) {
+    return c.json(fail(c, e) as never);
+  }
+});
+
+adminContentRoutes.put('/user/:id', async (c) => {
+  const { codec } = withCtx(c);
+  const id = numericId(c.req.param('id'), (v) => codec.decodeUserID(v));
+  if (id === null) return c.json(fail(c, Err.userNotFound()) as never);
+  try {
+    return c.json(ok(c, await upsertUser(c, id)) as never);
+  } catch (e) {
+    return c.json(fail(c, e) as never);
+  }
+});
+
+/** `POST /admin/user/batch/delete` —— 批量封禁（软删除）。对应 `AdminDeleteUser`。 */
+adminContentRoutes.post('/user/batch/delete', async (c) => {
+  const { sql } = withCtx(c);
+  const body = await readBody(c);
+  const ids = idList(body.ids);
+  if (ids.length === 0) return c.json(fail(c, Err.param('No user selected')) as never);
+  // 初始用户禁止操作，与原版一致
+  for (const id of ids) {
+    if (id === 1) throw new AppError(40043, 'Cannot perform this action on the default user');
+  }
+  await forEachId(
+    sql,
+    () => `UPDATE users SET status = 'sys_banned', deleted_at = now(), updated_at = now() WHERE id = $1`,
+    ids,
+  );
+  return c.json(ok(c) as never);
+});
+
+/** `POST /admin/user/:id/calibrate` —— 重算已用容量。对应 `AdminCalibrateStorage`。 */
+adminContentRoutes.post('/user/:id/calibrate', async (c) => {
+  const { codec, ctx } = withCtx(c);
+  const id = numericId(c.req.param('id'), (v) => codec.decodeUserID(v));
+  if (id === null) return c.json(fail(c, Err.userNotFound()) as never);
+  try {
+    await ctx.users.recalcStorage(id);
+    return c.json(ok(c) as never);
+  } catch (e) {
+    return c.json(fail(c, e) as never);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 文件
+// ---------------------------------------------------------------------------
+
+/** 文件对外形态，对齐前端 `File`。`user_hash_id` / `file_hash_id` 是行内头像要用的。 */
+async function fileToResponse(
+  codec: HashIDCodec,
+  ctx: ReturnType<typeof ctxOf>,
+  f: Record<string, unknown>,
+) {
+  const id = num(f.id);
+  const ownerId = num(f.owner_id);
+  const owner = ownerId ? await ctx.users.byId(ownerId) : null;
+  return {
+    id,
+    created_at: iso(f.created_at),
+    updated_at: iso(f.updated_at),
+    deleted_at: iso(f.deleted_at),
+    type: num(f.type),
+    name: String(f.name ?? ''),
+    owner_id: ownerId,
+    size: num(f.size),
+    primary_entity: num(f.primary_entity),
+    file_children: num(f.file_children),
+    is_symbolic: Boolean(f.is_symbolic),
+    storage_policy_files: num(f.storage_policy_files),
+    props: f.props ?? {},
+    user_hash_id: codec.encodeUserID(ownerId),
+    file_hash_id: codec.encodeFileID(id),
+    edges: {
+      owner: owner ? { id: ownerId, nick: owner.nick, email: owner.email } : undefined,
+    },
+  };
+}
+
+/**
+ * `POST /admin/file` —— 全站文件（扁平）列表。对应 `AdminListService.Files`
+ * （`service/admin/file.go:162`）。
+ *
+ * 只列**真实文件**（`type = 0`，不含目录）且不含回收站；条件键：
+ * `file_name` / `file_user` / `file_policy` / `file_metadata` /
+ * `file_shared` / `file_direct_link`。
+ */
+adminContentRoutes.post('/file', async (c) => {
+  const { sql, codec, ctx } = withCtx(c);
+  const body = await readBody(c);
+  const { page, pageSize, offset } = paginationArgs(body);
+  const conditions = (body.conditions ?? {}) as Record<string, string>;
+
+  const name = condStr(conditions, 'file_name');
+  const userId = condNum(conditions, 'file_user');
+  const policyId = condNum(conditions, 'file_policy');
+  const metadata = condStr(conditions, 'file_metadata');
+  const shared = condBool(conditions, 'file_shared');
+  const hasDirectLink = condBool(conditions, 'file_direct_link');
+  const orderCol = orderColumn(body.order_by, ['id', 'name', 'size', 'created_at', 'updated_at']);
+  const orderDir = orderDirection(body.order_direction);
+
+  const where = `f.deleted_at IS NULL AND f.type = 0
+      AND ($1::text = '' OR f.name ILIKE '%' || $1 || '%')
+      AND ($2::int IS NULL OR f.owner_id = $2)
+      AND ($3::int IS NULL OR f.storage_policy_files = $3)
+      AND ($4 = false OR EXISTS (
+            SELECT 1 FROM shares s WHERE s.file_shares = f.id AND s.deleted_at IS NULL))
+      AND ($5 = false OR EXISTS (
+            SELECT 1 FROM direct_links d WHERE d.file_id = f.id AND d.deleted_at IS NULL))
+      AND ($6::text = '' OR EXISTS (
+            SELECT 1 FROM metadata m
+            WHERE m.file_id = f.id AND m.deleted_at IS NULL AND m.name = $6))`;
+  const params = [name, userId, policyId, shared, hasDirectLink, metadata];
+
+  const rows = (await sql(
+    `SELECT f.* FROM files f WHERE ${where}
+     ORDER BY f.${orderCol} ${orderDir} LIMIT $7 OFFSET $8`,
+    [...params, pageSize, offset],
+  )) as Record<string, unknown>[];
+  const countRows = (await sql(
+    `SELECT COUNT(*)::int AS total FROM files f WHERE ${where}`,
+    params,
+  )) as Record<string, unknown>[];
+
+  const out = [];
+  for (const f of rows) out.push(await fileToResponse(codec, ctx, f));
+  return c.json(
+    ok(c, { files: out, pagination: paginationOf(page, pageSize, num(countRows[0]?.total)) }) as never,
+  );
+});
+
+/** `GET /admin/file/:id` —— 文件详情（含元数据、实体、直链、分享）。 */
+adminContentRoutes.get('/file/:id', async (c) => {
+  const { sql, codec, ctx } = withCtx(c);
+  const id = numericId(c.req.param('id'), (v) => codec.decodeFileID(v));
+  if (id === null) return c.json(fail(c, Err.fileNotFound()) as never);
+
+  const rows = (await sql('SELECT * FROM files WHERE id = $1 AND deleted_at IS NULL LIMIT 1', [
+    id,
+  ])) as Record<string, unknown>[];
+  if (!rows[0]) return c.json(fail(c, Err.fileNotFound()) as never);
+
+  const meta = (await sql(
+    'SELECT * FROM metadata WHERE file_id = $1 AND deleted_at IS NULL ORDER BY id ASC',
+    [id],
+  )) as Record<string, unknown>[];
+  const entities = (await sql(
+    `SELECT e.* FROM entities e
+     JOIN file_entities fe ON fe.entity_id = e.id
+     WHERE fe.file_id = $1 AND e.deleted_at IS NULL ORDER BY e.id ASC`,
+    [id],
+  )) as Record<string, unknown>[];
+  const links = (await sql(
+    'SELECT * FROM direct_links WHERE file_id = $1 AND deleted_at IS NULL ORDER BY id ASC',
+    [id],
+  )) as Record<string, unknown>[];
+  const shares = (await sql(
+    'SELECT * FROM shares WHERE file_shares = $1 AND deleted_at IS NULL ORDER BY id ASC',
+    [id],
+  )) as Record<string, unknown>[];
+
+  const base = await fileToResponse(codec, ctx, rows[0]);
+  return c.json(
+    ok(c, {
+      ...base,
+      edges: {
+        ...base.edges,
+        metadata: meta.map((m) => ({
+          id: num(m.id),
+          name: String(m.name ?? ''),
+          value: String(m.value ?? ''),
+          is_public: Boolean(m.is_public),
+        })),
+        entities: entities.map((e) => entityToResponse(codec, e)),
+        direct_links: links.map((l) => ({
+          id: num(l.id),
+          name: String(l.name ?? ''),
+          downloads: num(l.downloads),
+          speed: num(l.speed),
+        })),
+        shares: shares.map((s) => ({ id: num(s.id), downloads: num(s.downloads) })),
+      },
+    }) as never,
+  );
+});
+
+/** `PUT /admin/file/:id` —— 改文件名。对应 `UpsertFileService`。 */
+adminContentRoutes.put('/file/:id', async (c) => {
+  const { codec, ctx } = withCtx(c);
+  const id = numericId(c.req.param('id'), (v) => codec.decodeFileID(v));
+  if (id === null) return c.json(fail(c, Err.fileNotFound()) as never);
+  const raw = await readBody(c);
+  const body = unwrapBody<Record<string, unknown>>(raw, 'file');
+  try {
+    if (body.name !== undefined) {
+      const name = String(body.name);
+      if (!name) throw Err.illegalName('File name cannot be empty');
+      await ctx.files.rename(id, name);
+    }
+    return c.json(ok(c) as never);
+  } catch (e) {
+    return c.json(fail(c, e) as never);
+  }
+});
+
+/**
+ * `GET /admin/file/url/:id` —— 取文件的下载直链。
+ * 对应 `AdminGetFileUrl`：有直链就用直链，否则给出官方内容接口地址。
+ */
+adminContentRoutes.get('/file/url/:id', async (c) => {
+  const { codec, ctx } = withCtx(c);
+  const id = numericId(c.req.param('id'), (v) => codec.decodeFileID(v));
+  if (id === null) return c.json(fail(c, Err.fileNotFound()) as never);
+
+  const base = ctx.settings.siteUrl.replace(/\/+$/, '');
+  const links = await ctx.directLinks.listByFile(id);
+  if (links.length === 0) {
+    return c.json(ok(c, `${base}/api/v4/file/${codec.encodeFileID(id)}/content`) as never);
+  }
+  return c.json(ok(c, `${base}/s/${codec.encodeSourceLinkID(num(links[0]!.id))}`) as never);
+});
+
+/** `POST /admin/file/batch/delete` —— 批量删除文件（真删，不进回收站）。 */
+adminContentRoutes.post('/file/batch/delete', async (c) => {
+  const { ctx } = withCtx(c);
+  const body = await readBody(c);
+  const ids = idList(body.ids);
+  if (ids.length === 0) return c.json(fail(c, Err.param('No file selected')) as never);
+  try {
+    // 连子目录一起删，避免留下孤儿行
+    const descendants = await ctx.files.collectDescendants(ids);
+    const all = [...new Set([...ids, ...descendants])];
+    await ctx.entities.release(all);
+    await ctx.files.deleteMany(all);
+    return c.json(ok(c) as never);
+  } catch (e) {
+    return c.json(fail(c, e) as never);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 实体（物理对象）
+// ---------------------------------------------------------------------------
+
+/** 实体对外形态，对齐前端 `Entity`。 */
+function entityToResponse(codec: HashIDCodec, e: Record<string, unknown>) {
+  const id = num(e.id);
+  const createdBy = num(e.created_by);
+  return {
+    id,
+    created_at: iso(e.created_at),
+    updated_at: iso(e.updated_at),
+    deleted_at: iso(e.deleted_at),
+    type: num(e.type),
+    source: String(e.source ?? ''),
+    size: num(e.size),
+    reference_count: num(e.reference_count),
+    storage_policy_entities: num(e.storage_policy_entities),
+    upload_session_id: (e.upload_session_id as string) ?? null,
+    created_by: createdBy,
+    props: e.recycle_options ?? {},
+    user_hash_id: createdBy ? codec.encodeUserID(createdBy) : undefined,
+    edges: {},
+  };
+}
+
+/** `POST /admin/entity` —— 实体列表。条件键 `entity_policy` / `entity_user` / `entity_type`。 */
+adminContentRoutes.post('/entity', async (c) => {
+  const { sql, codec } = withCtx(c);
+  const body = await readBody(c);
+  const { page, pageSize, offset } = paginationArgs(body);
+  const conditions = (body.conditions ?? {}) as Record<string, string>;
+
+  const userId = condNum(conditions, 'entity_user');
+  const policyId = condNum(conditions, 'entity_policy');
+  const typeId = condNum(conditions, 'entity_type');
+  const orderCol = orderColumn(body.order_by, ['id', 'size', 'updated_at', 'reference_count']);
+  const orderDir = orderDirection(body.order_direction);
+
+  const where = `deleted_at IS NULL
+      AND ($1::int IS NULL OR created_by = $1)
+      AND ($2::int IS NULL OR storage_policy_entities = $2)
+      AND ($3::int IS NULL OR type = $3)`;
+  const params = [userId, policyId, typeId];
+
+  const rows = (await sql(
+    `SELECT * FROM entities WHERE ${where}
+     ORDER BY ${orderCol} ${orderDir} LIMIT $4 OFFSET $5`,
+    [...params, pageSize, offset],
+  )) as Record<string, unknown>[];
+  const countRows = (await sql(
+    `SELECT COUNT(*)::int AS total FROM entities WHERE ${where}`,
+    params,
+  )) as Record<string, unknown>[];
+
+  return c.json(
+    ok(c, {
+      entities: rows.map((e) => entityToResponse(codec, e)),
+      pagination: paginationOf(page, pageSize, num(countRows[0]?.total)),
+    }) as never,
+  );
+});
+
+/** `GET /admin/entity/:id` —— 实体详情，带上引用了它的文件。 */
+adminContentRoutes.get('/entity/:id', async (c) => {
+  const { sql, codec } = withCtx(c);
+  const id = numericId(c.req.param('id'), (v) => codec.decodeEntityID(v));
+  if (id === null) return c.json(fail(c, new AppError(40077, 'Entity not found')) as never);
+
+  const rows = (await sql('SELECT * FROM entities WHERE id = $1 AND deleted_at IS NULL LIMIT 1', [
+    id,
+  ])) as Record<string, unknown>[];
+  if (!rows[0]) return c.json(fail(c, new AppError(40077, 'Entity not found')) as never);
+
+  const files = (await sql(
+    `SELECT f.* FROM files f
+     JOIN file_entities fe ON fe.file_id = f.id
+     WHERE fe.entity_id = $1 AND f.deleted_at IS NULL ORDER BY f.id ASC`,
+    [id],
+  )) as Record<string, unknown>[];
+
+  // 前端 `EntityFileList` 用这张表把每个文件的归属者渲染成头像
+  const map: Record<number, string> = {};
+  for (const f of files) {
+    const owner = num(f.owner_id);
+    if (owner && !map[owner]) map[owner] = codec.encodeUserID(owner);
+  }
+
+  return c.json(
+    ok(c, {
+      ...entityToResponse(codec, rows[0]),
+      user_hash_id_map: map,
+      edges: {
+        file: files.map((f) => ({
+          id: num(f.id),
+          name: String(f.name ?? ''),
+          size: num(f.size),
+          owner_id: num(f.owner_id),
+          user_hash_id: codec.encodeUserID(num(f.owner_id)),
+        })),
+      },
+    }) as never,
+  );
+});
+
+/**
+ * `GET /admin/entity/url/:id` —— 取实体的存储直链。
+ * 对应 `AdminGetEntityUrl`：调驱动 `source()` 拿真实地址（与 `download.ts:101` 同一套参数）。
+ */
+adminContentRoutes.get('/entity/url/:id', async (c) => {
+  const { codec, ctx } = withCtx(c);
+  const id = numericId(c.req.param('id'), (v) => codec.decodeEntityID(v));
+  if (id === null) return c.json(fail(c, new AppError(40077, 'Entity not found')) as never);
+
+  const entity = await ctx.entities.byId(id);
+  if (!entity || entity.deleted_at) {
+    return c.json(fail(c, new AppError(40077, 'Entity not found')) as never);
+  }
+  try {
+    const policy = await ctx.policies.byId(entity.storage_policy_entities);
+    if (!policy) throw new AppError(40035, 'Storage policy not found');
+    const driver = ctx.driverFor(policy);
+    const url = await driver.source(entity.source, {
+      // 后台取直链不设过期，与原版 `GetEntityUrl` 的口径一致
+      expire: 0,
+      isDownload: true,
+      displayName: '',
+      speed: 0,
+    });
+    return c.json(ok(c, url) as never);
+  } catch (e) {
+    return c.json(fail(c, e) as never);
+  }
+});
+
+/** `POST /admin/entity/batch/delete` —— 批量删除实体。 */
+adminContentRoutes.post('/entity/batch/delete', async (c) => {
+  const { ctx } = withCtx(c);
+  const body = await readBody(c);
+  const ids = idList(body.ids);
+  if (ids.length === 0) return c.json(fail(c, Err.param('No entity selected')) as never);
+  try {
+    await ctx.entities.hardDelete(ids);
+    return c.json(ok(c) as never);
+  } catch (e) {
+    return c.json(fail(c, e) as never);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 分享
+// ---------------------------------------------------------------------------
+
+/** 分享对外形态，对齐前端 `Share`（含 `share_link`、`user_hash_id`）。 */
+function shareToResponse(codec: HashIDCodec, siteUrl: string, s: Record<string, unknown>) {
+  const id = num(s.id);
+  const userId = num(s.user_shares);
+  return {
+    id,
+    created_at: iso(s.created_at),
+    updated_at: iso(s.updated_at),
+    deleted_at: iso(s.deleted_at),
+    password: String(s.password ?? ''),
+    views: num(s.views),
+    downloads: num(s.downloads),
+    expires: iso(s.expires),
+    remain_downloads: num(s.remain_downloads),
+    props: s.props ?? {},
+    user_shares: userId,
+    file_shares: num(s.file_shares),
+    user_hash_id: userId ? codec.encodeUserID(userId) : undefined,
+    share_link: `${siteUrl.replace(/\/+$/, '')}/s/${codec.encodeShareID(id)}`,
+    edges: {},
+  };
+}
+
+/** `POST /admin/share` —— 分享列表。条件键 `share_user_id` / `share_file_id` / `share_id`。 */
+adminContentRoutes.post('/share', async (c) => {
+  const { sql, codec, ctx } = withCtx(c);
+  const body = await readBody(c);
+  const { page, pageSize, offset } = paginationArgs(body);
+  const conditions = (body.conditions ?? {}) as Record<string, string>;
+
+  const userId = condNum(conditions, 'share_user_id');
+  const fileId = condNum(conditions, 'share_file_id');
+  const shareIds = condStr(conditions, 'share_id')
+    .split(',')
+    .map((s) => Number(s.trim()))
+    .filter((n) => Number.isFinite(n) && n > 0);
+  const orderCol = orderColumn(body.order_by, ['id', 'created_at', 'updated_at', 'views', 'downloads']);
+  const orderDir = orderDirection(body.order_direction);
+
+  const where = `deleted_at IS NULL
+      AND ($1::int IS NULL OR user_shares = $1)
+      AND ($2::int IS NULL OR file_shares = $2)
+      AND ($3::int[] IS NULL OR id = ANY($3::int[]))`;
+  // share_id 是逗号分隔的 id 列表；为空时传 null 让这个条件整体失效
+  const params = [userId, fileId, shareIds.length ? shareIds : null];
+
+  const rows = (await sql(
+    `SELECT * FROM shares WHERE ${where}
+     ORDER BY ${orderCol} ${orderDir} LIMIT $4 OFFSET $5`,
+    [...params, pageSize, offset],
+  )) as Record<string, unknown>[];
+  const countRows = (await sql(
+    `SELECT COUNT(*)::int AS total FROM shares WHERE ${where}`,
+    params,
+  )) as Record<string, unknown>[];
+
+  return c.json(
+    ok(c, {
+      shares: rows.map((s) => shareToResponse(codec, ctx.settings.siteUrl, s)),
+      pagination: paginationOf(page, pageSize, num(countRows[0]?.total)),
+    }) as never,
+  );
+});
+
+/** `GET /admin/share/:id` —— 分享详情。 */
+adminContentRoutes.get('/share/:id', async (c) => {
+  const { sql, codec, ctx } = withCtx(c);
+  const id = numericId(c.req.param('id'), (v) => codec.decodeShareID(v));
+  if (id === null) return c.json(fail(c, Err.shareNotFound()) as never);
+
+  const rows = (await sql('SELECT * FROM shares WHERE id = $1 AND deleted_at IS NULL LIMIT 1', [
+    id,
+  ])) as Record<string, unknown>[];
+  if (!rows[0]) return c.json(fail(c, Err.shareNotFound()) as never);
+
+  const fileId = num(rows[0].file_shares);
+  const fileRows = fileId
+    ? ((await sql('SELECT * FROM files WHERE id = $1 LIMIT 1', [fileId])) as Record<
+        string,
+        unknown
+      >[])
+    : [];
+
+  return c.json(
+    ok(c, {
+      ...shareToResponse(codec, ctx.settings.siteUrl, rows[0]),
+      edges: { file: fileRows[0] ? await fileToResponse(codec, ctx, fileRows[0]) : undefined },
+    }) as never,
+  );
+});
+
+/** `POST /admin/share/batch/delete` —— 批量删分享。 */
+adminContentRoutes.post('/share/batch/delete', async (c) => {
+  const { sql } = withCtx(c);
+  const body = await readBody(c);
+  const ids = idList(body.ids);
+  if (ids.length === 0) return c.json(fail(c, Err.param('No share selected')) as never);
+  await forEachId(sql, () => 'UPDATE shares SET deleted_at = now(), updated_at = now() WHERE id = $1', ids);
+  return c.json(ok(c) as never);
+});
+
+// ---------------------------------------------------------------------------
+// 任务队列
+// ---------------------------------------------------------------------------
+
+/** 任务对外形态，对齐前端 `Task`。 */
+function taskToResponse(codec: HashIDCodec, t: Record<string, unknown>) {
+  const id = num(t.id);
+  const userId = num(t.user_tasks);
+  return {
+    id,
+    created_at: iso(t.created_at),
+    updated_at: iso(t.updated_at),
+    deleted_at: iso(t.deleted_at),
+    type: String(t.type ?? ''),
+    status: String(t.status ?? 'queued'),
+    public_state: t.public_state ?? {},
+    private_state: t.private_state ?? '',
+    correlation_id: t.correlation_id ?? null,
+    user_tasks: userId,
+    user_hash_id: userId ? codec.encodeUserID(userId) : undefined,
+    task_hash_id: codec.encodeTaskID(id),
+    edges: {},
+  };
+}
+
+/** `GET /admin/queue/metrics` —— 各状态任务计数。对应 `AdminGetQueueMetrics`。 */
+adminContentRoutes.get('/queue/metrics', async (c) => {
+  const { ctx } = withCtx(c);
+  const byStatus = await ctx.tasks.countByStatus();
+  return c.json(
+    ok(c, {
+      by_status: byStatus,
+      // 边缘版没有常驻 worker：任务是请求内联执行的，因此不存在繁忙 worker
+      busy_workers: 0,
+      success_tasks: 0,
+      failure_tasks: 0,
+      submitted_tasks: byStatus.queued ?? 0,
+      suspending_tasks: byStatus.suspending ?? 0,
+    }) as never,
+  );
+});
+
+/**
+ * `POST /admin/queue` —— 任务列表。
+ * 条件键 `task_type` / `task_status` / `task_user_id` / `task_correlation_id`。
+ */
+adminContentRoutes.post('/queue', async (c) => {
+  const { sql, codec } = withCtx(c);
+  const body = await readBody(c);
+  const { page, pageSize, offset } = paginationArgs(body);
+  const conditions = (body.conditions ?? {}) as Record<string, string>;
+
+  const type = condStr(conditions, 'task_type');
+  const status = condStr(conditions, 'task_status');
+  const userId = condNum(conditions, 'task_user_id');
+  const correlationId = condStr(conditions, 'task_correlation_id');
+  const orderCol = orderColumn(body.order_by, ['id', 'created_at', 'updated_at', 'status']);
+  const orderDir = orderDirection(body.order_direction);
+
+  const where = `deleted_at IS NULL
+      AND ($1::text = '' OR type = $1)
+      AND ($2::text = '' OR status = $2)
+      AND ($3::int IS NULL OR user_tasks = $3)
+      AND ($4::text = '' OR correlation_id = $4::uuid)`;
+  const params = [type, status, userId, correlationId];
+
+  const rows = (await sql(
+    `SELECT * FROM tasks WHERE ${where} ORDER BY ${orderCol} ${orderDir} LIMIT $5 OFFSET $6`,
+    [...params, pageSize, offset],
+  )) as Record<string, unknown>[];
+  const countRows = (await sql(
+    `SELECT COUNT(*)::int AS total FROM tasks WHERE ${where}`,
+    params,
+  )) as Record<string, unknown>[];
+
+  return c.json(
+    ok(c, {
+      tasks: rows.map((t) => taskToResponse(codec, t)),
+      pagination: paginationOf(page, pageSize, num(countRows[0]?.total)),
+    }) as never,
+  );
+});
+
+/** `GET /admin/queue/:id` —— 任务详情。 */
+adminContentRoutes.get('/queue/:id', async (c) => {
+  const { codec, ctx } = withCtx(c);
+  const id = numericId(c.req.param('id'), (v) => codec.decodeTaskID(v));
+  if (id === null) return c.json(fail(c, Err.notFound('Task not found')) as never);
+  const task = await ctx.tasks.byId(id);
+  if (!task) return c.json(fail(c, Err.notFound('Task not found')) as never);
+  return c.json(ok(c, taskToResponse(codec, task as unknown as Record<string, unknown>)) as never);
+});
+
+/** `POST /admin/queue/batch/delete` —— 批量删任务。 */
+adminContentRoutes.post('/queue/batch/delete', async (c) => {
+  const { ctx } = withCtx(c);
+  const body = await readBody(c);
+  const ids = idList(body.ids);
+  if (ids.length === 0) return c.json(fail(c, Err.param('No task selected')) as never);
+  await ctx.tasks.softDeleteMany(ids);
+  return c.json(ok(c) as never);
+});
+
+/**
+ * `POST /admin/queue/cleanup` —— 清理历史任务。
+ * 对应 `CleanupTaskService`：删掉 `not_after` 之前、且状态/类型命中的任务。
+ */
+adminContentRoutes.post('/queue/cleanup', async (c) => {
+  const { sql } = withCtx(c);
+  const body = (await readBody(c)) as {
+    not_after?: string;
+    types?: string[];
+    status?: string[];
+  };
+  const notAfter = body.not_after ? new Date(body.not_after) : null;
+  if (!notAfter || Number.isNaN(notAfter.getTime())) {
+    return c.json(fail(c, Err.param('Invalid not_after')) as never);
+  }
+  const statuses = jsonArray(body.status).map(String);
+  const types = jsonArray(body.types).map(String);
+
+  await sql(
+    `UPDATE tasks SET deleted_at = now(), updated_at = now()
+     WHERE deleted_at IS NULL
+       AND created_at < $1::timestamptz
+       AND ($2::text[] IS NULL OR status = ANY($2::text[]))
+       AND ($3::text[] IS NULL OR type = ANY($3::text[]))`,
+    [notAfter.toISOString(), statuses.length ? statuses : null, types.length ? types : null],
+  );
+  return c.json(ok(c) as never);
+});
+
+// ---------------------------------------------------------------------------
+// 节点
+// ---------------------------------------------------------------------------
+
+/**
+ * 节点。对应上游 `service/admin/node.go`。
+ *
+ * 边缘版是单体 Worker：节点**可以正常建、改、删、测**（与真实上游从节点
+ * /aria2 的连通性测试是真 HTTP 请求 + 同款 HMAC 签名，能测通就能配对），
+ * 但打包 / 远程下载等任务不会分派到节点 —— 任务都在请求内同步跑完，
+ * 节点配置仅对未来扩展生效。
+ */
+function nodeToResponse(n: Record<string, unknown>) {
+  return {
+    id: num(n.id),
+    created_at: iso(n.created_at),
+    updated_at: iso(n.updated_at),
+    name: String(n.name ?? ''),
+    type: String(n.type ?? 'slave'),
+    server: (n.server as string) ?? '',
+    slave_key: (n.slave_key as string) ?? '',
+    status: String(n.status ?? 'active'),
+    weight: num(n.weight),
+    capabilities: (n.capabilities as string) ?? '',
+    settings: (n.settings as Record<string, unknown>) ?? {},
+    edges: { storage_policy: [] },
+  };
+}
+
+async function loadNode(sql: Sql, id: number): Promise<Record<string, unknown> | null> {
+  const rows = (await sql(
+    'SELECT * FROM nodes WHERE id = $1 AND deleted_at IS NULL LIMIT 1',
+    [id],
+  )) as Record<string, unknown>[];
+  return rows[0] ?? null;
+}
+
+adminContentRoutes.post('/node', async (c) => {
+  const { sql } = withCtx(c);
+  const body = await readBody(c);
+  const { page, pageSize, offset } = paginationArgs(body);
+  const rows = (await sql(
+    'SELECT * FROM nodes WHERE deleted_at IS NULL ORDER BY id ASC LIMIT $1 OFFSET $2',
+    [pageSize, offset],
+  )) as Record<string, unknown>[];
+  const countRows = (await sql(
+    'SELECT COUNT(*)::int AS total FROM nodes WHERE deleted_at IS NULL',
+  )) as Record<string, unknown>[];
+  return c.json(
+    ok(c, {
+      nodes: rows.map(nodeToResponse),
+      pagination: paginationOf(page, pageSize, num(countRows[0]?.total)),
+    }) as never,
+  );
+});
+
+adminContentRoutes.get('/node/:id', async (c) => {
+  const { sql } = withCtx(c);
+  const id = numericId(c.req.param('id'), (v) => c.get('ctx').codec.decodeEntityID(v));
+  if (id === null) return c.json(fail(c, Err.notFound('Node not found')) as never);
+  const node = await loadNode(sql, id);
+  if (!node) return c.json(fail(c, Err.notFound('Node not found')) as never);
+  return c.json(ok(c, { node: nodeToResponse(node) }) as never);
+});
+
+/** 创建 / 更新节点的公共逻辑（`UpsertNodeService`）。 */
+async function upsertNode(c: Context<AppBindings>, id: number | null, requireExistingId: boolean) {
+  const { sql } = withCtx(c);
+  const raw = await readBody(c);
+  const body = unwrapBody<Record<string, unknown>>(raw, 'node');
+
+  if (requireExistingId && !(num(body.id) > 0)) {
+    throw Err.param('ID is required');
+  }
+  const name = String(body.name ?? '').trim();
+  if (!name) throw Err.param('Name is required');
+  const type = String(body.type ?? 'slave');
+  if (type !== 'master' && type !== 'slave') throw Err.param('Invalid node type');
+  const status = String(body.status ?? 'active');
+  if (status !== 'active' && status !== 'suspended') throw Err.param('Invalid node status');
+
+  const settings = JSON.stringify((body.settings as Record<string, unknown>) ?? {});
+
+  if (id === null) {
+    const rows = (await sql(
+      `INSERT INTO nodes (name, type, server, slave_key, status, weight, capabilities, settings)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb) RETURNING *`,
+      [
+        name,
+        type,
+        String(body.server ?? ''),
+        String(body.slave_key ?? ''),
+        status,
+        num(body.weight),
+        String(body.capabilities ?? ''),
+        settings,
+      ],
+    )) as Record<string, unknown>[];
+    return nodeToResponse(rows[0]!);
+  }
+
+  const existing = await loadNode(sql, id);
+  if (!existing) throw Err.notFound('Node not found');
+  await sql(
+    `UPDATE nodes SET name = $2, type = $3, server = $4, slave_key = $5, status = $6,
+                        weight = $7, capabilities = $8, settings = $9::jsonb, updated_at = now()
+     WHERE id = $1`,
+    [
+      id,
+      name,
+      type,
+      String(body.server ?? ''),
+      String(body.slave_key ?? ''),
+      status,
+      num(body.weight),
+      String(body.capabilities ?? ''),
+      settings,
+    ],
+  );
+  const updated = await loadNode(sql, id);
+  return nodeToResponse(updated!);
+}
+
+adminContentRoutes.put('/node', async (c) => {
+  try {
+    return c.json(ok(c, { node: await upsertNode(c, null, false) }) as never);
+  } catch (e) {
+    return c.json(fail(c, e) as never);
+  }
+});
+
+adminContentRoutes.put('/node/:id', async (c) => {
+  try {
+    const id = numericId(c.req.param('id'), (v) => c.get('ctx').codec.decodeEntityID(v));
+    if (id === null) throw Err.notFound('Node not found');
+    return c.json(ok(c, { node: await upsertNode(c, id, true) }) as never);
+  } catch (e) {
+    return c.json(fail(c, e) as never);
+  }
+});
+
+adminContentRoutes.delete('/node/:id', async (c) => {
+  const { sql } = withCtx(c);
+  try {
+    const id = numericId(c.req.param('id'), (v) => c.get('ctx').codec.decodeEntityID(v));
+    if (id === null) throw Err.notFound('Node not found');
+    const node = await loadNode(sql, id);
+    if (!node) throw Err.notFound('Node not found');
+
+    // 主节点是系统节点，不可删（上游 CodeInvalidActionOnSystemNode）
+    if (String(node.type) === 'master') {
+      throw new AppError(CodeInvalidActionOnSystemNode, 'Cannot delete master node');
+    }
+
+    // 被存储策略引用时拒绝，消息里带上策略名（上游同款）
+    const policyRows = (await sql(
+      'SELECT name FROM storage_policies WHERE node_id = $1 AND deleted_at IS NULL',
+      [id],
+    )) as Record<string, unknown>[];
+    if (policyRows.length > 0) {
+      throw new AppError(
+        CodeNodeUsedByStoragePolicy,
+        `Used by policies: ${policyRows.map((r) => String(r.name)).join(', ')}`,
+      );
+    }
+
+    await sql('UPDATE nodes SET deleted_at = now(), updated_at = now() WHERE id = $1', [id]);
+    return c.json(ok(c) as never);
+  } catch (e) {
+    return c.json(fail(c, e) as never);
+  }
+});
+
+/**
+ * 连通性测试：向从节点 `POST /api/v4/slave/ping` 发真请求。
+ *
+ * 签名与上游 master 完全同款（`pkg/auth`）：待签串是
+ * `{"Path":..,"Header":"<排序后的 X-Cr-* 头>","Body":..}` 的 JSON，
+ * HMAC-SHA256(slave_key) 后附 `:<expires>`，放 `Authorization: Bearer Cr ` 头。
+ * 测通意味着这台真实的上游 Cloudreve 从节点可以接入。
+ */
+adminContentRoutes.post('/node/test', async (c) => {
+  const { ctx } = withCtx(c);
+  try {
+    const raw = await readBody(c);
+    const body = unwrapBody<Record<string, unknown>>(raw, 'node');
+    const server = String(body.server ?? '').replace(/\/+$/, '');
+    const slaveKey = String(body.slave_key ?? '');
+    if (!server) throw Err.param('server is required');
+
+    const callback = ctx.settings.siteUrl;
+    const payload = JSON.stringify({ callback });
+    const expires = Math.floor(Date.now() / 1000) + ctx.settings.getInt('slave_api_timeout', 60);
+
+    // X-Cr-* 头按字母序参与签名（上游 getSignContent）
+    const headers: Record<string, string> = {
+      'X-Cr-Site-Id': ctx.settings.siteId,
+      'X-Cr-Site-Url': callback,
+      'X-Cr-Version': BACKEND_VERSION,
+    };
+    const nodeId = num(body.id);
+    if (nodeId > 0) headers['X-Cr-Node-Id'] = String(nodeId);
+    const signedHeaders = Object.keys(headers)
+      .sort()
+      .map((k) => `${k}=${headers[k]}`)
+      .join('&');
+    const signString = JSON.stringify({ Path: '/api/v4/slave/ping', Header: signedHeaders, Body: payload });
+    const sign = await ctx.signer.sign(signString, expires);
+
+    let res: Response;
+    try {
+      res = await fetch(`${server}/api/v4/slave/ping`, {
+        method: 'POST',
+        headers: {
+          ...headers,
+          Authorization: `Bearer Cr ${sign}`,
+          'Content-Type': 'application/json;charset=utf-8',
+        },
+        body: payload,
+        signal: AbortSignal.timeout(10000),
+      });
+    } catch (err) {
+      throw Err.param(`Failed to connect to node: ${(err as Error).message}`);
+    }
+    if (!res.ok) {
+      throw Err.param(`Failed to connect to node: HTTP ${res.status}`);
+    }
+    const json = (await res.json().catch(() => ({}))) as { code?: number; msg?: string };
+    if ((json.code ?? 0) !== 0) {
+      throw Err.param(`Successfully connected to slave node, but slave returns: ${json.msg ?? 'unknown'}`);
+    }
+    return c.json(ok(c) as never);
+  } catch (e) {
+    return c.json(fail(c, e) as never);
+  }
+});
+
+/**
+ * 下载器测试。
+ *
+ *   - master / aria2：向 aria2 RPC 发 `aria2.getVersion`（JSON-RPC over HTTP）；
+ *   - slave：向上游从节点 `POST /api/v4/slave/download/test` 发同款签名请求。
+ *
+ * 返回下载器版本字符串（上游同款）。
+ */
+adminContentRoutes.post('/node/test/downloader', async (c) => {
+  const { ctx } = withCtx(c);
+  try {
+    const raw = await readBody(c);
+    const body = unwrapBody<Record<string, unknown>>(raw, 'node');
+    const nodeType = String(body.type ?? 'slave');
+    const settings = (body.settings as Record<string, unknown>) ?? {};
+    const provider = String(settings.provider ?? 'aria2');
+
+    if (nodeType === 'master' || provider === 'aria2') {
+      // aria2 JSON-RPC：POST {server}/jsonrpc
+      const aria2 = (settings.aria2 ?? {}) as Record<string, unknown>;
+      const rpc = String(aria2.url ?? '');
+      if (!rpc) throw Err.param('aria2 url is required');
+      const params: unknown[] = [];
+      const token = String(aria2.token ?? '');
+      if (token) params.push(`token:${token}`);
+      let res: Response;
+      try {
+        res = await fetch(rpc, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ jsonrpc: '2.0', id: 'cr_edge_test', method: 'aria2.getVersion', params }),
+          signal: AbortSignal.timeout(10000),
+        });
+      } catch (err) {
+        throw Err.param(`Failed to test downloader: ${(err as Error).message}`);
+      }
+      const json = (await res.json().catch(() => ({}))) as {
+        result?: { version?: string };
+        error?: { message?: string };
+      };
+      if (json.error) {
+        throw Err.param(`Failed to test downloader: ${json.error.message ?? 'aria2 error'}`);
+      }
+      return c.json(ok(c, json.result?.version ?? '') as never);
+    }
+
+    // slave 下载器：同款 HMAC 签名请求
+    const server = String(body.server ?? '').replace(/\/+$/, '');
+    const slaveKey = String(body.slave_key ?? '');
+    if (!server) throw Err.param('server is required');
+    const callback = ctx.settings.siteUrl;
+    const payload = JSON.stringify({ node_setting: settings, node_setting_hash: '' });
+    const expires = Math.floor(Date.now() / 1000) + ctx.settings.getInt('slave_api_timeout', 60);
+    const headers: Record<string, string> = {
+      'X-Cr-Site-Id': ctx.settings.siteId,
+      'X-Cr-Site-Url': callback,
+      'X-Cr-Version': BACKEND_VERSION,
+    };
+    const nodeId = num(body.id);
+    if (nodeId > 0) headers['X-Cr-Node-Id'] = String(nodeId);
+    const signedHeaders = Object.keys(headers)
+      .sort()
+      .map((k) => `${k}=${headers[k]}`)
+      .join('&');
+    const signString = JSON.stringify({
+      Path: '/api/v4/slave/download/test',
+      Header: signedHeaders,
+      Body: payload,
+    });
+    const sign = await ctx.signer.sign(signString, expires);
+    let res: Response;
+    try {
+      res = await fetch(`${server}/api/v4/slave/download/test`, {
+        method: 'POST',
+        headers: {
+          ...headers,
+          Authorization: `Bearer Cr ${sign}`,
+          'Content-Type': 'application/json;charset=utf-8',
+        },
+        body: payload,
+        signal: AbortSignal.timeout(10000),
+      });
+    } catch (err) {
+      throw Err.param(`Failed to test downloader: ${(err as Error).message}`);
+    }
+    const json = (await res.json().catch(() => ({}))) as { code?: number; msg?: string; data?: string };
+    if ((json.code ?? 0) !== 0) {
+      throw Err.param(`Failed to test downloader: ${json.msg ?? 'unknown'}`);
+    }
+    return c.json(ok(c, json.data ?? '') as never);
+  } catch (e) {
+    return c.json(fail(c, e) as never);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// OAuth 应用
+// ---------------------------------------------------------------------------
+
+/** 对齐前端 `GetOAuthClientResponse`。 */
+function oauthClientToResponse(row: Record<string, unknown>, totalGrants: number) {
+  return {
+    id: num(row.id),
+    created_at: iso(row.created_at),
+    updated_at: iso(row.updated_at),
+    deleted_at: iso(row.deleted_at),
+    guid: String(row.guid ?? ''),
+    secret: String(row.secret ?? ''),
+    name: String(row.name ?? ''),
+    homepage_url: (row.homepage_url as string) ?? '',
+    redirect_uris: jsonArray(row.redirect_uris),
+    scopes: jsonArray(row.scopes),
+    props: row.props ?? {},
+    is_enabled: row.is_enabled !== false,
+    is_system: false,
+    total_grants: totalGrants,
+  };
+}
+
+/** `POST /admin/oauthClient` —— OAuth 应用列表。条件键 `is_enabled`。 */
+adminContentRoutes.post('/oauthClient', async (c) => {
+  const { sql } = withCtx(c);
+  const body = await readBody(c);
+  const { page, pageSize, offset } = paginationArgs(body);
+  const conditions = (body.conditions ?? {}) as Record<string, string>;
+
+  const enabledRaw = condStr(conditions, 'is_enabled');
+  const enabled = enabledRaw === '' ? null : condBool(conditions, 'is_enabled');
+  const orderCol = orderColumn(body.order_by, ['id', 'name', 'created_at', 'updated_at']);
+  const orderDir = orderDirection(body.order_direction);
+
+  const where = `deleted_at IS NULL AND ($1::bool IS NULL OR is_enabled = $1)`;
+  const rows = (await sql(
+    `SELECT * FROM oauth_clients WHERE ${where} ORDER BY ${orderCol} ${orderDir} LIMIT $2 OFFSET $3`,
+    [enabled, pageSize, offset],
+  )) as Record<string, unknown>[];
+  const countRows = (await sql(
+    `SELECT COUNT(*)::int AS total FROM oauth_clients WHERE ${where}`,
+    [enabled],
+  )) as Record<string, unknown>[];
+
+  const out = [];
+  for (const r of rows) {
+    const grantRows = (await sql(
+      'SELECT COUNT(*)::int AS total FROM oauth_grants WHERE client_id = $1 AND deleted_at IS NULL',
+      [num(r.id)],
+    )) as Record<string, unknown>[];
+    out.push(oauthClientToResponse(r, num(grantRows[0]?.total)));
+  }
+
+  return c.json(
+    ok(c, { clients: out, pagination: paginationOf(page, pageSize, num(countRows[0]?.total)) }) as never,
+  );
+});
+
+/** `GET /admin/oauthClient/:id` —— OAuth 应用详情。 */
+adminContentRoutes.get('/oauthClient/:id', async (c) => {
+  const { sql, codec } = withCtx(c);
+  const id = numericId(c.req.param('id'), (v) => codec.decodeEntityID(v));
+  if (id === null) return c.json(fail(c, Err.notFound('OAuth client not found')) as never);
+
+  const rows = (await sql(
+    'SELECT * FROM oauth_clients WHERE id = $1 AND deleted_at IS NULL LIMIT 1',
+    [id],
+  )) as Record<string, unknown>[];
+  if (!rows[0]) return c.json(fail(c, Err.notFound('OAuth client not found')) as never);
+
+  const grantRows = (await sql(
+    'SELECT COUNT(*)::int AS total FROM oauth_grants WHERE client_id = $1 AND deleted_at IS NULL',
+    [id],
+  )) as Record<string, unknown>[];
+  return c.json(ok(c, oauthClientToResponse(rows[0], num(grantRows[0]?.total))) as never);
+});
+
+/**
+ * `PUT /admin/oauthClient` 与 `PUT /admin/oauthClient/:id` —— 创建 / 更新。
+ * 请求体 `{ client: {...} }`；`guid` 是客户端 ID，不传自动生成。
+ */
+async function upsertOAuthClient(c: Context<AppBindings>, id: number | null) {
+  const { sql } = withCtx(c);
+  const raw = await readBody(c);
+  const body = unwrapBody<Record<string, unknown>>(raw, 'client');
+
+  const name = String(body.name ?? '').trim();
+  if (!name) throw Err.param('Name is required');
+  const redirectUris = jsonArray(body.redirect_uris).map(String);
+  const scopes = jsonArray(body.scopes).map(String);
+  const props = (body.props as Record<string, unknown>) ?? {};
+  const isEnabled = body.is_enabled !== false;
+
+  if (id === null) {
+    const guid = String(body.guid ?? '') || randomString(32);
+    const secret = String(body.secret ?? '') || randomString(48);
+    const rows = (await sql(
+      `INSERT INTO oauth_clients (guid, secret, name, homepage_url, redirect_uris, scopes, props, is_enabled)
+       VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb, $7::jsonb, $8) RETURNING *`,
+      [
+        guid,
+        secret,
+        name,
+        String(body.homepage_url ?? ''),
+        JSON.stringify(redirectUris),
+        JSON.stringify(scopes),
+        JSON.stringify(props),
+        isEnabled,
+      ],
+    )) as Record<string, unknown>[];
+    return oauthClientToResponse(rows[0]!, 0);
+  }
+
+  const existing = (await sql(
+    'SELECT * FROM oauth_clients WHERE id = $1 AND deleted_at IS NULL LIMIT 1',
+    [id],
+  )) as Record<string, unknown>[];
+  if (!existing[0]) throw Err.notFound('OAuth client not found');
+
+  // secret 留空表示不改动（前端表单不会回填已存的 secret）
+  const secret = String(body.secret ?? '') || String(existing[0].secret ?? '');
+  await sql(
+    `UPDATE oauth_clients SET
+       guid = $2, secret = $3, name = $4, homepage_url = $5,
+       redirect_uris = $6::jsonb, scopes = $7::jsonb, props = $8::jsonb,
+       is_enabled = $9, updated_at = now()
+     WHERE id = $1`,
+    [
+      id,
+      String(body.guid ?? '') || String(existing[0].guid ?? ''),
+      secret,
+      name,
+      String(body.homepage_url ?? ''),
+      JSON.stringify(redirectUris),
+      JSON.stringify(scopes),
+      JSON.stringify(props),
+      isEnabled,
+    ],
+  );
+  const rows = (await sql('SELECT * FROM oauth_clients WHERE id = $1 LIMIT 1', [id])) as Record<
+    string,
+    unknown
+  >[];
+  return oauthClientToResponse(rows[0]!, 0);
+}
+
+adminContentRoutes.put('/oauthClient', async (c) => {
+  try {
+    return c.json(ok(c, await upsertOAuthClient(c, null)) as never);
+  } catch (e) {
+    return c.json(fail(c, e) as never);
+  }
+});
+
+adminContentRoutes.put('/oauthClient/:id', async (c) => {
+  const { codec } = withCtx(c);
+  const id = numericId(c.req.param('id'), (v) => codec.decodeEntityID(v));
+  if (id === null) return c.json(fail(c, Err.notFound('OAuth client not found')) as never);
+  try {
+    return c.json(ok(c, await upsertOAuthClient(c, id)) as never);
+  } catch (e) {
+    return c.json(fail(c, e) as never);
+  }
+});
+
+/** `DELETE /admin/oauthClient/:id` —— 删单个应用（连带撤销授权）。 */
+adminContentRoutes.delete('/oauthClient/:id', async (c) => {
+  const { sql, codec } = withCtx(c);
+  const id = numericId(c.req.param('id'), (v) => codec.decodeEntityID(v));
+  if (id === null) return c.json(fail(c, Err.notFound('OAuth client not found')) as never);
+  await sql('UPDATE oauth_grants SET deleted_at = now() WHERE client_id = $1 AND deleted_at IS NULL', [id]);
+  await sql('UPDATE oauth_clients SET deleted_at = now(), updated_at = now() WHERE id = $1', [id]);
+  return c.json(ok(c) as never);
+});
+
+/** `POST /admin/oauthClient/batch/delete` —— 批量删应用。 */
+adminContentRoutes.post('/oauthClient/batch/delete', async (c) => {
+  const { sql } = withCtx(c);
+  const body = await readBody(c);
+  const ids = idList(body.ids);
+  if (ids.length === 0) return c.json(fail(c, Err.param('No client selected')) as never);
+  await forEachId(
+    sql,
+    () => 'UPDATE oauth_grants SET deleted_at = now() WHERE client_id = $1 AND deleted_at IS NULL',
+    ids,
+  );
+  await forEachId(
+    sql,
+    () => 'UPDATE oauth_clients SET deleted_at = now(), updated_at = now() WHERE id = $1',
+    ids,
+  );
+  return c.json(ok(c) as never);
+});

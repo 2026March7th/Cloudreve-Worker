@@ -8,6 +8,7 @@
  *   /api/v4/file/*     文件与上传下载
  *   /api/v4/share/*    分享
  *   /api/v4/admin/*    管理后台
+ *   /api/v4/workflow/* 任务流（打包 / 远程下载）
  *   /s/:id             分享短链（302）
  *   /f/:id/:name       文件直链（302）
  *
@@ -31,7 +32,10 @@ import { userRoutes } from './routes/user';
 import { fileRoutes } from './routes/file';
 import { shareRoutes } from './routes/share';
 import { adminRoutes } from './routes/admin';
+import { workflowRoutes } from './routes/workflow';
 import { callbackRoutes } from './routes/callback';
+import { devicesRoutes } from './routes/devices';
+import { davRoutes } from './routes/dav';
 import { DownloadService } from './services/download';
 import { FileSystemService } from './services/fs';
 import { ShareService } from './services/share';
@@ -92,6 +96,7 @@ app.route('/api/v4/user', userRoutes);
 app.route('/api/v4/file', fileRoutes);
 app.route('/api/v4/share', shareRoutes);
 app.route('/api/v4/admin', adminRoutes);
+app.route('/api/v4/workflow', workflowRoutes);
 
 /**
  * 上传回调。原版在 `/api/v4/callback` 下按驱动分成 9 个子路径，边缘版只实现
@@ -101,6 +106,8 @@ app.route('/api/v4/admin', adminRoutes);
  * 鉴权靠路径里的 callback secret，不走登录中间件（与原版一致）。
  */
 app.route('/api/v4/callback', callbackRoutes);
+app.route('/api/v4/devices', devicesRoutes);
+app.route('/dav', davRoutes);
 
 // ---------------------------------------------------------------------------
 // 内容跨域。对应原版 `middleware.ContentCORS()`，只挂在两个「内容」路由组上：

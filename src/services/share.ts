@@ -19,6 +19,7 @@ import { FileType, GroupPermission } from '../lib/boolset';
 import {
   AppError,
   CodeIncorrectPassword,
+  CodeNoPermissionErr,
   CodeNotFound,
   CodeSaveOwnShare,
   CodeGroupNotAllowed,
@@ -90,16 +91,23 @@ export class ShareService {
   /** 创建分享，返回分享 URL（与原版一致，data 是字符串）。 */
   async create(params: ShareCreateParams): Promise<string> {
     const user = this.ctx.requireUser();
-    this.ctx.requireGroupPermission(GroupPermission.Share, 'Sharing is not allowed for your group');
+    this.ctx.requireGroupPermission(GroupPermission.Share, 'Group permission denied');
 
     if (!params.uri) throw Err.param('uri is required');
     const uri = URI.parse(params.uri);
-    const file = await this.fs.mustResolve(uri);
-    if (this.fs.isRootFolder(file)) {
-      throw new AppError(40053, 'Cannot share root folder');
+    // 对齐原版 `manager.CreateOrUpdateShare`（`manager/operation.go:288-296`）：
+    // 取不到源文件（含根目录，原版带 `WithNotRoot()`）或缺少 Share 能力位，
+    // 一律报 `CodeNotFound` + "src file not found"；属主不符报 403 "permission denied"。
+    const file = await this.fs.resolve(uri);
+    if (!file || this.fs.isRootFolder(file)) {
+      throw new AppError(CodeNotFound, 'src file not found');
     }
     if (file.owner_id !== user.id) {
-      throw new AppError(403, 'Owner operation only');
+      throw new AppError(CodeNoPermissionErr, 'permission denied');
+    }
+    // 符号目录（「保存到我的网盘」生成的快捷方式）不能分享，见 operation.go:298-300
+    if (file.is_symbolic) {
+      throw new AppError(CodeNoPermissionErr, 'cannot share symbolic file');
     }
 
     let password = params.password?.trim() || null;
@@ -134,13 +142,30 @@ export class ShareService {
 
   async edit(shareHashId: string, params: ShareCreateParams): Promise<string> {
     const user = this.ctx.requireUser();
-    this.ctx.requireGroupPermission(GroupPermission.Share, 'Sharing is not allowed for your group');
+    this.ctx.requireGroupPermission(GroupPermission.Share, 'Group permission denied');
 
     const shareId = this.ctx.codec.decodeShareID(shareHashId);
     if (shareId === null) throw Err.shareNotFound();
     const share = await this.ctx.shares.byId(shareId);
     if (!share) throw Err.shareNotFound();
-    if (share.user_shares !== user.id) throw new AppError(403, 'Owner operation only');
+
+    // 原版 `EditShare` 走的是同一个 `Upsert(c, existedID)`（`share/manage.go:63-100`），
+    // 也就是说编辑和创建共用全部前置校验：按 `params.uri` 重新解析源文件 → 校验属主 →
+    // 再确认待编辑的分享指的就是这个文件（`operation.go:311-313`）。
+    if (!params.uri) throw Err.param('uri is required');
+    const file = await this.fs.resolve(URI.parse(params.uri));
+    if (!file || this.fs.isRootFolder(file)) {
+      throw new AppError(CodeNotFound, 'src file not found');
+    }
+    if (file.owner_id !== user.id) {
+      throw new AppError(CodeNoPermissionErr, 'permission denied');
+    }
+    if (file.is_symbolic) {
+      throw new AppError(CodeNoPermissionErr, 'cannot share symbolic file');
+    }
+    if (share.file_shares !== file.id) {
+      throw new AppError(CodeNotFound, 'share link not found');
+    }
 
     let password = params.password?.trim() || null;
     if (password && !/^[a-zA-Z0-9]{1,32}$/.test(password)) {
@@ -385,8 +410,11 @@ export class ShareService {
     if (shareId === null) throw Err.shareNotFound();
     const share = await this.ctx.shares.byId(shareId);
     if (!share) throw Err.shareNotFound();
+    // 对齐原版 `DeleteShare`（`share/manage.go:102-126`）：管理员可删任意分享，
+    // 其余人只能删自己的；不属于自己的分享走「查不到」分支 ——
+    // 即 `CodeNotFound` + "share not found"，而不是 403（不泄露分享是否存在）。
     if (share.user_shares !== user.id && !this.ctx.isAdmin) {
-      throw new AppError(403, 'Owner operation only');
+      throw new AppError(CodeNotFound, 'share not found');
     }
     await this.ctx.shares.softDelete(shareId);
   }

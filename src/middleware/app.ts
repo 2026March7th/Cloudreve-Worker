@@ -20,6 +20,8 @@ export interface AppBindings {
   Variables: {
     ctx: AppContext;
     correlationId: string;
+    /** WebDAV Basic Auth 验证通过的账号（仅 /dav 路由使用） */
+    davAccount: import('../db/repo').DavAccountRow;
   };
 }
 
@@ -77,7 +79,7 @@ export function appContext(): MiddlewareHandler<AppBindings> {
       if (claims?.client_id) scopes = claims.scopes;
     }
 
-    c.set('ctx', new AppContext(env, settings, codec, jwt, user));
+    c.set('ctx', new AppContext(env, settings, codec, jwt, user, scopes));
     c.header('X-Correlation-ID', correlationId);
 
     await next();

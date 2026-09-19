@@ -14,6 +14,22 @@ import { randomString } from '../lib/crypto';
 const KV_CACHE_KEY = 'settings:all:v1';
 const KV_CACHE_TTL = 60;
 
+/** 全文检索配置。字段名与官方前端面板提交的键名一致。 */
+export interface FtsConfig {
+  enabled: boolean;
+  indexType: string;
+  extractorType: string;
+  meiliEndpoint: string;
+  meiliApiKey: string;
+  meiliPageSize: number;
+  meiliEmbedEnabled: boolean;
+  meiliEmbedConfig: string;
+  tikaEndpoint: string;
+  tikaExts: string[];
+  tikaMaxFileSize: number;
+  chunkSize: number;
+}
+
 export class SettingsProvider {
   private cache: Map<string, string> | null = null;
 
@@ -83,6 +99,60 @@ export class SettingsProvider {
   }
   get emailActive(): boolean {
     return this.getBool('email_active', false);
+  }
+  /**
+   * SMTP 连接参数。字段名与官方前端管理面板**提交的键名逐字一致**
+   * （`frontend/src/component/Admin/Settings/Email/Email.tsx`），
+   * 所以管理员在面板里填完保存就能直接生效，不需要任何环境变量。
+   */
+  get smtp(): {
+    host: string;
+    port: number;
+    user: string;
+    pass: string;
+    forceEncryption: boolean;
+    keepalive: number;
+  } {
+    return {
+      host: this.get('smtpHost', ''),
+      port: this.getInt('smtpPort', 25),
+      user: this.get('smtpUser', ''),
+      pass: this.get('smtpPass', ''),
+      forceEncryption: this.getBool('smtpEncryption', false),
+      keepalive: this.getInt('mail_keepalive', 30),
+    };
+  }
+  /** 发件人与回复地址。`fromAdress` 的拼写错误来自上游，不能顺手改。 */
+  get mailSender(): { name: string; address: string; replyTo: string } {
+    return {
+      name: this.get('fromName', ''),
+      address: this.get('fromAdress', ''),
+      replyTo: this.get('replyTo', ''),
+    };
+  }
+  /**
+   * 全文检索配置。字段名与官方前端面板提交的键名一致
+   * （`frontend/src/component/Admin/FileSystem/FullTextSearch/FullTextSearchSetting.tsx`）。
+   */
+  get fts(): FtsConfig {
+    return {
+      enabled: this.getBool('fts_enabled', false),
+      indexType: this.get('fts_index_type', 'meilisearch'),
+      extractorType: this.get('fts_extractor_type', 'tika'),
+      meiliEndpoint: this.get('fts_meilisearch_endpoint', '').replace(/\/+$/, ''),
+      meiliApiKey: this.get('fts_meilisearch_api_key', ''),
+      meiliPageSize: this.getInt('fts_meilisearch_page_size', 5),
+      meiliEmbedEnabled: this.getBool('fts_meilisearch_embed_enabled', false),
+      meiliEmbedConfig: this.get('fts_meilisearch_embed_config', '{}'),
+      tikaEndpoint: this.get('fts_tika_endpoint', '').replace(/\/+$/, ''),
+      tikaExts: this
+        .get('fts_tika_exts', '')
+        .split(',')
+        .map((s) => s.trim().toLowerCase())
+        .filter(Boolean),
+      tikaMaxFileSize: this.getInt('fts_tika_max_file_size', 26214400),
+      chunkSize: this.getInt('fts_chunk_size', 2000),
+    };
   }
   get loginCaptcha(): boolean {
     return this.getBool('login_captcha', false);

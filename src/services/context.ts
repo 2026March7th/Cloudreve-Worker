@@ -17,6 +17,8 @@ import {
   ShareRepo,
   TaskRepo,
   UserRepo,
+  DavAccountRepo,
+  PasskeyRepo,
 } from '../db/repo';
 import type { GroupRow, StoragePolicyRow, UserWithGroup } from '../db/types';
 import { AppError, CodeGroupNotAllowed, CodeNoPermissionErr } from '../lib/errors';
@@ -47,6 +49,8 @@ export class AppContext {
   readonly metadata: MetadataRepo;
   readonly directLinks: DirectLinkRepo;
   readonly tasks: TaskRepo;
+  readonly davAccounts: DavAccountRepo;
+  readonly passkeys: PasskeyRepo;
   /** URL / 请求签名器，密钥与 JWT 共用站点 secret */
   readonly signer: Signer;
 
@@ -56,6 +60,11 @@ export class AppContext {
     readonly codec: HashIDCodec,
     readonly jwt: JWTService,
     readonly user?: UserWithGroup,
+    /**
+     * OAuth 客户端 token 的 scopes（内置登录 token 没有，视为不限）。
+     * 对应上游 `auth.GetScopesFromContext`。
+     */
+    readonly scopes?: string[],
   ) {
     this.users = new UserRepo(env);
     this.groups = new GroupRepo(env);
@@ -66,6 +75,8 @@ export class AppContext {
     this.metadata = new MetadataRepo(env);
     this.directLinks = new DirectLinkRepo(env);
     this.tasks = new TaskRepo(env);
+    this.davAccounts = new DavAccountRepo(env);
+    this.passkeys = new PasskeyRepo(env);
     this.signer = new Signer(settings.secretKey);
   }
 

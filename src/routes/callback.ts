@@ -19,6 +19,7 @@ import { fail, ok } from '../lib/response';
 import { AppError, CodeFeatureNotEnabled } from '../lib/errors';
 import { FileSystemService } from '../services/fs';
 import { UploadService } from '../services/upload';
+import { SearchService } from '../services/search';
 
 export const callbackRoutes = new Hono<AppBindings>();
 
@@ -28,6 +29,15 @@ callbackRoutes.post('/onedrive/:sessionID/:key', async (c) => {
   try {
     const service = new FileSystemService(ctx);
     const upload = new UploadService(ctx, service);
+    // 直传收尾后同样送全文索引（waitUntil 不阻塞回调响应）
+    const search = new SearchService(ctx);
+    if (search.available) {
+      upload.onUploadFinished = (file) => {
+        c.executionCtx.waitUntil(
+          search.indexFile(file).catch((e) => console.error('FTS index after upload failed', e)),
+        );
+      };
+    }
     await upload.completeByCallback(c.req.param('sessionID'), c.req.param('key'));
     return c.json(ok(c) as never);
   } catch (e) {

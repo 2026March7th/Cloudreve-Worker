@@ -9,12 +9,14 @@
  *   - 目录内容：`file_children = 父 id`
  */
 import { AppContext } from './context';
+import { SearchService } from './search';
 import { FileSystemType, URI, validateName } from './uri';
 import type { ExplorerView, FileRow, MetadataRow, StoragePolicyRow } from '../db/types';
 import { BooleanSet, EntityType, FileType, GroupPermission } from '../lib/boolset';
 import {
   AppError,
   CodeAnonymouseAccessDenied,
+  CodeEntityNotExist,
   CodeFileCountLimitedReached,
   CodeFileNotFound,
   CodeGroupNotAllowed,
@@ -34,6 +36,7 @@ import {
   MetadataExpectedCollectTime,
   MetadataRestoreUri,
   MetadataSharedRedirect,
+  MetadataUploadSessionID,
 } from '../lib/sysmeta';
 import { isShareInvalid } from './share-rules';
 
@@ -88,6 +91,8 @@ export interface EntityInfo {
   size: number;
   type: number;
   created_at: string;
+  /** 该实体所在的存储策略（原版 `BuildEntity` 恒带此字段）。 */
+  storage_policy?: StoragePolicyInfo;
 }
 
 export interface ExtendedInfo {
@@ -420,7 +425,19 @@ export class FileSystemService {
     return res;
   }
 
+  /**
+   * 构造 `extended_info`。字段与可见性对齐原版 `dbfs/dbfs.go:413-437` 的
+   * `LoadFileExtendedInfo` 分支：
+   *   - `storage_used` = 该文件**所有实体**的大小之和（`File.SizeUsed()`）；
+   *   - `direct_links` **仅属主**可见（原版 `if f.user.ID == target.OwnerID()`）；
+   *   - `view` 属主或管理员可见，取自 `files.props.view`；
+   *   - 每个实体附带它所在的存储策略。
+   */
   private async buildExtendedInfo(file: FileRow): Promise<ExtendedInfo> {
+    const requester = this.ctx.user;
+    const isOwner = requester !== undefined && file.owner_id === requester.id;
+    const canSeeOwnerOnly = isOwner || this.ctx.isAdmin;
+
     const info: ExtendedInfo = { storage_used: 0 };
 
     const policyId = file.storage_policy_files;
@@ -433,23 +450,38 @@ export class FileSystemService {
 
     if (file.type === FileType.File) {
       const entities = await this.ctx.entities.listByFile(file.id);
-      info.entities = entities.map((e) => ({
-        id: this.ctx.codec.encodeEntityID(e.id),
-        size: Number(e.size),
-        type: e.type,
-        created_at: e.created_at.toISOString(),
-      }));
+      info.storage_used = entities.reduce((sum, e) => sum + Number(e.size), 0);
+
+      const entityInfos: EntityInfo[] = [];
+      for (const e of entities) {
+        const entityInfo: EntityInfo = {
+          id: this.ctx.codec.encodeEntityID(e.id),
+          size: Number(e.size),
+          type: e.type,
+          created_at: e.created_at.toISOString(),
+        };
+        const entityPolicy = await this.ctx.policies.byId(e.storage_policy_entities);
+        if (entityPolicy) entityInfo.storage_policy = this.buildPolicyInfo(entityPolicy);
+        entityInfos.push(entityInfo);
+      }
+      info.entities = entityInfos;
     }
 
-    const links = await this.ctx.directLinks.listByFile(file.id);
-    if (links.length > 0) {
-      const base = this.ctx.settings.siteUrl.replace(/\/+$/, '');
-      info.direct_links = links.map((l) => ({
-        id: this.ctx.codec.encodeSourceLinkID(l.id),
-        url: `${base}/f/${this.ctx.codec.encodeSourceLinkID(l.id)}/${encodeURIComponent(l.name)}`,
-        downloaded: l.downloads,
-        created_at: l.created_at.toISOString(),
-      }));
+    if (canSeeOwnerOnly && file.props?.view) {
+      info.view = file.props.view;
+    }
+
+    if (isOwner) {
+      const links = await this.ctx.directLinks.listByFile(file.id);
+      if (links.length > 0) {
+        const base = this.ctx.settings.siteUrl.replace(/\/+$/, '');
+        info.direct_links = links.map((l) => ({
+          id: this.ctx.codec.encodeSourceLinkID(l.id),
+          url: `${base}/f/${this.ctx.codec.encodeSourceLinkID(l.id)}/${encodeURIComponent(l.name)}`,
+          downloaded: l.downloads,
+          created_at: l.created_at.toISOString(),
+        }));
+      }
     }
 
     return info;
@@ -700,6 +732,15 @@ export class FileSystemService {
 
     await this.ctx.files.rename(file.id, newName);
     const updated = await this.ctx.files.byId(file.id);
+
+    // 同步全文索引里的文件名（失败不影响改名本身）
+    if (updated && updated.primary_entity) {
+      await new SearchService(this.ctx).rename(
+        updated.id,
+        updated.primary_entity,
+        updated.name,
+      );
+    }
     return this.buildFileResponse(updated!, { owned: true });
   }
 
@@ -868,6 +909,9 @@ export class FileSystemService {
 
     await this.ctx.files.moveToTrash([file.id]);
 
+    // 进回收站的文件不该再被搜到：从全文索引剔除，恢复时重建
+    await new SearchService(this.ctx).deleteByFileIds([file.id]);
+
     await this.ctx.metadata.upsert(file.id, MetadataRestoreUri, restoreUri, true);
 
     const retention = this.ctx.user?.group.settings?.trash_retention ?? 0;
@@ -912,6 +956,91 @@ export class FileSystemService {
     }
     await this.ctx.entities.hardDelete(garbage.map((e) => e.id));
     await this.ctx.files.deleteMany(ids);
+
+    // 彻底删除的文件从全文索引剔除
+    await new SearchService(this.ctx).deleteByFileIds(ids);
+  }
+
+  // -------------------------------------------------------------------------
+  // 版本管理。对应原版 `DBFS.VersionControl`（`dbfs/manage.go:415-478`），
+  // 两个服务分别以 `delete=false` / `delete=true` 调用同一段逻辑。
+  // -------------------------------------------------------------------------
+
+  /**
+   * 把文件的当前版本切换成指定的历史版本。
+   * 对齐 `dbfs/manage.go:785-821` 的 `setCurrentVersion`。
+   */
+  async setCurrentVersion(uri: URI, versionId: number): Promise<void> {
+    const file = await this.resolveVersionTarget(uri);
+    if (file.primary_entity === versionId) return;
+
+    // 原版要求：实体存在、类型为 version、且不是未完成上传的占位实体
+    // （`upload_session_id == nil`），否则报 `fs.ErrEntityNotExist`。
+    const entities = await this.ctx.entities.listByFile(file.id);
+    const target = entities.find(
+      (e) => e.id === versionId && e.type === EntityType.Version && e.upload_session_id === null,
+    );
+    if (!target) throw new AppError(CodeEntityNotExist, 'Entity not exist');
+
+    await this.ctx.files.updatePrimaryEntity(file.id, versionId);
+  }
+
+  /**
+   * 删除文件的某个历史版本。
+   * 对齐 `dbfs/manage.go:757-783` 的 `deleteEntity`。原版这里只按 ID 找实体、
+   * **不校验类型**，所以缩略图实体也能从这条路径删掉 —— 保持一致。
+   */
+  async deleteVersion(uri: URI, versionId: number): Promise<void> {
+    const file = await this.resolveVersionTarget(uri);
+
+    // 原版不允许删当前版本，报 `fs.ErrNotSupportedAction`（403 Not supported action）
+    if (file.primary_entity === versionId) {
+      throw new AppError(CodeNoPermissionErr, 'Not supported action');
+    }
+
+    const entities = await this.ctx.entities.listByFile(file.id);
+    const target = entities.find((e) => e.id === versionId);
+    if (!target) throw new AppError(CodeEntityNotExist, 'Entity not exist');
+
+    await this.ctx.entities.unlinkFile(file.id, target.id);
+    // 原版在实体仍是「未完成上传」状态时，会顺带清掉文件上的上传会话标记
+    if (target.upload_session_id !== null) {
+      await this.ctx.metadata.remove(file.id, MetadataUploadSessionID);
+    }
+
+    const garbage = await this.ctx.entities.release([target.id]);
+    for (const entity of garbage) {
+      try {
+        const policy = await this.ctx.policies.byId(entity.storage_policy_entities);
+        if (policy) await this.ctx.driverFor(policy).delete([entity.source]);
+      } catch {
+        // 物理删除失败不回滚数据库（与原版一致，留待人工清理）
+      }
+      if (entity.created_by) {
+        await this.ctx.users.addStorage(entity.created_by, -Number(entity.size));
+      }
+    }
+    await this.ctx.entities.hardDelete(garbage.map((e) => e.id));
+  }
+
+  /**
+   * 版本管理的目标解析与前置校验，对齐 `dbfs/manage.go:415-439`。
+   *
+   * 顺序与原版一致：**先查属主、再查类型**。属主判定放在这里（而不是复用
+   * `assertOwner`）是因为原版此处没有管理员后门 —— `ByPassOwnerCheckCtxKey`
+   * 只在内部调用链里注入，HTTP 路径永远拿不到它。
+   */
+  private async resolveVersionTarget(uri: URI): Promise<FileRow> {
+    const user = this.ctx.requireUser();
+    const file = await this.mustResolve(uri);
+
+    if (file.owner_id !== user.id) {
+      throw new AppError(CodeOwnerOnly, 'Only owner or administrator can perform this action');
+    }
+    if (file.type !== FileType.File) {
+      throw new AppError(CodeNoPermissionErr, 'Not supported action');
+    }
+    return file;
   }
 
   async restore(uris: URI[]): Promise<void> {
@@ -946,6 +1075,12 @@ export class FileSystemService {
       await this.ctx.files.updateParent(file.id, dstDir.id);
       await this.ctx.metadata.remove(file.id, MetadataRestoreUri);
       await this.ctx.metadata.remove(file.id, MetadataExpectedCollectTime);
+
+      // 恢复后重建全文索引（软删时剔除过）
+      const restored = await this.ctx.files.byId(file.id);
+      if (restored) {
+        await new SearchService(this.ctx).indexFile(restored).catch(() => undefined);
+      }
     }
   }
 
@@ -1008,7 +1143,7 @@ export class FileSystemService {
     if (file.owner_id === userId) return;
     if (this.ctx.isAdmin) return;
     if (this.ctx.groupPermissions.enabled(GroupPermission.IgnoreFileOwnership)) return;
-    throw new AppError(CodeOwnerOnly, 'Owner operation only');
+    throw new AppError(CodeOwnerOnly, 'Only owner or administrator can perform this action');
   }
 
   /** 复制到自己的空间时禁止转存自己的分享（原版 CodeSaveOwnShare）。 */

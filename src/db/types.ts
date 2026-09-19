@@ -254,4 +254,23 @@ export interface TaskPublicState {
   executed_duration?: number;
   retry_count?: number;
   resume_time?: number;
+  /**
+   * 任务摘要。对应上游 `types.TaskPublicState.Summary`
+   * （`inventory/types/types.go`），前端 `TaskSummary` 读的就是这个字段。
+   */
+  summary?: {
+    phase?: string;
+    props?: {
+      src?: string;
+      src_str?: string;
+      dst?: string;
+      src_multiple?: string[];
+      dst_policy_id?: string;
+      failed?: number;
+      total?: number;
+      /** 重建索引任务的进度游标 */
+      indexed?: number;
+      download?: unknown;
+    };
+  };
 }

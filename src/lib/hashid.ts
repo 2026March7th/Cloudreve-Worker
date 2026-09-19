@@ -89,6 +89,9 @@ export class HashIDCodec {
   encodeTaskID(id: number): string {
     return this.encode(id, IDType.Task);
   }
+  encodeDavAccountID(id: number): string {
+    return this.encode(id, IDType.DavAccount);
+  }
 
   decodeUserID(raw: string): number | null {
     return this.decode(raw, IDType.User);
@@ -113,5 +116,8 @@ export class HashIDCodec {
   }
   decodeTaskID(raw: string): number | null {
     return this.decode(raw, IDType.Task);
+  }
+  decodeDavAccountID(raw: string): number | null {
+    return this.decode(raw, IDType.DavAccount);
   }
 }

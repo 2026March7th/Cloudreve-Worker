@@ -1,4 +1,4 @@
-/**
+﻿/**
  * 用户路由。对应 Cloudreve v4 `routers/router.go` 的 user 分组。
  *
  *   POST   /api/v4/user                  注册
@@ -8,18 +8,25 @@
  *   GET    /api/v4/user/avatar/:id       头像
  *   GET    /api/v4/user/setting          用户设置
  *   PATCH  /api/v4/user/setting          修改设置
+ *   GET    /api/v4/user/setting/2fa      初始化两步验证
  *   PUT    /api/v4/user/setting/avatar   上传头像
  *   GET    /api/v4/user/search           搜索用户
  *   GET    /api/v4/user/shares/:id       某用户的公开分享
+ *   POST   /api/v4/user/reset            发送密码重置邮件
+ *   PATCH  /api/v4/user/reset/:id        用令牌重置密码
+ *   GET    /api/v4/user/activate/:id     邮件激活（需路径签名）
+ *
+ * WebDAV 账号管理已迁至 `routes/devices.ts`（上游 devices 是独立分组）。
  */
 import { Hono } from 'hono';
 import type { AppBindings } from '../middleware/app';
 import { ctxOf } from '../middleware/app';
 import { fail, ok } from '../lib/response';
 import { UserService } from '../services/user';
+import { PasskeyService } from '../services/passkey';
 import { ShareService } from '../services/share';
 import { FileSystemService } from '../services/fs';
-import { AppError, CodeFeatureNotEnabled, Err } from '../lib/errors';
+import { AppError, CodeEmailSent, CodeNotFullySuccess, Err } from '../lib/errors';
 import { verifyCaptcha } from './site';
 
 export const userRoutes = new Hono<AppBindings>();
@@ -55,13 +62,18 @@ userRoutes.post('/', async (c) => {
   }
 
   try {
-    const result = await new UserService(ctx).register(body.email, body.password);
-    // 需要邮件激活时返回 203（原版 CodeNotFullySuccess）
-    if (result.needActivation) {
-      const { okWithCode } = await import('../lib/response');
-      return c.json(okWithCode(c, 203) as never);
+    const result = await new UserService(ctx).register(body.email, body.password, body.language);
+    const { okWithCode } = await import('../lib/response');
+    switch (result.kind) {
+      case 'needActivation':
+        // 需要邮件激活 → 203（原版 CodeNotFullySuccess）
+        return c.json(okWithCode(c, CodeNotFullySuccess) as never);
+      case 'resent':
+        // 邮箱已存在但未激活，激活邮件已重发 → 40033（原版 CodeEmailSent）
+        return c.json(fail(c, new AppError(CodeEmailSent, result.msg)) as never);
+      default:
+        return c.json(ok(c, result.user) as never);
     }
-    return c.json(ok(c, result.user) as never);
   } catch (e) {
     return c.json(fail(c, e) as never);
   }
@@ -131,10 +143,11 @@ userRoutes.get('/setting', async (c) => {
       version_retention_enabled: settings.version_retention === true,
       version_retention_ext: settings.version_retention_ext ?? [],
       version_retention_max: settings.version_retention_max ?? 0,
-      // 原版字段名的拼写就是 paswordless（少一个 s），保持不变
-      paswordless: !ctx.user.password,
+      // 上游 Go 结构体字段写作 `Paswordless`（少一个 s），但 JSON tag 是完整的
+      // `passwordless`（service/user/response.go:30），前端也按 `passwordless` 读。
+      passwordless: !ctx.user.password,
       two_fa_enabled: Boolean(ctx.user.two_factor_secret),
-      passkeys: [],
+      passkeys: await new PasskeyService(ctx, c.env, ctx.codec).list(ctx.user),
       disable_view_sync: settings.disable_view_sync === true,
       share_links_in_profile: settings.share_links_in_profile ?? '',
       oauth_grants: [],
@@ -158,8 +171,77 @@ userRoutes.patch('/setting', async (c) => {
       new_password: body.new_password as string | undefined,
       disable_view_sync: body.disable_view_sync as boolean | undefined,
       share_links_in_profile: body.share_links_in_profile as string | undefined,
+      two_fa_enabled: body.two_fa_enabled as boolean | undefined,
+      two_fa_code: body.two_fa_code as string | undefined,
     });
     return c.json(ok(c, res) as never);
+  } catch (e) {
+    return c.json(fail(c, e) as never);
+  }
+});
+
+/**
+ * 初始化两步验证：返回 TOTP 密钥原文（base32，无填充）。
+ *
+ * 前端 `get2FAInitSecret()` 直接拿这个串拼 `otpauth://totp/...` 生成二维码，
+ * 所以响应体就是密钥本身，不套对象。密钥同时暂存进 KV（`2fa_init_{uid}`，
+ * TTL 600 秒），等 `PATCH /user/setting` 带上 `two_fa_code` 确认后才写进账号。
+ */
+userRoutes.get('/setting/2fa', async (c) => {
+  const ctx = ctxOf(c);
+  if (!ctx.user) return c.json(fail(c, Err.loginRequired()) as never);
+  try {
+    return c.json(ok(c, await new UserService(ctx).init2FA()) as never);
+  } catch (e) {
+    return c.json(fail(c, e) as never);
+  }
+});
+
+/**
+ * Passkey 管理。对应上游 `user.Group("authn")`（router.go:1255-1267），
+ * 受站点设置 `authn_enabled` 门控。
+ *
+ *   PUT    生成创建选项（挑战暂存 KV）
+ *   POST   验证 attestation 并落库
+ *   DELETE ?id=<credentialID> 删除
+ */
+userRoutes.put('/authn', async (c) => {
+  const ctx = ctxOf(c);
+  if (!ctx.user) return c.json(fail(c, Err.loginRequired()) as never);
+  const service = new PasskeyService(ctx, c.env, ctx.codec);
+  try {
+    return c.json(ok(c, await service.prepareRegister(ctx.user)) as never);
+  } catch (e) {
+    return c.json(fail(c, e) as never);
+  }
+});
+
+userRoutes.post('/authn', async (c) => {
+  const ctx = ctxOf(c);
+  if (!ctx.user) return c.json(fail(c, Err.loginRequired()) as never);
+  const body = (await c.req.json().catch(() => ({}))) as { response?: string; name?: string };
+  if (!body.response || !body.name) {
+    return c.json(fail(c, Err.param('response and name are required')) as never);
+  }
+  const service = new PasskeyService(ctx, c.env, ctx.codec);
+  try {
+    return c.json(
+      ok(c, await service.finishRegister(ctx.user, { response: body.response, name: body.name })) as never,
+    );
+  } catch (e) {
+    return c.json(fail(c, e) as never);
+  }
+});
+
+userRoutes.delete('/authn', async (c) => {
+  const ctx = ctxOf(c);
+  if (!ctx.user) return c.json(fail(c, Err.loginRequired()) as never);
+  const credentialId = c.req.query('id');
+  if (!credentialId) return c.json(fail(c, Err.param('id is required')) as never);
+  const service = new PasskeyService(ctx, c.env, ctx.codec);
+  try {
+    await service.remove(ctx.user, credentialId);
+    return c.json(ok(c) as never);
   } catch (e) {
     return c.json(fail(c, e) as never);
   }
@@ -180,14 +262,6 @@ userRoutes.put('/setting/avatar', async (c) => {
   } catch (e) {
     return c.json(fail(c, e) as never);
   }
-});
-
-/** 搜索用户 */
-userRoutes.get('/search', async (c) => {
-  const ctx = ctxOf(c);
-  const keyword = c.req.query('keyword') ?? '';
-  if (!keyword) return c.json(ok(c, []) as never);
-  return c.json(ok(c, await new UserService(ctx).search(keyword)) as never);
 });
 
 /** 某用户的公开分享 */
@@ -227,12 +301,70 @@ userRoutes.get('/shares/:id', async (c) => {
   return c.json(ok(c, res) as never);
 });
 
-/** 发送密码重置邮件 —— 边缘版没有邮件服务，改为返回「未启用」。 */
-userRoutes.post('/reset', (c) =>
-  c.json(
-    fail(c, new AppError(CodeFeatureNotEnabled, 'Email delivery is not configured in the edge build')) as never,
-  ),
-);
+/**
+ * 搜索用户（分享选择器等场景用）。
+ * 对应上游 `user.GET("search")`（router.go:1248）→ `SearchActive`：
+ * nick / email 模糊匹配、只搜活跃用户、上限 10 条、脱敏返回。
+ */
+userRoutes.get('/search', async (c) => {
+  const ctx = ctxOf(c);
+  if (!ctx.user) return c.json(fail(c, Err.loginRequired()) as never);
+  const keyword = (c.req.query('keyword') ?? '').trim();
+  if (keyword.length < 2) {
+    return c.json(fail(c, Err.param('keyword must be at least 2 characters')) as never);
+  }
+  try {
+    const users = await ctx.users.searchActive(keyword, 10);
+    const service = new UserService(ctx);
+    return c.json(
+      ok(
+        c,
+        users.map((u) => ({
+          id: ctx.codec.encodeUserID(u.id),
+          nickname: u.nick,
+          avatar: service.buildAvatarUrl(u),
+          created_at: u.created_at.toISOString(),
+          email: u.email,
+        })),
+      ) as never,
+    );
+  } catch (e) {
+    return c.json(fail(c, e) as never);
+  }
+});
+
+/**
+ * 发送密码重置邮件。对应上游 `routers/router.go:391 user.POST("reset")`。
+ *
+ * 原版这一步挂了 `CaptchaRequired`，决定权在看 `forget_captcha` 设置项
+ * （注意不是注册用的 `reg_captcha`）。
+ */
+userRoutes.post('/reset', async (c) => {
+  const ctx = ctxOf(c);
+  const body = (await c.req.json().catch(() => ({}))) as {
+    email?: string;
+    language?: string;
+    captcha?: string;
+    ticket?: string;
+  };
+
+  if (!body.email) {
+    return c.json(fail(c, Err.param('Email is required')) as never);
+  }
+  if (ctx.settings.forgetCaptcha) {
+    const passed = await verifyCaptcha(c.env, body.ticket, body.captcha);
+    if (!passed) {
+      return c.json(fail(c, new AppError(40026, 'CAPTCHA verification failed')) as never);
+    }
+  }
+
+  try {
+    await new UserService(ctx).sendResetEmail(body.email);
+    return c.json(ok(c) as never);
+  } catch (e) {
+    return c.json(fail(c, e) as never);
+  }
+});
 
 /** 通过令牌重置密码 */
 userRoutes.patch('/reset/:id', async (c) => {
@@ -249,9 +381,27 @@ userRoutes.patch('/reset/:id', async (c) => {
   }
 });
 
-/** 邮件激活 —— 边缘版不支持邮件，直接返回未启用。 */
-userRoutes.get('/activate/:id', (c) =>
-  c.json(
-    fail(c, new AppError(CodeFeatureNotEnabled, 'Email activation is not supported in the edge build')) as never,
-  ),
-);
+/**
+ * 邮件激活。对应上游 `routers/router.go:399 user.GET("activate/:id")`。
+ *
+ * 上游在 handler 之前挂了 `SignRequired`，校验的是**路径签名**：
+ * 前端 `/session/activate?id=&sign=` 里的 sign，是用后端 API 路径
+ * `/api/v4/user/activate/<id>` 算出来的。签名通过才允许改状态——
+ * 少了这一步，任何人猜到一个用户 id 就能把别人的账号激活。
+ *
+ * 这里用路由参数重新拼路径再校验，避免客户端传了百分号编码导致路径不等。
+ */
+userRoutes.get('/activate/:id', async (c) => {
+  const ctx = ctxOf(c);
+  const id = c.req.param('id');
+  try {
+    const res = await new UserService(ctx).activate(
+      id,
+      c.req.query('sign') ?? '',
+      `/api/v4/user/activate/${id}`,
+    );
+    return c.json(ok(c, res) as never);
+  } catch (e) {
+    return c.json(fail(c, e) as never);
+  }
+});

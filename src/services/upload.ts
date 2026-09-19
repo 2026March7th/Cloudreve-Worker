@@ -42,8 +42,7 @@ const SESSION_PREFIX = 'upload_session:';
 /** 原版 uploadSentinelCheckMargin = 5 分钟 */
 const SENTINEL_MARGIN_MS = 5 * 60 * 1000;
 
-export interface CreateUploadSessionParams {
-  uri: string;
+export interface CreateUploadSessionParams {  uri: string;
   size: number;
   lastModified?: number;
   mimeType?: string;
@@ -73,6 +72,13 @@ export interface UploadSessionResponse {
 }
 
 export class UploadService {
+  /**
+   * 上传彻底收尾后的钩子。路由层用它把「建全文索引」这类
+   * 不该阻塞响应、又必须做的工作挂到 `waitUntil` 上。
+   * 收尾失败（钩子抛错）不影响上传本身 —— 索引可以重建，文件不能丢。
+   */
+  onUploadFinished?: (file: FileRow) => void;
+
   constructor(
     private readonly ctx: AppContext,
     private readonly fs: FileSystemService,
@@ -411,6 +417,15 @@ export class UploadService {
     // 按版本保留策略裁剪历史版本（原版 `dbfs/upload.go:305-351` 的 CapEntities）
     const target = await this.ctx.files.byId(session.fileId);
     await this.capVersionEntities(session.fileId, session.uid, target?.name ?? null);
+
+    if (target && this.onUploadFinished) {
+      // 钩子抛错不影响上传结果（收尾已经完成，这里只是附加工作）
+      try {
+        this.onUploadFinished(target);
+      } catch (e) {
+        console.error('onUploadFinished hook failed', e);
+      }
+    }
   }
 
   /**
@@ -486,6 +501,7 @@ export class UploadService {
     body: ReadableStream,
     length: number,
     mimeType: string,
+    options: { ignoreMaxEdit?: boolean } = {},
   ): Promise<void> {
     const user = this.ctx.requireUser();
     const file = await this.fs.mustResolve(uri);
@@ -493,15 +509,19 @@ export class UploadService {
       throw new AppError(CodeFileNotFound, 'Target is not a file');
     }
     if (file.owner_id !== user.id && !this.ctx.isAdmin) {
-      throw new AppError(CodeOwnerOnly, 'Owner operation only');
+      throw new AppError(CodeOwnerOnly, 'Only owner or administrator can perform this action');
     }
 
-    const maxEdit = this.ctx.settings.getInt('maxEditSize', 52428800);
-    if (maxEdit > 0 && length > maxEdit) {
-      throw new AppError(
-        CodeFileTooLarge,
-        `File size exceeds the online edit limit of ${maxEdit} bytes`,
-      );
+    // WebDAV 的 PUT 也是覆盖写，但它不该受「在线编辑」的体积限制（上游 WebDAV
+    // 直接走 fm.Upload，同样没有 maxEditSize 一说）
+    if (!options.ignoreMaxEdit) {
+      const maxEdit = this.ctx.settings.getInt('maxEditSize', 52428800);
+      if (maxEdit > 0 && length > maxEdit) {
+        throw new AppError(
+          CodeFileTooLarge,
+          `File size exceeds the online edit limit of ${maxEdit} bytes`,
+        );
+      }
     }
 
     const policy = await this.ctx.resolvePolicy(file.storage_policy_files);

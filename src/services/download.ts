@@ -199,7 +199,7 @@ export class DownloadService {
     const user = this.ctx.requireUser();
     const file = await this.fs.mustResolve(uri);
     if (file.owner_id !== user.id && !this.ctx.isAdmin) {
-      throw new AppError(CodeOwnerOnly, 'Owner operation only');
+      throw new AppError(CodeOwnerOnly, 'Only owner or administrator can perform this action');
     }
     const link = await this.ctx.directLinks.create(file.id, file.name, speed);
     const base = this.ctx.settings.siteUrl.replace(/\/+$/, '');
@@ -222,7 +222,7 @@ export class DownloadService {
     const user = this.ctx.requireUser();
     const file = await this.ctx.files.byId(link.file_id);
     if (!file || (file.owner_id !== user.id && !this.ctx.isAdmin)) {
-      throw new AppError(CodeOwnerOnly, 'Owner operation only');
+      throw new AppError(CodeOwnerOnly, 'Only owner or administrator can perform this action');
     }
     await this.ctx.directLinks.softDelete(id);
   }

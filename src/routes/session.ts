@@ -1,20 +1,22 @@
 /**
  * 会话路由。对应 Cloudreve v4 `routers/router.go` 的 session 分组。
  *
- *   POST   /api/v4/session/token           登录
+ *   POST   /api/v4/session/token           登录（开了 2FA 时回 203 + 会话 ID）
+ *   POST   /api/v4/session/token/2fa       用 TOTP 验证码完成登录
  *   POST   /api/v4/session/token/refresh   刷新
  *   DELETE /api/v4/session/token           注销
  *   GET    /api/v4/session/prepare         登录前置检查
- *
- * 原版 `/session/token/2fa` 与 WebAuthn 相关端点在边缘版未实现：
- * 前者需要 2FA 秘钥轮转，后者需要 WebAuthn 服务端库（见 README「未实现」）。
+ *   PUT    /api/v4/session/authn           Passkey 登录：生成断言选项
+ *   POST   /api/v4/session/authn           Passkey 登录：验证断言、签发 token
  */
 import { Hono } from 'hono';
 import type { AppBindings } from '../middleware/app';
 import { ctxOf } from '../middleware/app';
-import { fail, ok } from '../lib/response';
+import { fail, ok, okWithCode } from '../lib/response';
 import { UserService } from '../services/user';
-import { AppError, CodeFeatureNotEnabled, Err } from '../lib/errors';
+import { PasskeyService } from '../services/passkey';
+import { OAuthService } from '../services/oauth';
+import { AppError, CodeNotFullySuccess, Err } from '../lib/errors';
 import { verifyCaptcha } from './site';
 
 export const sessionRoutes = new Hono<AppBindings>();
@@ -45,6 +47,11 @@ sessionRoutes.post('/token', async (c) => {
 
   try {
     const result = await new UserService(ctx).login(body.email, body.password);
+    // 开了两步验证：不发 token，回 203 + 会话 ID，让前端转去输验证码。
+    // 前端 `SignIn.tsx:222-225` 认的是 `Code.Continue`（203），会话 ID 从 `data` 里取。
+    if ('two_fa_session_id' in result) {
+      return c.json(okWithCode(c, CodeNotFullySuccess, result.two_fa_session_id) as never);
+    }
     return c.json(ok(c, result) as never);
   } catch (e) {
     return c.json(fail(c, e) as never);
@@ -88,18 +95,156 @@ sessionRoutes.get('/prepare', async (c) => {
   const user = await ctx.users.byEmail(email);
   return c.json(
     ok(c, {
-      // 边缘版不支持 Passkey 登录，恒为 false
-      webauthn_enabled: false,
+      // 站点设置 authn_enabled 决定登录页是否显示 Passkey 按钮
+      webauthn_enabled: ctx.settings.authnEnabled,
       // 用户存在且设置了密码
       password_enabled: Boolean(user?.password),
     }) as never,
   );
 });
 
-/** 未实现的认证方式，统一返回「功能未开启」。 */
-sessionRoutes.all('/token/2fa', (c) =>
-  c.json(fail(c, new AppError(CodeFeatureNotEnabled, 'Two-factor authentication is not implemented')) as never),
-);
-sessionRoutes.all('/authn', (c) =>
-  c.json(fail(c, new AppError(CodeFeatureNotEnabled, 'Passkey authentication is not implemented')) as never),
-);
+/**
+ * 两步验证登录：用 TOTP 验证码 + 登录会话 ID 换 token。
+ *
+ * 对应上游 `service/user/login.go` 的 `OtpValidationService`（`routers/router.go`
+ * 里挂在 `POST /session/token/2fa`）。会话是登录第一步（密码校验通过）签发的，
+ * 校验通过后即失效。
+ */
+sessionRoutes.post('/token/2fa', async (c) => {
+  const ctx = ctxOf(c);
+  const body = (await c.req.json().catch(() => ({}))) as { otp?: string; session_id?: string };
+  if (!body.otp || !body.session_id) {
+    return c.json(fail(c, Err.param('otp and session_id are required')) as never);
+  }
+  try {
+    const result = await new UserService(ctx).login2FA(body.otp, body.session_id);
+    return c.json(ok(c, result) as never);
+  } catch (e) {
+    return c.json(fail(c, e) as never);
+  }
+});
+/**
+ * Passkey 登录：生成断言选项 / 校验断言并签发 token。
+ * 对应上游 `session.Group("authn")`（router.go:349-367），
+ * 受站点设置 `authn_enabled` 门控。会话编排见 `services/passkey.ts`。
+ */
+sessionRoutes.put('/authn', async (c) => {
+  const ctx = ctxOf(c);
+  const service = new PasskeyService(ctx, c.env, ctx.codec);
+  try {
+    return c.json(ok(c, await service.prepareLogin()) as never);
+  } catch (e) {
+    return c.json(fail(c, e) as never);
+  }
+});
+
+sessionRoutes.post('/authn', async (c) => {
+  const ctx = ctxOf(c);
+  const body = (await c.req.json().catch(() => ({}))) as { response?: string; session_id?: string };
+  if (!body.response || !body.session_id) {
+    return c.json(fail(c, Err.param('response and session_id are required')) as never);
+  }
+  const service = new PasskeyService(ctx, c.env, ctx.codec);
+  try {
+    const user = await service.finishLogin({
+      response: body.response,
+      sessionID: body.session_id,
+    });
+    // 上游链路 FinishLoginAuthn → UserIssueToken，返回与密码登录相同的结构
+    const result = await new UserService(ctx).issueToken(user);
+    return c.json(
+      ok(c, {
+        user: await new UserService(ctx).buildUserResponse(user, true),
+        token: result,
+      }) as never,
+    );
+  } catch (e) {
+    return c.json(fail(c, e) as never);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// OAuth2 授权码流程。对应上游 `session.Group("oauth")`（router.go:321-347）。
+// 服务编排见 `services/oauth.ts`。
+// ---------------------------------------------------------------------------
+
+/** 应用信息：授权同意页展示用。匿名可查（上游未挂 LoginRequired）。 */
+sessionRoutes.get('/oauth/app/:app_id', async (c) => {
+  const ctx = ctxOf(c);
+  const service = new OAuthService(ctx, c.env);
+  try {
+    return c.json(
+      ok(c, await service.getAppRegistration(c.req.param('app_id'), ctx.user?.id ?? null)) as never,
+    );
+  } catch (e) {
+    return c.json(fail(c, e) as never);
+  }
+});
+
+/** 用户同意 → 签发授权码。 */
+sessionRoutes.post('/oauth/consent', async (c) => {
+  const ctx = ctxOf(c);
+  if (!ctx.user) return c.json(fail(c, Err.loginRequired()) as never);
+  const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
+  const service = new OAuthService(ctx, c.env);
+  try {
+    const res = await service.consent(ctx.user, {
+      client_id: String(body.client_id ?? ''),
+      response_type: String(body.response_type ?? ''),
+      redirect_uri: String(body.redirect_uri ?? ''),
+      state: body.state === undefined ? undefined : String(body.state),
+      scope: String(body.scope ?? ''),
+      code_challenge: body.code_challenge === undefined ? undefined : String(body.code_challenge),
+      code_challenge_method:
+        body.code_challenge_method === undefined ? undefined : String(body.code_challenge_method),
+    });
+    return c.json(ok(c, res) as never);
+  } catch (e) {
+    return c.json(fail(c, e) as never);
+  }
+});
+
+/** 授权码换 token。表单编码（OAuth2 规范）。 */
+sessionRoutes.post('/oauth/token', async (c) => {
+  const ctx = ctxOf(c);
+  const service = new OAuthService(ctx, c.env);
+  try {
+    const form = await c.req.formData();
+    const get = (k: string): string => String(form.get(k) ?? '');
+    const res = await service.exchangeToken({
+      client_id: get('client_id'),
+      client_secret: get('client_secret'),
+      grant_type: get('grant_type'),
+      code: get('code'),
+      code_verifier: form.has('code_verifier') ? get('code_verifier') : undefined,
+    });
+    return c.json(res as never);
+  } catch (e) {
+    return c.json(fail(c, e) as never);
+  }
+});
+
+/** OIDC userinfo。按 token scopes 决定返回字段。 */
+sessionRoutes.get('/oauth/userinfo', async (c) => {
+  const ctx = ctxOf(c);
+  if (!ctx.user) return c.json(fail(c, Err.loginRequired()) as never);
+  const service = new OAuthService(ctx, c.env);
+  try {
+    return c.json(ok(c, await service.userinfo(ctx.user, ctx.scopes)) as never);
+  } catch (e) {
+    return c.json(fail(c, e) as never);
+  }
+});
+
+/** 撤销对某应用的授权。 */
+sessionRoutes.delete('/oauth/grant/:app_id', async (c) => {
+  const ctx = ctxOf(c);
+  if (!ctx.user) return c.json(fail(c, Err.loginRequired()) as never);
+  const service = new OAuthService(ctx, c.env);
+  try {
+    await service.deleteGrant(ctx.user, c.req.param('app_id'));
+    return c.json(ok(c) as never);
+  } catch (e) {
+    return c.json(fail(c, e) as never);
+  }
+});

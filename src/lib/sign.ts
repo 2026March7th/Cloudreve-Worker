@@ -3,12 +3,13 @@
  *
  * 签名值格式：`base64url(HMAC-SHA256(body + ":" + expires)) + ":" + expires`
  *   - `body` 对 URL 签名而言就是**路径**（不含 query，见 `getUrlSignContent`）；
+ *   - base64url **带 `=` 填充**，与上游 Go 的 `base64.URLEncoding` 一致；
  *   - `expires` 为 0 表示永不过期；
  *   - 校验时从签名串尾部解析有效期，先判过期再比对摘要。
  *
  * 签名以 `?sign=` 查询参数附加到 URL 上（原版 `SignURI`）。
  */
-import { base64UrlToString, bytesToBase64Url } from './crypto';
+import { base64UrlToString, bytesToBase64UrlPadded } from './crypto';
 import { AppError, CodeInvalidSign, CodeSignExpired } from './errors';
 
 export class Signer {
@@ -32,7 +33,8 @@ export class Signer {
   async sign(body: string, expires = 0): Promise<string> {
     const payload = `${body}:${expires}`;
     const mac = await crypto.subtle.sign('HMAC', await this.key(), new TextEncoder().encode(payload));
-    return `${bytesToBase64Url(new Uint8Array(mac))}:${expires}`;
+    // 带填充，与上游 Go 的 base64.URLEncoding 对齐（不是 JWT 的无填充写法）
+    return `${bytesToBase64UrlPadded(new Uint8Array(mac))}:${expires}`;
   }
 
   async check(body: string, sign: string): Promise<void> {

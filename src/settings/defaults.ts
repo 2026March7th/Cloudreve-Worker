@@ -8,6 +8,7 @@
  * 首次启动时 `ensureSettings()` 会把这些写入 settings 表；之后以数据库里的值为准。
  * 少数几项默认值与上游不同，都单独标注了原因。
  */
+import { DEFAULT_MAIL_TEMPLATES } from './mail-templates';
 
 export const DEFAULT_SETTINGS: Record<string, string> = {
   // --- 站点基础 ---
@@ -59,7 +60,7 @@ export const DEFAULT_SETTINGS: Record<string, string> = {
   forget_captcha: '0',
   // 上游默认是 1。边缘版没有 WebAuthn / Passkey 实现，开着会让前端显示无法使用的
   // 登录方式，因此默认关掉（管理员可在后台打开，但依然会返回「未启用」）。
-  authn_enabled: '0',
+  authn_enabled: '1',
   default_group: '2',
   captcha_type: '',
   captcha_ReCaptchaKey: '',
@@ -105,14 +106,59 @@ export const DEFAULT_SETTINGS: Record<string, string> = {
   custom_props: '[]',
   file_viewers: '[]',
   viewer_default_apps: '{}',
-  show_encryption_status: 'true',
+  show_encryption_status: '1',
   map_provider: 'openstreetmap',
-  map_google_tile_type: 'roadmap',
+  // 取值必须是 `pkg/setting/types.go:166-171` 里的枚举：
+  // regular / satellite / terrain —— 不是 Google 地图 API 的 'roadmap'。
+  map_google_tile_type: 'regular',
   map_mapbox_ak: '',
-  show_app_promotion: 'false',
-  show_desktop_app_promotion: 'false',
-  // 边缘版没有全文检索实现，固定关闭
-  fts_enabled: 'false',
+  show_app_promotion: '1',
+  show_desktop_app_promotion: '1',
+
+  // --- 邮件 ---
+  // 发件人。键名照抄上游（含上游 `fromAdress` 的拼写错误，改了就找不到配置项）。
+  fromName: 'Cloudreve',
+  fromAdress: 'no-reply@cloudreve.org',
+  replyTo: 'support@cloudreve.org',
+  // SMTP 连接参数。这几项的键名/默认值逐字对齐上游 `inventory/setting.go:501-509`，
+  // 因为官方前端管理面板的「邮件」设置页直接读写它们
+  // （`frontend/src/component/Admin/Settings/Email/Email.tsx`）。
+  //
+  // 边缘版真正走的就是 SMTP 协议（`src/services/smtp.ts`），不是 HTTP 发信 API，
+  // 所以这几项填了就有用，不需要任何环境变量。
+  //
+  // 注意默认端口 25 沿用了上游，但 **Cloudflare Workers 禁止连 25 端口**，
+  // 所以这是个「未配置」状态。管理员必须改成 465（SSL）或 587（STARTTLS），
+  // 发信时的报错会明确说明这一点。
+  smtpHost: 'smtp.cloudreve.com',
+  smtpPort: '25',
+  smtpUser: 'smtp.cloudreve.com',
+  smtpPass: '',
+  smtpEncryption: '0',
+  mail_keepalive: '30',
+  // 上游把这两项写成 minified 的巨型 HTML（`inventory/setting.go:356-357`），
+  // 这里换成等价占位符语义的简洁模板（见 `src/settings/mail-templates.ts`）。
+  // **占位符契约与上游完全一致**，管理员把上游模板原样贴回来也能正常渲染。
+  mail_activation_template: JSON.stringify(DEFAULT_MAIL_TEMPLATES.activation),
+  mail_reset_template: JSON.stringify(DEFAULT_MAIL_TEMPLATES.reset),
+
+  // --- 全文检索 ---
+  // 键名与默认值逐条取自 `inventory/setting.go:675-686`。
+  // 原版是「Tika 抽正文 + Meilisearch 建索引」的两段式，两者都是 HTTP 服务，
+  // Workers 能直接调，所以边缘版**照搬原版方案**，不降级成文件名匹配。
+  // 管理员在「管理面板 → 文件系统 → 全文检索」里填 endpoint 即可生效。
+  fts_enabled: '0',
+  fts_index_type: 'meilisearch',
+  fts_extractor_type: 'tika',
+  fts_meilisearch_endpoint: '',
+  fts_meilisearch_api_key: '',
+  fts_meilisearch_page_size: '5',
+  fts_meilisearch_embed_enabled: '0',
+  fts_meilisearch_embed_config: '{}',
+  fts_tika_endpoint: '',
+  fts_tika_exts: 'pdf,doc,docx,xls,xlsx,ppt,pptx,odt,ods,odp,rtf,txt,md,html,htm,epub,csv',
+  fts_tika_max_file_size: '26214400',
+  fts_chunk_size: '2000',
 
   // --- 其它 ---
   public_resource_maxage: '86400',

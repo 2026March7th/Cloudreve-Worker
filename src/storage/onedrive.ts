@@ -47,11 +47,13 @@ const TOKEN_EXPIRY_MARGIN = 600;
 /** $batch 单次最多 20 条请求（原版 BatchDelete 按 20 分组） */
 const BATCH_SIZE = 20;
 
-interface OAuthCredential {
+export interface OAuthCredential {
   access_token: string;
   refresh_token: string;
   /** 绝对过期时间（Unix 秒），与原版把相对秒数转绝对值的做法一致 */
   expires_in: number;
+  /** 上一次成功换取 token 的绝对时间（Unix 秒），对应原版 `Credential.RefreshedAtUnix` */
+  refreshed_at: number;
 }
 
 /** 逐段编码路径；Cloudreve 的文件名校验已禁止 `:` `/` 等字符，这里主要处理空格与 `#`。 */
@@ -158,6 +160,7 @@ export class OneDriveDriver implements StorageDriver {
       access_token: json.access_token,
       refresh_token: json.refresh_token || refreshToken,
       expires_in: Math.floor(Date.now() / 1000) + (json.expires_in ?? 3600),
+      refreshed_at: Math.floor(Date.now() / 1000),
     };
 
     // 缓存到 KV；TTL 取「距过期还有 margin 秒」的下限 60 秒
@@ -179,7 +182,7 @@ export class OneDriveDriver implements StorageDriver {
   }
 
   /** 用授权码换 token（后台 OAuth 回调时用）。 */
-  async exchangeCode(code: string): Promise<void> {
+  async exchangeCode(code: string): Promise<OAuthCredential> {
     const body = new URLSearchParams({
       client_id: this.policy.bucket_name ?? '',
       client_secret: this.policy.secret_key ?? '',
@@ -205,10 +208,55 @@ export class OneDriveDriver implements StorageDriver {
       access_token: json.access_token,
       refresh_token: json.refresh_token,
       expires_in: Math.floor(Date.now() / 1000) + (json.expires_in ?? 3600),
+      refreshed_at: Math.floor(Date.now() / 1000),
     };
     const ttl = Math.max(60, credential.expires_in - TOKEN_EXPIRY_MARGIN - Math.floor(Date.now() / 1000));
     await this.env.KV.put(this.credentialKey, JSON.stringify(credential), { expirationTtl: ttl });
+    return credential;
   }
+
+  /**
+   * 读取当前凭证状态，对应原版 `OauthCredentialStatus`。
+   *
+   * 原版从凭据管理器拿 Credential 后取 `RefreshedAt()`；这里读同一份 KV 缓存。
+   * 缓存里没有（未授权 / 已过期）或策略本身没存 refresh token 时，都算未授权。
+   */
+  async credentialStatus(): Promise<{ valid: boolean; last_refresh_time: string | null }> {
+    if (!this.policy.access_key) return { valid: false, last_refresh_time: null };
+    const cached = (await this.env.KV.get(this.credentialKey, 'json')) as OAuthCredential | null;
+    if (!cached?.refreshed_at) return { valid: false, last_refresh_time: null };
+    return { valid: true, last_refresh_time: new Date(cached.refreshed_at * 1000).toISOString() };
+  }
+
+  /**
+   * 通过 SharePoint 站点 URL 反查站点 ID，返回 `<siteId>/drive`。
+   *
+   * 对应原版 `onedrive/api.go:188 GetSiteIDByURL`：请求
+   * `{graphBase}/sites/{hostname}:/{path}`，**不带 drive 资源段**。
+   * 前端拿到这个串后会填进策略的 `settings.od_driver`。
+   */
+  async getSiteIdByUrl(siteUrl: string): Promise<string> {
+    let parsed: URL;
+    try {
+      parsed = new URL(siteUrl);
+    } catch {
+      throw new Error(`Invalid site URL: ${siteUrl}`);
+    }
+    const relativePath = parsed.pathname.replace(/^\/+|\/+$/g, '');
+    const api = `${this.graphBase}/sites/${encodeURIComponent(parsed.hostname)}:/${relativePath}`;
+
+    const res = await this.request('GET', api);
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      throw new Error(`Failed to get site id: ${res.status} ${text.slice(0, 300)}`);
+    }
+    const json = (await res.json()) as { id?: string };
+    if (!json.id) throw new Error('Site id is empty in Graph response');
+    return `sites/${json.id}/drive`;
+  }
+
+  /** 生成授权 URL 时用的 redirect_uri 对应的前端路由（上游 `MasterPolicyOAuthCallback`）。 */
+  static oauthCallbackPath = '/admin/policy/oauth';
 
   // -------------------------------------------------------------------------
   // 请求封装

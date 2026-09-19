@@ -13,18 +13,33 @@ import type { UserRow, UserWithGroup } from '../db/types';
 import { BooleanSet, GroupPermission } from '../lib/boolset';
 import {
   AppError,
+  Code2FACodeErr,
   CodeEmailExisted,
-  CodeFeatureNotEnabled,
   CodeIncorrectPassword,
+  CodeInternalSetting,
   CodeInvalidPassword,
+  CodeNotFound,
   CodeNotFullySuccess,
+  CodeNotSet,
+  CodeTempLinkExpired,
   CodeUserBaned,
+  CodeUserCannotActivate,
   CodeUserNotActivated,
   Err,
 } from '../lib/errors';
 import { checkPassword, digestPassword } from '../lib/crypto';
 import { hashUserState, RevokeTokenPrefix, type Claims } from '../lib/jwt';
 import { randomString } from '../lib/crypto';
+import { generateTotpSecret, validateTotp } from '../lib/totp';
+import { MailService } from './mail';
+
+/**
+ * 两步验证会话的有效期（秒）。
+ *
+ * 两处都取自上游：`service/user/login.go:148` 与 `service/user/setting.go:46`
+ * 都是 600 秒，改其中一个不改另一个会让「登录到一半过期」变得难以解释。
+ */
+const TWO_FA_SESSION_TTL = 600;
 
 export interface UserResponse {
   id: string;
@@ -58,11 +73,34 @@ export interface LoginResult {
   };
 }
 
-export interface RegisterResult {
-  /** 需要邮件激活时 data 为空，code 为 203 */
-  needActivation: boolean;
-  user?: UserResponse;
-}
+/**
+ * 登录结果。
+ *
+ * 开了两步验证的账号，密码校验通过后**不发 token**，而是回一个 2FA 会话 ID
+ * （上游 `service/user/login.go:146-150`），客户端再拿 TOTP 验证码 + 这个
+ * session_id 调 `POST /session/token/2fa` 换 token。
+ */
+export type LoginOutcome = LoginResult | { two_fa_session_id: string };
+
+/**
+ * 注册结果。三种终态对应上游 `service/user/register.go:33-89` 的三个分支：
+ *   - `ok`              → 200 + 用户对象
+ *   - `needActivation`  → 203（`CodeNotFullySuccess`），激活邮件已发出
+ *   - `resent`          → 400（`CodeEmailSent`），邮箱已存在但未激活，重发了激活邮件
+ */
+export type RegisterOutcome =
+  | { kind: 'ok'; user: UserResponse }
+  | { kind: 'needActivation' }
+  | { kind: 'resent'; msg: string };
+
+/** 密码重置会话在 KV 里的键前缀。取自上游 `service/user/login.go:79`。 */
+export const UserResetPrefix = 'user_reset_';
+
+/** 激活链接有效期 24 小时（上游 `register.go:94`）。 */
+const ACTIVATION_TTL_SECONDS = 86400;
+
+/** 重置链接有效期 1 小时（上游 `login.go:100`）。 */
+const RESET_TTL_SECONDS = 3600;
 
 export class UserService {
   constructor(private readonly ctx: AppContext) {}
@@ -131,7 +169,7 @@ export class UserService {
   // 登录
   // -------------------------------------------------------------------------
 
-  async login(email: string, password: string): Promise<LoginResult> {
+  async login(email: string, password: string): Promise<LoginOutcome> {
     const user = await this.ctx.users.byEmailWithGroup(email);
     if (!user) {
       throw new AppError(CodeInvalidPassword, 'Incorrect password or email address');
@@ -147,9 +185,14 @@ export class UserService {
       throw new AppError(CodeUserNotActivated, 'This account is not activated');
     }
 
-    // 二次验证：原版在这里签发 2FA session，边缘版未实现 TOTP，见 README。
+    // 两步验证：密码对了还不算登录成功，先发一个一次性会话，等 TOTP 验证码。
+    // 对应上游 `service/user/login.go:146-150`：KV `user_2fa_{uuid}` -> 用户 ID。
     if (user.two_factor_secret) {
-      throw new AppError(CodeFeatureNotEnabled, 'Two-factor authentication is not supported in the edge build');
+      const sessionId = crypto.randomUUID();
+      await this.ctx.env.KV.put(`user_2fa_${sessionId}`, String(user.id), {
+        expirationTtl: TWO_FA_SESSION_TTL,
+      });
+      return { two_fa_session_id: sessionId };
     }
 
     // 确保根目录存在
@@ -160,6 +203,59 @@ export class UserService {
       user: await this.buildUserResponse(user, true),
       token,
     };
+  }
+
+  // -------------------------------------------------------------------------
+  // 两步验证（TOTP，RFC 6238）
+  // -------------------------------------------------------------------------
+
+  /**
+   * 初始化两步验证：生成 TOTP 密钥并暂存，等用户拿验证码确认后才写进账号。
+   *
+   * 对应上游 `service/user/setting.go:33-51`：密钥存 KV `2fa_init_{uid}`、
+   * TTL 600 秒，返回 `key.Secret()`（base32 无填充）—— 前端直接把它拼进
+   * `otpauth://` 生成二维码，所以这里返回的就是密钥原文，不做任何加工。
+   */
+  async init2FA(): Promise<string> {
+    const user = this.ctx.requireUser();
+    const secret = generateTotpSecret();
+    await this.ctx.env.KV.put(`2fa_init_${user.id}`, secret, {
+      expirationTtl: TWO_FA_SESSION_TTL,
+    });
+    return secret;
+  }
+
+  /**
+   * 用 TOTP 验证码完成登录。对应上游 `service/user/login.go:219-244`。
+   *
+   * 上游在校验通过后立刻删掉会话（`login.go:242`），一个 session 只能换一次 token，
+   * 验证码输错不消耗会话（会话还在，可以重试）。
+   */
+  async login2FA(otp: string, sessionId: string): Promise<LoginResult> {
+    const raw = await this.ctx.env.KV.get(`user_2fa_${sessionId}`);
+    if (!raw) throw new AppError(CodeNotFound, 'Session not found');
+
+    const uid = Number(raw);
+    if (!Number.isFinite(uid)) throw new AppError(CodeNotFound, 'Session not found');
+
+    const user = await this.ctx.users.byId(uid);
+    if (!user) throw new AppError(CodeNotFound, 'User not found');
+
+    if (user.two_factor_secret && !(await validateTotp(otp, user.two_factor_secret))) {
+      throw new AppError(Code2FACodeErr, 'Incorrect 2FA code');
+    }
+
+    await this.ctx.env.KV.delete(`user_2fa_${sessionId}`);
+
+    await this.ctx.files.ensureRoot(user.id);
+    const token = await this.issueToken(user);
+    return { user: await this.buildUserResponse(user, true), token };
+  }
+
+  /** 写入 / 清除 TOTP 密钥。传 null 表示关闭两步验证。 */
+  async setTwoFactorSecret(secret: string | null): Promise<void> {
+    const user = this.ctx.requireUser();
+    await this.ctx.users.setTwoFactorSecret(user.id, secret);
   }
 
   /** 签发 token 对。 */
@@ -223,65 +319,208 @@ export class UserService {
   // 注册
   // -------------------------------------------------------------------------
 
-  async register(email: string, password: string): Promise<RegisterResult> {
+  /** 邮件服务。 */
+  get mail(): MailService {
+    return new MailService(this.ctx);
+  }
+
+  /**
+   * 注册。对应上游 `service/user/register.go:33 Register`。
+   *
+   * 上游把「邮箱已存在」拆成两种情况（`inventory/user.go:367-374`）：
+   *   - 已存在的账号**处于未激活状态** → `ErrInactiveUserExisted`，重发激活邮件，
+   *     返回 `CodeEmailSent`（40033）。用户没收到第一封邮件时只能靠这条路自救，
+   *     所以不能简单当成「邮箱已被占用」拒掉。
+   *   - 其余 → `CodeEmailExisted`（40032）。
+   */
+  async register(email: string, password: string, language?: string): Promise<RegisterOutcome> {
     if (!this.ctx.settings.registerEnabled) {
       throw new AppError(40019, 'Registration is not enabled');
     }
 
-    const existing = await this.ctx.users.byEmail(email);
-    if (existing) throw new AppError(CodeEmailExisted, 'This email has already been used');
-
-    const digest = await digestPassword(password);
+    // 上游 `register.go:39` 把邮箱统一转小写后再落库
+    const normalized = email.trim().toLowerCase();
     const needActivation = this.ctx.settings.emailActive;
 
+    const existing = await this.ctx.users.byEmail(normalized);
+    if (existing) {
+      if (existing.status === 'inactive') {
+        await this.sendActivationEmail(existing);
+        return { kind: 'resent', msg: 'User is not activated, activation email has been resent' };
+      }
+      throw new AppError(CodeEmailExisted, 'This email has already been used');
+    }
+
+    const digest = await digestPassword(password);
     const user = await this.ctx.users.create({
-      email,
-      nick: email.split('@')[0] ?? email,
+      email: normalized,
+      nick: normalized.split('@')[0] ?? normalized,
       passwordDigest: digest,
       groupId: this.ctx.settings.defaultGroupId,
       status: needActivation ? 'inactive' : 'active',
+      language,
     });
 
     await this.ctx.files.ensureRoot(user.id);
 
     if (needActivation) {
-      return { needActivation: true };
+      // 上游 `register.go:82-85`：发信失败时返回 `CodeNotSet` + 空 msg
+      // （用户行已经落库了，所以再注册一次会走到上面的「重发」分支）
+      await this.sendActivationEmail(user);
+      return { kind: 'needActivation' };
     }
-    return { needActivation: false, user: await this.buildUserResponse(user, true) };
+    return { kind: 'ok', user: await this.buildUserResponse(user, true) };
+  }
+
+  // -------------------------------------------------------------------------
+  // 激活
+  // -------------------------------------------------------------------------
+
+  /**
+   * 构造前端的激活地址。
+   *
+   * 上游分两步（`register.go:91-108`）：先对着**API 路径**签名，
+   * 再把 id / sign 拼到前端路由 `/session/activate` 上。签名正文只有路径
+   * （见 `pkg/auth/auth.go:212 getUrlSignContent`），所以前端页面地址和签名
+   * 路径可以不同 —— 校验时仍是拿 API 请求的路径去比对。
+   */
+  async buildActivationUrl(user: UserRow): Promise<string> {
+    const uid = this.ctx.codec.encodeUserID(user.id);
+    const apiPath = `/api/v4/user/activate/${uid}`;
+    const expires = Math.floor(Date.now() / 1000) + ACTIVATION_TTL_SECONDS;
+    const sign = await this.ctx.signer.sign(apiPath, expires);
+    return this.frontendLink('/session/activate', { id: uid, sign });
+  }
+
+  /** 发送激活邮件。 */
+  async sendActivationEmail(user: UserRow): Promise<void> {
+    const url = await this.buildActivationUrl(user);
+    try {
+      await this.mail.sendActivationEmail(user, url);
+    } catch (e) {
+      // 上游把发信失败包成 CodeNotSet + 空 msg（`register.go:68 / 83`）
+      throw new AppError(CodeNotSet, '', e);
+    }
+  }
+
+  /**
+   * 激活账号。对应上游 `service/user/register.go:124 ActivateUser`。
+   *
+   * 注意错误码与文案都是照抄的，包括上游那句拼错的 "User not fount" ——
+   * 前端不解析它，但「逐字一致」是硬要求（见项目约定）。
+   */
+  async activate(userHashId: string, sign: string, path: string): Promise<UserResponse> {
+    // 原版由 `middleware.SignRequired` 在进 handler 之前校验，失败一律包成
+    // CodeCredentialInvalid（`middleware/auth.go:38-41`）。注意 msg 用的是
+    // 底层错误的文案：签名缺失时 `Signer.check('')` 会走到「有效期段为空」
+    // 这一支，得到 "expire timestamp is missing"（上游 `auth.go:22`）。
+    try {
+      await this.ctx.signer.check(path, sign);
+    } catch (e) {
+      throw new AppError(40020, e instanceof Error ? e.message : 'invalid sign');
+    }
+
+    const uid = this.ctx.codec.decodeUserID(userHashId);
+    if (uid === null) throw new AppError(40021, 'User not fount');
+
+    const inactiveUser = await this.ctx.users.byId(uid);
+    if (!inactiveUser) throw new AppError(40021, 'User not fount');
+
+    if (inactiveUser.status !== 'inactive') {
+      throw new AppError(CodeUserCannotActivate, 'This user cannot be activated');
+    }
+
+    await this.ctx.users.updateStatus(uid, 'active');
+    await this.ctx.files.ensureRoot(uid);
+    const activeUser = await this.ctx.users.byId(uid);
+    return this.buildUserResponse(activeUser ?? inactiveUser, true);
   }
 
   // -------------------------------------------------------------------------
   // 密码重置
   // -------------------------------------------------------------------------
 
-  async resetPassword(userHashId: string, secret: string, newPassword: string): Promise<UserResponse> {
-    const uid = this.ctx.codec.decodeUserID(userHashId);
-    if (uid === null) throw Err.userNotFound();
-    const user = await this.ctx.users.byId(uid);
-    if (!user) throw Err.userNotFound();
+  /** 构造前端的重置地址（`/session/reset?id=&secret=`）。 */
+  buildResetUrl(user: UserRow, secret: string): string {
+    const uid = this.ctx.codec.encodeUserID(user.id);
+    return this.frontendLink('/session/reset', { id: uid, secret });
+  }
 
-    // 校验重置令牌：存在 KV 里的一次性密钥
-    const stored = await this.ctx.env.KV.get(`password_reset:${uid}`);
-    if (!stored || stored !== secret) {
-      throw new AppError(40029, 'Invalid or expired reset link');
+  /**
+   * 发送密码重置邮件。对应上游 `service/user/login.go:82 UserResetEmailService.Reset`。
+   *
+   * 三种拒绝理由各自有独立的错误码，别合并成一句「用户不存在」：
+   * 被封禁的账号来重置密码，前端要能区分出来。
+   */
+  async sendResetEmail(email: string): Promise<void> {
+    const user = await this.ctx.users.byEmail(email.trim().toLowerCase());
+    if (!user) throw new AppError(40021, 'User not found');
+
+    if (user.status === 'manual_banned' || user.status === 'sys_banned') {
+      throw new AppError(CodeUserBaned, 'This user is banned');
+    }
+    if (user.status === 'inactive') {
+      throw new AppError(CodeUserNotActivated, 'This user is not activated');
     }
 
-    const digest = await digestPassword(newPassword);
-    await this.ctx.users.updatePassword(uid, digest);
-    await this.ctx.env.KV.delete(`password_reset:${uid}`);
+    const secret = randomString(32);
+    await this.ctx.env.KV.put(`${UserResetPrefix}${user.id}`, secret, {
+      expirationTtl: RESET_TTL_SECONDS,
+    });
+
+    await this.mail.sendResetEmail(user, this.buildResetUrl(user, secret));
+  }
+
+  /**
+   * 用令牌重置密码。对应上游 `service/user/login.go:41 UserResetService.Reset`。
+   *
+   * 判定顺序照抄上游：**先比令牌再看用户**。所以令牌不对时不管 id 是否存在，
+   * 一律是「链接失效」—— 这样也顺带避免了用这个接口探测用户是否存在。
+   */
+  async resetPassword(userHashId: string, secret: string, newPassword: string): Promise<UserResponse> {
+    const uid = this.ctx.codec.decodeUserID(userHashId);
+    if (uid === null) throw new AppError(CodeTempLinkExpired, 'Link is expired');
+
+    const stored = await this.ctx.env.KV.get(`${UserResetPrefix}${uid}`);
+    if (!stored || stored !== secret) {
+      throw new AppError(CodeTempLinkExpired, 'Link is expired');
+    }
+
+    // 一次性令牌：校验通过立刻销毁，重放无效
+    await this.ctx.env.KV.delete(`${UserResetPrefix}${uid}`);
+
+    // 对应上游 `GetActiveByID`：只有正常状态的账号能重置
+    const user = await this.ctx.users.byId(uid);
+    if (!user || user.status !== 'active') throw new AppError(40021, 'User not found');
+
+    await this.ctx.users.updatePassword(uid, await digestPassword(newPassword));
 
     const updated = await this.ctx.users.byId(uid);
     return this.buildUserResponse(updated!, true);
   }
 
-  /** 生成密码重置令牌（无邮件服务时由管理员/CLI 取用，见 README）。 */
-  async createResetToken(email: string): Promise<{ token: string; expiresIn: number }> {
-    const user = await this.ctx.users.byEmail(email);
+  /**
+   * 手工生成一条重置链接。
+   *
+   * 上游没有这个入口 —— 它是边缘版的兜底：没配邮件服务（或 SMTP/Resend 挂了）
+   * 时，管理员仍能把链接直接交给用户。用的是同一个 KV 键，所以和邮件那条路
+   * 完全等价，不会出现「两套令牌互不认识」。
+   */
+  async createResetUrl(email: string): Promise<{ url: string; expiresIn: number }> {
+    const user = await this.ctx.users.byEmail(email.trim().toLowerCase());
     if (!user) throw Err.userNotFound();
-    const token = randomString(32);
-    const ttl = 3600;
-    await this.ctx.env.KV.put(`password_reset:${user.id}`, token, { expirationTtl: ttl });
-    return { token, expiresIn: ttl };
+    const secret = randomString(32);
+    await this.ctx.env.KV.put(`${UserResetPrefix}${user.id}`, secret, {
+      expirationTtl: RESET_TTL_SECONDS,
+    });
+    return { url: this.buildResetUrl(user, secret), expiresIn: RESET_TTL_SECONDS };
+  }
+
+  /** 站点地址 + 前端路由 + 查询参数。站点地址没配时退化成相对路径。 */
+  private frontendLink(path: string, query: Record<string, string>): string {
+    const base = this.ctx.settings.siteUrl.replace(/\/+$/, '');
+    const qs = new URLSearchParams(query).toString();
+    return `${base}${path}?${qs}`;
   }
 
   // -------------------------------------------------------------------------
@@ -309,8 +548,32 @@ export class UserService {
     new_password?: string;
     disable_view_sync?: boolean;
     share_links_in_profile?: string;
+    two_fa_enabled?: boolean;
+    two_fa_code?: string;
   }): Promise<UserResponse> {
     const user = this.ctx.requireUser();
+
+    // 两步验证的开关走独立分支：开启要用「待确认密钥」验码，关闭要用「已存密钥」验码。
+    // 对应上游 `service/user/setting.go:298-328`。
+    if (patch.two_fa_enabled !== undefined) {
+      const code = patch.two_fa_code ?? '';
+      if (patch.two_fa_enabled) {
+        const pending = await this.ctx.env.KV.get(`2fa_init_${user.id}`);
+        if (!pending) {
+          throw new AppError(CodeInternalSetting, 'You have not initiated 2FA session');
+        }
+        if (!(await validateTotp(code, pending))) {
+          throw new AppError(Code2FACodeErr, 'Incorrect 2FA code');
+        }
+        await this.ctx.users.setTwoFactorSecret(user.id, pending);
+        await this.ctx.env.KV.delete(`2fa_init_${user.id}`);
+      } else {
+        if (!user.two_factor_secret || !(await validateTotp(code, user.two_factor_secret))) {
+          throw new AppError(Code2FACodeErr, 'Incorrect 2FA code');
+        }
+        await this.ctx.users.setTwoFactorSecret(user.id, null);
+      }
+    }
 
     if (patch.new_password) {
       const ok = await checkPassword(user.password, patch.current_password ?? '');

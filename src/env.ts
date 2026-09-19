@@ -12,6 +12,13 @@ export interface Env {
    */
   JWT_SECRET?: string;
 
+  // 邮件（SMTP）配置**不在环境变量里**。它在数据库的 settings 表里，由管理后台的
+  // 「邮件」设置页维护 —— 键名是 smtpHost / smtpPort / smtpUser / smtpPass /
+  // smtpEncryption / fromName / fromAdress / replyTo（见
+  // `src/settings/provider.ts` 的 `smtp` getter），协议实现在 `src/services/smtp.ts`。
+  // 之所以这样安排：官方前端的面板只有这组 SMTP 字段，配置若放环境变量，
+  // 管理员在面板里改了什么都不会生效，面板就成了摆设。
+
   // --- 变量（wrangler.toml [vars]） ---
   /** 本站对外地址，用于拼分享链接 / 下载直链 */
   SITE_URL: string;
