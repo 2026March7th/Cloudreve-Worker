@@ -735,6 +735,22 @@ export class UserService {
     if (patch.nick !== undefined) {
       await this.ctx.users.updateProfile(uid, { nick: patch.nick });
     }
+    if (patch.email !== undefined) {
+      // 上游 UpsertUserService.validateEmail（#3563 修复）：管理员改邮箱必须
+      // 过格式校验，否则存进去一个登录不了的黑户。规则与注册一致：要求
+      // 域名带点（admin@test / user@localhost 这类都会被拒）。
+      const normalized = patch.email.trim().toLowerCase();
+      if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(normalized)) {
+        throw Err.param('Email format error');
+      }
+      const existing = await this.ctx.users.byEmail(normalized);
+      if (existing && existing.id !== uid) {
+        throw new AppError(CodeEmailExisted, 'This email has already been used');
+      }
+      if (existing?.id !== uid) {
+        await this.ctx.users.updateEmail(uid, normalized);
+      }
+    }
   }
 
   async resetUserPassword(userHashId: string, newPassword: string): Promise<void> {

@@ -301,6 +301,12 @@ export class UserRepo {
     `;
   }
 
+  async updateEmail(id: number, email: string): Promise<void> {
+    await this.sql`
+      UPDATE users SET email = ${email}, updated_at = now() WHERE id = ${id}
+    `;
+  }
+
   async setTwoFactorSecret(id: number, secret: string | null): Promise<void> {
     await this.sql`
       UPDATE users SET two_factor_secret = ${secret}, updated_at = now() WHERE id = ${id}

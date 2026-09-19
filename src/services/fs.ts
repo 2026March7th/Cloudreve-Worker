@@ -781,6 +781,10 @@ export class FileSystemService {
       if (nameError) throw new AppError(CodeIllegalObjectName, nameError);
 
       if (copy) {
+        // files 表有 (file_children, name) 唯一索引，不预检同名会把原始
+        // DB 冲突裸抛成 500（move 分支同样道理，见下方 conflict 检查）
+        const conflict = await this.ctx.files.childByName(dstFolder!.id, src.name);
+        if (conflict) throw Err.objectExist();
         await this.copyRecursive(src, dstFolder!.id, user.id);
       } else if (dstFs === FileSystemType.Trash) {
         await this.softDeleteFile(src);
