@@ -27,3 +27,17 @@ Thumbs.db
 _gap.json
 _gap_result.txt
 _*
+/trace.log
+/curl.log
+/tsc_*.txt
+/git_*.txt
+/push_*.txt
+/push_err*.txt
+/cred_test.txt
+/ci_check.txt
+/ci_view.txt
+/live_*.txt
+/smoke_result.txt
+/final_git.txt
+/trace_full.txt
+/curl_tail.txt
