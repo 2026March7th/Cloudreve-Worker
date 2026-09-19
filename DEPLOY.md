@@ -25,9 +25,9 @@ Cloudflare 面板 → Workers & Pages → Create → 选你 fork 的仓库，只
 | **构建命令**（Build command） | `npm install` |
 | **部署命令**（Deploy command） | `npm run deploy` |
 
-输出目录 / 根目录：留空。`npm run deploy` 会**自动创建 KV namespace 和 R2
-bucket 并把真实 ID 回填进 wrangler.toml**（`scripts/deploy.mjs` 干的），
-占位 ID 不用改。
+输出目录 / 根目录：留空。`npm run deploy` 会自动处理 KV namespace 和 R2
+bucket：**账号里已有同名资源就直接连过来用，没有才新建**，并把真实 ID
+回填进 wrangler.toml（`scripts/deploy.mjs` 干的），占位 ID 不用改。
 
 然后在项目的 **设置 → 环境变量** 里添加 `DATABASE_URL`（值是 Neon 连接串），
 保存后重新部署 —— 部署脚本会自动把它写入 Worker 的运行时 Secret。

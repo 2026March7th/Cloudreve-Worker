@@ -32,7 +32,7 @@ Workers & Pages → Create → 选仓库，只填两格：
 | **构建命令** | `npm install` |
 | **部署命令** | `npm run deploy` |
 
-输出目录留空。`npm run deploy` 会**自动创建 KV 和 R2 并回填 ID**，不需要改 `wrangler.toml`。
+输出目录留空。`npm run deploy` 会自动处理 KV 和 R2：**账号里已有同名资源就直接连过来用，没有才新建**，并把真实 ID 回填，不需要改 `wrangler.toml`。
 
 然后在项目的**设置 → 环境变量**里添加 `DATABASE_URL`（第 1 步的连接串），保存后重新部署 —— 部署脚本会自动把它写入 Worker 的运行时 Secret，不用再去面板手动加。`SITE_URL` 同样加在这个环境变量里即可。
 
@@ -184,6 +184,13 @@ npm run dev           # 本地 wrangler dev
 ```
 
 本地调试把机密写进 `.dev.vars`（已被 `.gitignore` 排除），参考 `.dev.vars.example`。
+
+## CI 检查
+
+仓库自带 GitHub Actions（`.github/workflows/ci.yml`），两级检查：
+
+1. **构建 + dry-run**（每次 push / PR 自动跑）：类型检查 + `wrangler deploy --dry-run`，代码或 `wrangler.toml` 配置有错会直接标红。
+2. **真实部署检查**（可选）：在仓库 Settings → Secrets and variables → Actions 配置 `CLOUDFLARE_API_TOKEN` 和 `CLOUDFLARE_ACCOUNT_ID`（可选再配 `DATABASE_URL`），push 到 main 时会真实部署一次（同样自动复用/创建 KV、R2），部署出错在 Actions 日志里第一时间看到。不配 secrets 则自动跳过，不影响检查通过。
 
 ## 许可
 
