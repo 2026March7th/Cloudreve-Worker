@@ -31,17 +31,17 @@ sessionRoutes.post('/token', async (c) => {
   };
 
   if (!body.email || !body.password) {
-    return c.json(fail(c, Err.param('Email and password are required')) as never);
+    return fail(c, Err.param('Email and password are required'));
   }
   if (body.password.length < 4 || body.password.length > 128) {
-    return c.json(fail(c, Err.param('Password length must be between 4 and 128')) as never);
+    return fail(c, Err.param('Password length must be between 4 and 128'));
   }
 
   // 登录验证码（站点开启时才校验）
   if (ctx.settings.loginCaptcha) {
     const passed = await verifyCaptcha(c.env, body.ticket, body.captcha);
     if (!passed) {
-      return c.json(fail(c, new AppError(40026, 'CAPTCHA verification failed')) as never);
+      return fail(c, new AppError(40026, 'CAPTCHA verification failed'));
     }
   }
 
@@ -50,11 +50,11 @@ sessionRoutes.post('/token', async (c) => {
     // 开了两步验证：不发 token，回 203 + 会话 ID，让前端转去输验证码。
     // 前端 `SignIn.tsx:222-225` 认的是 `Code.Continue`（203），会话 ID 从 `data` 里取。
     if ('two_fa_session_id' in result) {
-      return c.json(okWithCode(c, CodeNotFullySuccess, result.two_fa_session_id) as never);
+      return okWithCode(c, CodeNotFullySuccess, result.two_fa_session_id);
     }
-    return c.json(ok(c, result) as never);
+    return ok(c, result);
   } catch (e) {
-    return c.json(fail(c, e) as never);
+    return fail(c, e);
   }
 });
 
@@ -62,13 +62,13 @@ sessionRoutes.post('/token/refresh', async (c) => {
   const ctx = ctxOf(c);
   const body = (await c.req.json().catch(() => ({}))) as { refresh_token?: string };
   if (!body.refresh_token) {
-    return c.json(fail(c, Err.param('refresh_token is required')) as never);
+    return fail(c, Err.param('refresh_token is required'));
   }
   try {
     const token = await new UserService(ctx).refresh(body.refresh_token);
-    return c.json(ok(c, token) as never);
+    return ok(c, token);
   } catch (e) {
-    return c.json(fail(c, e) as never);
+    return fail(c, e);
   }
 });
 
@@ -80,9 +80,9 @@ sessionRoutes.delete('/token', async (c) => {
       await new UserService(ctx).logout(body.refresh_token);
     }
     // 原版注销成功返回空字符串
-    return c.json(ok(c, '') as never);
+    return ok(c, '');
   } catch (e) {
-    return c.json(fail(c, e) as never);
+    return fail(c, e);
   }
 });
 
@@ -90,13 +90,13 @@ sessionRoutes.get('/prepare', async (c) => {
   const ctx = ctxOf(c);
   const email = c.req.query('email');
   if (!email) {
-    return c.json(fail(c, Err.param('email is required')) as never);
+    return fail(c, Err.param('email is required'));
   }
   // 用户不存在时按上游返回 404（login.go:258 "User not found"），
   // 不能吞掉 —— 前端对「查不到」和「无密码」的处理路径完全不同。
   const user = await ctx.users.byEmail(email);
   if (!user) {
-    return c.json(fail(c, new AppError(CodeNotFound, 'User not found')) as never);
+    return fail(c, new AppError(CodeNotFound, 'User not found'));
   }
   return c.json(
     ok(c, {
@@ -120,13 +120,13 @@ sessionRoutes.post('/token/2fa', async (c) => {
   const ctx = ctxOf(c);
   const body = (await c.req.json().catch(() => ({}))) as { otp?: string; session_id?: string };
   if (!body.otp || !body.session_id) {
-    return c.json(fail(c, Err.param('otp and session_id are required')) as never);
+    return fail(c, Err.param('otp and session_id are required'));
   }
   try {
     const result = await new UserService(ctx).login2FA(body.otp, body.session_id);
-    return c.json(ok(c, result) as never);
+    return ok(c, result);
   } catch (e) {
-    return c.json(fail(c, e) as never);
+    return fail(c, e);
   }
 });
 /**
@@ -138,9 +138,9 @@ sessionRoutes.put('/authn', async (c) => {
   const ctx = ctxOf(c);
   const service = new PasskeyService(ctx, c.env, ctx.codec);
   try {
-    return c.json(ok(c, await service.prepareLogin()) as never);
+    return ok(c, await service.prepareLogin());
   } catch (e) {
-    return c.json(fail(c, e) as never);
+    return fail(c, e);
   }
 });
 
@@ -148,7 +148,7 @@ sessionRoutes.post('/authn', async (c) => {
   const ctx = ctxOf(c);
   const body = (await c.req.json().catch(() => ({}))) as { response?: string; session_id?: string };
   if (!body.response || !body.session_id) {
-    return c.json(fail(c, Err.param('response and session_id are required')) as never);
+    return fail(c, Err.param('response and session_id are required'));
   }
   const service = new PasskeyService(ctx, c.env, ctx.codec);
   try {
@@ -165,7 +165,7 @@ sessionRoutes.post('/authn', async (c) => {
       }) as never,
     );
   } catch (e) {
-    return c.json(fail(c, e) as never);
+    return fail(c, e);
   }
 });
 
@@ -183,14 +183,14 @@ sessionRoutes.get('/oauth/app/:app_id', async (c) => {
       ok(c, await service.getAppRegistration(c.req.param('app_id'), ctx.user?.id ?? null)) as never,
     );
   } catch (e) {
-    return c.json(fail(c, e) as never);
+    return fail(c, e);
   }
 });
 
 /** 用户同意 → 签发授权码。 */
 sessionRoutes.post('/oauth/consent', async (c) => {
   const ctx = ctxOf(c);
-  if (!ctx.user) return c.json(fail(c, Err.loginRequired()) as never);
+  if (!ctx.user) return fail(c, Err.loginRequired());
   const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
   const service = new OAuthService(ctx, c.env);
   try {
@@ -204,9 +204,9 @@ sessionRoutes.post('/oauth/consent', async (c) => {
       code_challenge_method:
         body.code_challenge_method === undefined ? undefined : String(body.code_challenge_method),
     });
-    return c.json(ok(c, res) as never);
+    return ok(c, res);
   } catch (e) {
-    return c.json(fail(c, e) as never);
+    return fail(c, e);
   }
 });
 
@@ -226,31 +226,31 @@ sessionRoutes.post('/oauth/token', async (c) => {
     });
     return c.json(res as never);
   } catch (e) {
-    return c.json(fail(c, e) as never);
+    return fail(c, e);
   }
 });
 
 /** OIDC userinfo。按 token scopes 决定返回字段。 */
 sessionRoutes.get('/oauth/userinfo', async (c) => {
   const ctx = ctxOf(c);
-  if (!ctx.user) return c.json(fail(c, Err.loginRequired()) as never);
+  if (!ctx.user) return fail(c, Err.loginRequired());
   const service = new OAuthService(ctx, c.env);
   try {
-    return c.json(ok(c, await service.userinfo(ctx.user, ctx.scopes)) as never);
+    return ok(c, await service.userinfo(ctx.user, ctx.scopes));
   } catch (e) {
-    return c.json(fail(c, e) as never);
+    return fail(c, e);
   }
 });
 
 /** 撤销对某应用的授权。 */
 sessionRoutes.delete('/oauth/grant/:app_id', async (c) => {
   const ctx = ctxOf(c);
-  if (!ctx.user) return c.json(fail(c, Err.loginRequired()) as never);
+  if (!ctx.user) return fail(c, Err.loginRequired());
   const service = new OAuthService(ctx, c.env);
   try {
     await service.deleteGrant(ctx.user, c.req.param('app_id'));
-    return c.json(ok(c) as never);
+    return ok(c);
   } catch (e) {
-    return c.json(fail(c, e) as never);
+    return fail(c, e);
   }
 });

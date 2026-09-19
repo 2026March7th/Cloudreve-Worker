@@ -31,7 +31,7 @@ export const workflowRoutes = new Hono<AppBindings>();
 
 /** 所有任务端点都要登录。 */
 workflowRoutes.use('*', async (c, next) => {
-  if (!ctxOf(c).user) return c.json(fail(c, Err.loginRequired()) as never);
+  if (!ctxOf(c).user) return fail(c, Err.loginRequired());
   await next();
 });
 
@@ -92,11 +92,11 @@ workflowRoutes.get('/', async (c) => {
 workflowRoutes.get('/progress/:id', async (c) => {
   const ctx = ctxOf(c);
   const id = ctx.codec.decodeTaskID(c.req.param('id'));
-  if (id === null) return c.json(fail(c, new AppError(CodeNotFound, 'Task not found')) as never);
+  if (id === null) return fail(c, new AppError(CodeNotFound, 'Task not found'));
 
   const task = await ctx.tasks.byId(id);
   if (!task || task.user_tasks !== ctx.user!.id) {
-    return c.json(fail(c, new AppError(CodeNotFound, 'Task not found')) as never);
+    return fail(c, new AppError(CodeNotFound, 'Task not found'));
   }
 
   const done = task.status === 'completed' || task.status === 'error' || task.status === 'canceled';
@@ -131,16 +131,16 @@ workflowRoutes.post('/archive', async (c) => {
   const ctx = ctxOf(c);
   const body = (await c.req.json().catch(() => ({}))) as { src?: string[]; dst?: string };
   if (!body.src?.length || !body.dst) {
-    return c.json(fail(c, Err.param('src and dst are required')) as never);
+    return fail(c, Err.param('src and dst are required'));
   }
   try {
     const task = await new WorkflowService(ctx, new FileSystemService(ctx)).createArchive({
       src: body.src,
       dst: body.dst,
     });
-    return c.json(ok(c, taskToResponse(ctx.codec, task)) as never);
+    return ok(c, taskToResponse(ctx.codec, task));
   } catch (e) {
-    return c.json(fail(c, e) as never);
+    return fail(c, e);
   }
 });
 
@@ -168,7 +168,7 @@ workflowRoutes.post('/download', async (c) => {
     src_file?: string;
     dst?: string;
   };
-  if (!body.dst) return c.json(fail(c, Err.param('dst is required')) as never);
+  if (!body.dst) return fail(c, Err.param('dst is required'));
 
   // 前端两种方式：直接给一组 URL，或上传一个存放 URL 列表的文件
   let urls = body.src ?? [];
@@ -185,7 +185,7 @@ workflowRoutes.post('/download', async (c) => {
       ) as never,
     );
   }
-  if (!urls.length) return c.json(fail(c, Err.param('src is required')) as never);
+  if (!urls.length) return fail(c, Err.param('src is required'));
 
   const service = new WorkflowService(ctx, new FileSystemService(ctx));
   const out: ReturnType<typeof taskToResponse>[] = [];
@@ -198,8 +198,8 @@ workflowRoutes.post('/download', async (c) => {
       errors.push(e);
     }
   }
-  if (!out.length && errors.length) return c.json(fail(c, errors[0]) as never);
-  return c.json(ok(c, out) as never);
+  if (!out.length && errors.length) return fail(c, errors[0]);
+  return ok(c, out);
 });
 
 /**
@@ -211,27 +211,27 @@ workflowRoutes.post('/download', async (c) => {
 workflowRoutes.patch('/download/:id', async (c) => {
   const ctx = ctxOf(c);
   const id = ctx.codec.decodeTaskID(c.req.param('id'));
-  if (id === null) return c.json(fail(c, new AppError(CodeNotFound, 'Task not found')) as never);
+  if (id === null) return fail(c, new AppError(CodeNotFound, 'Task not found'));
   const task = await ctx.tasks.byId(id);
   if (!task || task.user_tasks !== ctx.user!.id) {
-    return c.json(fail(c, new AppError(CodeNotFound, 'Task not found')) as never);
+    return fail(c, new AppError(CodeNotFound, 'Task not found'));
   }
-  return c.json(ok(c) as never);
+  return ok(c);
 });
 
 /** 取消下载任务。边缘版的任务是同步跑完的，能取消的只有「还没开始」这种边界情况。 */
 workflowRoutes.delete('/download/:id', async (c) => {
   const ctx = ctxOf(c);
   const id = ctx.codec.decodeTaskID(c.req.param('id'));
-  if (id === null) return c.json(fail(c, new AppError(CodeNotFound, 'Task not found')) as never);
+  if (id === null) return fail(c, new AppError(CodeNotFound, 'Task not found'));
   const task = await ctx.tasks.byId(id);
   if (!task || task.user_tasks !== ctx.user!.id) {
-    return c.json(fail(c, new AppError(CodeNotFound, 'Task not found')) as never);
+    return fail(c, new AppError(CodeNotFound, 'Task not found'));
   }
   if (task.status === 'queued' || task.status === 'processing') {
     await ctx.tasks.updateStatus(id, 'canceled');
   }
-  return c.json(ok(c) as never);
+  return ok(c);
 });
 
 // ---------------------------------------------------------------------------
@@ -367,8 +367,8 @@ workflowRoutes.post('/rebuildFtsIndex', async (c) => {
       task = { ...task, status: 'processing', public_state: publicState };
     }
 
-    return c.json(ok(c, taskToResponse(ctx.codec, task)) as never);
+    return ok(c, taskToResponse(ctx.codec, task));
   } catch (e) {
-    return c.json(fail(c, e) as never);
+    return fail(c, e);
   }
 });

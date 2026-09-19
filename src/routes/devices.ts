@@ -68,7 +68,7 @@ function validateDavUri(raw: string): void {
 
 devicesRoutes.get('/dav', async (c) => {
   const ctx = ctxOf(c);
-  if (!ctx.user) return c.json(fail(c, Err.loginRequired()) as never);
+  if (!ctx.user) return fail(c, Err.loginRequired());
   const pageSize = Math.max(10, Math.min(100, Number(c.req.query('page_size') ?? 20) || 20));
   const page = Math.max(0, Number(c.req.query('next_page_token') ?? 0) || 0);
 
@@ -93,7 +93,7 @@ devicesRoutes.get('/dav', async (c) => {
 
 devicesRoutes.put('/dav', async (c) => {
   const ctx = ctxOf(c);
-  if (!ctx.user) return c.json(fail(c, Err.loginRequired()) as never);
+  if (!ctx.user) return fail(c, Err.loginRequired());
   const body = (await c.req.json().catch(() => ({}))) as {
     name?: string;
     uri?: string;
@@ -102,7 +102,7 @@ devicesRoutes.put('/dav', async (c) => {
     disable_sys_files?: boolean;
   };
   if (!body.name || !body.uri) {
-    return c.json(fail(c, Err.param('name and uri are required')) as never);
+    return fail(c, Err.param('name and uri are required'));
   }
   try {
     // 上游 validateAndGetBs：用户组没开 WebDAV 就不能建账号
@@ -117,17 +117,17 @@ devicesRoutes.put('/dav', async (c) => {
       password: randomString(32),
       options: davOptionsFrom(body, ctx.groupPermissions.enabled(GroupPermission.WebDAVProxy)),
     });
-    return c.json(ok(c, davAccountToResponse(ctx.codec, account)) as never);
+    return ok(c, davAccountToResponse(ctx.codec, account));
   } catch (e) {
-    return c.json(fail(c, e) as never);
+    return fail(c, e);
   }
 });
 
 devicesRoutes.patch('/dav/:id', async (c) => {
   const ctx = ctxOf(c);
-  if (!ctx.user) return c.json(fail(c, Err.loginRequired()) as never);
+  if (!ctx.user) return fail(c, Err.loginRequired());
   const id = ctx.codec.decodeDavAccountID(c.req.param('id'));
-  if (id === null) return c.json(fail(c, Err.param('Invalid account id')) as never);
+  if (id === null) return fail(c, Err.param('Invalid account id'));
   const body = (await c.req.json().catch(() => ({}))) as {
     name?: string;
     uri?: string;
@@ -136,7 +136,7 @@ devicesRoutes.patch('/dav/:id', async (c) => {
     disable_sys_files?: boolean;
   };
   if (!body.name || !body.uri) {
-    return c.json(fail(c, Err.param('name and uri are required')) as never);
+    return fail(c, Err.param('name and uri are required'));
   }
   try {
     const existing = await ctx.davAccounts.byIdAndUser(id, ctx.user.id);
@@ -148,23 +148,23 @@ devicesRoutes.patch('/dav/:id', async (c) => {
       uri: body.uri,
       options: davOptionsFrom(body, ctx.groupPermissions.enabled(GroupPermission.WebDAVProxy)),
     });
-    return c.json(ok(c, davAccountToResponse(ctx.codec, account)) as never);
+    return ok(c, davAccountToResponse(ctx.codec, account));
   } catch (e) {
-    return c.json(fail(c, e) as never);
+    return fail(c, e);
   }
 });
 
 devicesRoutes.delete('/dav/:id', async (c) => {
   const ctx = ctxOf(c);
-  if (!ctx.user) return c.json(fail(c, Err.loginRequired()) as never);
+  if (!ctx.user) return fail(c, Err.loginRequired());
   const id = ctx.codec.decodeDavAccountID(c.req.param('id'));
-  if (id === null) return c.json(fail(c, Err.param('Invalid account id')) as never);
+  if (id === null) return fail(c, Err.param('Invalid account id'));
   try {
     const existing = await ctx.davAccounts.byIdAndUser(id, ctx.user.id);
     if (!existing) throw new AppError(40004, 'Account not exist');
     await ctx.davAccounts.remove(id);
-    return c.json(ok(c) as never);
+    return ok(c);
   } catch (e) {
-    return c.json(fail(c, e) as never);
+    return fail(c, e);
   }
 });

@@ -43,9 +43,10 @@ export function okWithCode<T>(c: Context, code: number, data?: T): Response {
 /**
  * 错误响应。镜像原版 `serializer.ErrWithDetails`：
  *   - 底层是 AppError 时，取其 code 与 msg；
- *   - 非生产模式下附加 `error` 明细。
+ *   - 非生产模式下附加 `error` 明细；
+ *   - status 仅在原版确实返回非 200 时使用（如 /f/ 直链不存在回 404）。
  */
-export function fail(c: Context, err: unknown): Response {
+export function fail(c: Context, err: unknown, status: 200 | 404 = 200): Response {
   let code = CodeNotSet;
   let msg = '';
   let raw: unknown = err;
@@ -69,7 +70,7 @@ export function fail(c: Context, err: unknown): Response {
   if (typeof cid === 'string' && cid) {
     body.correlation_id = cid;
   }
-  return jsonResponse(c, body);
+  return jsonResponse(c, body, status);
 }
 
 /** 参数错误快捷方式。 */
@@ -81,7 +82,7 @@ function isProduction(c: Context): boolean {
   return (c.env as { ENVIRONMENT?: string } | undefined)?.ENVIRONMENT === 'production';
 }
 
-function jsonResponse(c: Context, body: Envelope): Response {
-  // 与原版一致：HTTP 200 + 自定义业务码
-  return c.json(body as never, 200);
+function jsonResponse(c: Context, body: Envelope, status: 200 | 404 = 200): Response {
+  // 与原版一致：默认 HTTP 200 + 自定义业务码；仅个别路径（/f/ 404）用非 200
+  return c.json(body as never, status);
 }

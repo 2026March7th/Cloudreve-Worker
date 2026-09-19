@@ -25,7 +25,7 @@ export const siteRoutes = new Hono<AppBindings>();
 
 siteRoutes.get('/ping', (c) => {
   c.header('Cache-Control', 'no-cache');
-  return c.json(ok(c, BACKEND_VERSION) as never);
+  return ok(c, BACKEND_VERSION);
 });
 
 siteRoutes.get('/config/:section', async (c) => {

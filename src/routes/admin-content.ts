@@ -217,12 +217,12 @@ adminContentRoutes.post('/user', async (c) => {
 adminContentRoutes.get('/user/:id', async (c) => {
   const { sql, codec, ctx } = withCtx(c);
   const id = numericId(c.req.param('id'), (v) => codec.decodeUserID(v));
-  if (id === null) return c.json(fail(c, Err.userNotFound()) as never);
+  if (id === null) return fail(c, Err.userNotFound());
 
   const rows = (await sql('SELECT * FROM users WHERE id = $1 AND deleted_at IS NULL LIMIT 1', [
     id,
   ])) as Record<string, unknown>[];
-  if (!rows[0]) return c.json(fail(c, Err.userNotFound()) as never);
+  if (!rows[0]) return fail(c, Err.userNotFound());
 
   const user = rows[0];
   const edges = await userEdges(ctx, num(user.group_users));
@@ -323,20 +323,20 @@ async function upsertUser(c: Context<AppBindings>, id: number | null) {
 
 adminContentRoutes.put('/user', async (c) => {
   try {
-    return c.json(ok(c, await upsertUser(c, null)) as never);
+    return ok(c, await upsertUser(c, null));
   } catch (e) {
-    return c.json(fail(c, e) as never);
+    return fail(c, e);
   }
 });
 
 adminContentRoutes.put('/user/:id', async (c) => {
   const { codec } = withCtx(c);
   const id = numericId(c.req.param('id'), (v) => codec.decodeUserID(v));
-  if (id === null) return c.json(fail(c, Err.userNotFound()) as never);
+  if (id === null) return fail(c, Err.userNotFound());
   try {
-    return c.json(ok(c, await upsertUser(c, id)) as never);
+    return ok(c, await upsertUser(c, id));
   } catch (e) {
-    return c.json(fail(c, e) as never);
+    return fail(c, e);
   }
 });
 
@@ -345,7 +345,7 @@ adminContentRoutes.post('/user/batch/delete', async (c) => {
   const { sql } = withCtx(c);
   const body = await readBody(c);
   const ids = idList(body.ids);
-  if (ids.length === 0) return c.json(fail(c, Err.param('No user selected')) as never);
+  if (ids.length === 0) return fail(c, Err.param('No user selected'));
   // 初始用户禁止操作，与原版一致
   for (const id of ids) {
     if (id === 1) throw new AppError(40043, 'Cannot perform this action on the default user');
@@ -355,19 +355,19 @@ adminContentRoutes.post('/user/batch/delete', async (c) => {
     () => `UPDATE users SET status = 'sys_banned', deleted_at = now(), updated_at = now() WHERE id = $1`,
     ids,
   );
-  return c.json(ok(c) as never);
+  return ok(c);
 });
 
 /** `POST /admin/user/:id/calibrate` —— 重算已用容量。对应 `AdminCalibrateStorage`。 */
 adminContentRoutes.post('/user/:id/calibrate', async (c) => {
   const { codec, ctx } = withCtx(c);
   const id = numericId(c.req.param('id'), (v) => codec.decodeUserID(v));
-  if (id === null) return c.json(fail(c, Err.userNotFound()) as never);
+  if (id === null) return fail(c, Err.userNotFound());
   try {
     await ctx.users.recalcStorage(id);
-    return c.json(ok(c) as never);
+    return ok(c);
   } catch (e) {
-    return c.json(fail(c, e) as never);
+    return fail(c, e);
   }
 });
 
@@ -463,12 +463,12 @@ adminContentRoutes.post('/file', async (c) => {
 adminContentRoutes.get('/file/:id', async (c) => {
   const { sql, codec, ctx } = withCtx(c);
   const id = numericId(c.req.param('id'), (v) => codec.decodeFileID(v));
-  if (id === null) return c.json(fail(c, Err.fileNotFound()) as never);
+  if (id === null) return fail(c, Err.fileNotFound());
 
   const rows = (await sql('SELECT * FROM files WHERE id = $1 AND deleted_at IS NULL LIMIT 1', [
     id,
   ])) as Record<string, unknown>[];
-  if (!rows[0]) return c.json(fail(c, Err.fileNotFound()) as never);
+  if (!rows[0]) return fail(c, Err.fileNotFound());
 
   const meta = (await sql(
     'SELECT * FROM metadata WHERE file_id = $1 AND deleted_at IS NULL ORDER BY id ASC',
@@ -518,7 +518,7 @@ adminContentRoutes.get('/file/:id', async (c) => {
 adminContentRoutes.put('/file/:id', async (c) => {
   const { codec, ctx } = withCtx(c);
   const id = numericId(c.req.param('id'), (v) => codec.decodeFileID(v));
-  if (id === null) return c.json(fail(c, Err.fileNotFound()) as never);
+  if (id === null) return fail(c, Err.fileNotFound());
   const raw = await readBody(c);
   const body = unwrapBody<Record<string, unknown>>(raw, 'file');
   try {
@@ -527,9 +527,9 @@ adminContentRoutes.put('/file/:id', async (c) => {
       if (!name) throw Err.illegalName('File name cannot be empty');
       await ctx.files.rename(id, name);
     }
-    return c.json(ok(c) as never);
+    return ok(c);
   } catch (e) {
-    return c.json(fail(c, e) as never);
+    return fail(c, e);
   }
 });
 
@@ -540,14 +540,14 @@ adminContentRoutes.put('/file/:id', async (c) => {
 adminContentRoutes.get('/file/url/:id', async (c) => {
   const { codec, ctx } = withCtx(c);
   const id = numericId(c.req.param('id'), (v) => codec.decodeFileID(v));
-  if (id === null) return c.json(fail(c, Err.fileNotFound()) as never);
+  if (id === null) return fail(c, Err.fileNotFound());
 
   const base = ctx.settings.siteUrl.replace(/\/+$/, '');
   const links = await ctx.directLinks.listByFile(id);
   if (links.length === 0) {
-    return c.json(ok(c, `${base}/api/v4/file/${codec.encodeFileID(id)}/content`) as never);
+    return ok(c, `${base}/api/v4/file/${codec.encodeFileID(id)}/content`);
   }
-  return c.json(ok(c, `${base}/s/${codec.encodeSourceLinkID(num(links[0]!.id))}`) as never);
+  return ok(c, `${base}/s/${codec.encodeSourceLinkID(num(links[0]!.id))}`);
 });
 
 /** `POST /admin/file/batch/delete` —— 批量删除文件（真删，不进回收站）。 */
@@ -555,16 +555,16 @@ adminContentRoutes.post('/file/batch/delete', async (c) => {
   const { ctx } = withCtx(c);
   const body = await readBody(c);
   const ids = idList(body.ids);
-  if (ids.length === 0) return c.json(fail(c, Err.param('No file selected')) as never);
+  if (ids.length === 0) return fail(c, Err.param('No file selected'));
   try {
     // 连子目录一起删，避免留下孤儿行
     const descendants = await ctx.files.collectDescendants(ids);
     const all = [...new Set([...ids, ...descendants])];
     await ctx.entities.release(all);
     await ctx.files.deleteMany(all);
-    return c.json(ok(c) as never);
+    return ok(c);
   } catch (e) {
-    return c.json(fail(c, e) as never);
+    return fail(c, e);
   }
 });
 
@@ -635,12 +635,12 @@ adminContentRoutes.post('/entity', async (c) => {
 adminContentRoutes.get('/entity/:id', async (c) => {
   const { sql, codec } = withCtx(c);
   const id = numericId(c.req.param('id'), (v) => codec.decodeEntityID(v));
-  if (id === null) return c.json(fail(c, new AppError(40077, 'Entity not found')) as never);
+  if (id === null) return fail(c, new AppError(40077, 'Entity not found'));
 
   const rows = (await sql('SELECT * FROM entities WHERE id = $1 AND deleted_at IS NULL LIMIT 1', [
     id,
   ])) as Record<string, unknown>[];
-  if (!rows[0]) return c.json(fail(c, new AppError(40077, 'Entity not found')) as never);
+  if (!rows[0]) return fail(c, new AppError(40077, 'Entity not found'));
 
   const files = (await sql(
     `SELECT f.* FROM files f
@@ -680,11 +680,11 @@ adminContentRoutes.get('/entity/:id', async (c) => {
 adminContentRoutes.get('/entity/url/:id', async (c) => {
   const { codec, ctx } = withCtx(c);
   const id = numericId(c.req.param('id'), (v) => codec.decodeEntityID(v));
-  if (id === null) return c.json(fail(c, new AppError(40077, 'Entity not found')) as never);
+  if (id === null) return fail(c, new AppError(40077, 'Entity not found'));
 
   const entity = await ctx.entities.byId(id);
   if (!entity || entity.deleted_at) {
-    return c.json(fail(c, new AppError(40077, 'Entity not found')) as never);
+    return fail(c, new AppError(40077, 'Entity not found'));
   }
   try {
     const policy = await ctx.policies.byId(entity.storage_policy_entities);
@@ -697,9 +697,9 @@ adminContentRoutes.get('/entity/url/:id', async (c) => {
       displayName: '',
       speed: 0,
     });
-    return c.json(ok(c, url) as never);
+    return ok(c, url);
   } catch (e) {
-    return c.json(fail(c, e) as never);
+    return fail(c, e);
   }
 });
 
@@ -708,12 +708,12 @@ adminContentRoutes.post('/entity/batch/delete', async (c) => {
   const { ctx } = withCtx(c);
   const body = await readBody(c);
   const ids = idList(body.ids);
-  if (ids.length === 0) return c.json(fail(c, Err.param('No entity selected')) as never);
+  if (ids.length === 0) return fail(c, Err.param('No entity selected'));
   try {
     await ctx.entities.hardDelete(ids);
-    return c.json(ok(c) as never);
+    return ok(c);
   } catch (e) {
-    return c.json(fail(c, e) as never);
+    return fail(c, e);
   }
 });
 
@@ -789,12 +789,12 @@ adminContentRoutes.post('/share', async (c) => {
 adminContentRoutes.get('/share/:id', async (c) => {
   const { sql, codec, ctx } = withCtx(c);
   const id = numericId(c.req.param('id'), (v) => codec.decodeShareID(v));
-  if (id === null) return c.json(fail(c, Err.shareNotFound()) as never);
+  if (id === null) return fail(c, Err.shareNotFound());
 
   const rows = (await sql('SELECT * FROM shares WHERE id = $1 AND deleted_at IS NULL LIMIT 1', [
     id,
   ])) as Record<string, unknown>[];
-  if (!rows[0]) return c.json(fail(c, Err.shareNotFound()) as never);
+  if (!rows[0]) return fail(c, Err.shareNotFound());
 
   const fileId = num(rows[0].file_shares);
   const fileRows = fileId
@@ -817,9 +817,9 @@ adminContentRoutes.post('/share/batch/delete', async (c) => {
   const { sql } = withCtx(c);
   const body = await readBody(c);
   const ids = idList(body.ids);
-  if (ids.length === 0) return c.json(fail(c, Err.param('No share selected')) as never);
+  if (ids.length === 0) return fail(c, Err.param('No share selected'));
   await forEachId(sql, () => 'UPDATE shares SET deleted_at = now(), updated_at = now() WHERE id = $1', ids);
-  return c.json(ok(c) as never);
+  return ok(c);
 });
 
 // ---------------------------------------------------------------------------
@@ -909,10 +909,10 @@ adminContentRoutes.post('/queue', async (c) => {
 adminContentRoutes.get('/queue/:id', async (c) => {
   const { codec, ctx } = withCtx(c);
   const id = numericId(c.req.param('id'), (v) => codec.decodeTaskID(v));
-  if (id === null) return c.json(fail(c, Err.notFound('Task not found')) as never);
+  if (id === null) return fail(c, Err.notFound('Task not found'));
   const task = await ctx.tasks.byId(id);
-  if (!task) return c.json(fail(c, Err.notFound('Task not found')) as never);
-  return c.json(ok(c, taskToResponse(codec, task as unknown as Record<string, unknown>)) as never);
+  if (!task) return fail(c, Err.notFound('Task not found'));
+  return ok(c, taskToResponse(codec, task as unknown as Record<string, unknown>));
 });
 
 /** `POST /admin/queue/batch/delete` —— 批量删任务。 */
@@ -920,9 +920,9 @@ adminContentRoutes.post('/queue/batch/delete', async (c) => {
   const { ctx } = withCtx(c);
   const body = await readBody(c);
   const ids = idList(body.ids);
-  if (ids.length === 0) return c.json(fail(c, Err.param('No task selected')) as never);
+  if (ids.length === 0) return fail(c, Err.param('No task selected'));
   await ctx.tasks.softDeleteMany(ids);
-  return c.json(ok(c) as never);
+  return ok(c);
 });
 
 /**
@@ -938,7 +938,7 @@ adminContentRoutes.post('/queue/cleanup', async (c) => {
   };
   const notAfter = body.not_after ? new Date(body.not_after) : null;
   if (!notAfter || Number.isNaN(notAfter.getTime())) {
-    return c.json(fail(c, Err.param('Invalid not_after')) as never);
+    return fail(c, Err.param('Invalid not_after'));
   }
   const statuses = jsonArray(body.status).map(String);
   const types = jsonArray(body.types).map(String);
@@ -951,7 +951,7 @@ adminContentRoutes.post('/queue/cleanup', async (c) => {
        AND ($3::text[] IS NULL OR type = ANY($3::text[]))`,
     [notAfter.toISOString(), statuses.length ? statuses : null, types.length ? types : null],
   );
-  return c.json(ok(c) as never);
+  return ok(c);
 });
 
 // ---------------------------------------------------------------------------
@@ -1013,10 +1013,10 @@ adminContentRoutes.post('/node', async (c) => {
 adminContentRoutes.get('/node/:id', async (c) => {
   const { sql } = withCtx(c);
   const id = numericId(c.req.param('id'), (v) => c.get('ctx').codec.decodeEntityID(v));
-  if (id === null) return c.json(fail(c, Err.notFound('Node not found')) as never);
+  if (id === null) return fail(c, Err.notFound('Node not found'));
   const node = await loadNode(sql, id);
-  if (!node) return c.json(fail(c, Err.notFound('Node not found')) as never);
-  return c.json(ok(c, { node: nodeToResponse(node) }) as never);
+  if (!node) return fail(c, Err.notFound('Node not found'));
+  return ok(c, { node: nodeToResponse(node) });
 });
 
 /** 创建 / 更新节点的公共逻辑（`UpsertNodeService`）。 */
@@ -1079,9 +1079,9 @@ async function upsertNode(c: Context<AppBindings>, id: number | null, requireExi
 
 adminContentRoutes.put('/node', async (c) => {
   try {
-    return c.json(ok(c, { node: await upsertNode(c, null, false) }) as never);
+    return ok(c, { node: await upsertNode(c, null, false) });
   } catch (e) {
-    return c.json(fail(c, e) as never);
+    return fail(c, e);
   }
 });
 
@@ -1089,9 +1089,9 @@ adminContentRoutes.put('/node/:id', async (c) => {
   try {
     const id = numericId(c.req.param('id'), (v) => c.get('ctx').codec.decodeEntityID(v));
     if (id === null) throw Err.notFound('Node not found');
-    return c.json(ok(c, { node: await upsertNode(c, id, true) }) as never);
+    return ok(c, { node: await upsertNode(c, id, true) });
   } catch (e) {
-    return c.json(fail(c, e) as never);
+    return fail(c, e);
   }
 });
 
@@ -1121,9 +1121,9 @@ adminContentRoutes.delete('/node/:id', async (c) => {
     }
 
     await sql('UPDATE nodes SET deleted_at = now(), updated_at = now() WHERE id = $1', [id]);
-    return c.json(ok(c) as never);
+    return ok(c);
   } catch (e) {
-    return c.json(fail(c, e) as never);
+    return fail(c, e);
   }
 });
 
@@ -1185,9 +1185,9 @@ adminContentRoutes.post('/node/test', async (c) => {
     if ((json.code ?? 0) !== 0) {
       throw Err.param(`Successfully connected to slave node, but slave returns: ${json.msg ?? 'unknown'}`);
     }
-    return c.json(ok(c) as never);
+    return ok(c);
   } catch (e) {
-    return c.json(fail(c, e) as never);
+    return fail(c, e);
   }
 });
 
@@ -1234,7 +1234,7 @@ adminContentRoutes.post('/node/test/downloader', async (c) => {
       if (json.error) {
         throw Err.param(`Failed to test downloader: ${json.error.message ?? 'aria2 error'}`);
       }
-      return c.json(ok(c, json.result?.version ?? '') as never);
+      return ok(c, json.result?.version ?? '');
     }
 
     // slave 下载器：同款 HMAC 签名请求
@@ -1280,9 +1280,9 @@ adminContentRoutes.post('/node/test/downloader', async (c) => {
     if ((json.code ?? 0) !== 0) {
       throw Err.param(`Failed to test downloader: ${json.msg ?? 'unknown'}`);
     }
-    return c.json(ok(c, json.data ?? '') as never);
+    return ok(c, json.data ?? '');
   } catch (e) {
-    return c.json(fail(c, e) as never);
+    return fail(c, e);
   }
 });
 
@@ -1350,19 +1350,19 @@ adminContentRoutes.post('/oauthClient', async (c) => {
 adminContentRoutes.get('/oauthClient/:id', async (c) => {
   const { sql, codec } = withCtx(c);
   const id = numericId(c.req.param('id'), (v) => codec.decodeEntityID(v));
-  if (id === null) return c.json(fail(c, Err.notFound('OAuth client not found')) as never);
+  if (id === null) return fail(c, Err.notFound('OAuth client not found'));
 
   const rows = (await sql(
     'SELECT * FROM oauth_clients WHERE id = $1 AND deleted_at IS NULL LIMIT 1',
     [id],
   )) as Record<string, unknown>[];
-  if (!rows[0]) return c.json(fail(c, Err.notFound('OAuth client not found')) as never);
+  if (!rows[0]) return fail(c, Err.notFound('OAuth client not found'));
 
   const grantRows = (await sql(
     'SELECT COUNT(*)::int AS total FROM oauth_grants WHERE client_id = $1 AND deleted_at IS NULL',
     [id],
   )) as Record<string, unknown>[];
-  return c.json(ok(c, oauthClientToResponse(rows[0], num(grantRows[0]?.total))) as never);
+  return ok(c, oauthClientToResponse(rows[0], num(grantRows[0]?.total)));
 });
 
 /**
@@ -1436,20 +1436,20 @@ async function upsertOAuthClient(c: Context<AppBindings>, id: number | null) {
 
 adminContentRoutes.put('/oauthClient', async (c) => {
   try {
-    return c.json(ok(c, await upsertOAuthClient(c, null)) as never);
+    return ok(c, await upsertOAuthClient(c, null));
   } catch (e) {
-    return c.json(fail(c, e) as never);
+    return fail(c, e);
   }
 });
 
 adminContentRoutes.put('/oauthClient/:id', async (c) => {
   const { codec } = withCtx(c);
   const id = numericId(c.req.param('id'), (v) => codec.decodeEntityID(v));
-  if (id === null) return c.json(fail(c, Err.notFound('OAuth client not found')) as never);
+  if (id === null) return fail(c, Err.notFound('OAuth client not found'));
   try {
-    return c.json(ok(c, await upsertOAuthClient(c, id)) as never);
+    return ok(c, await upsertOAuthClient(c, id));
   } catch (e) {
-    return c.json(fail(c, e) as never);
+    return fail(c, e);
   }
 });
 
@@ -1457,10 +1457,10 @@ adminContentRoutes.put('/oauthClient/:id', async (c) => {
 adminContentRoutes.delete('/oauthClient/:id', async (c) => {
   const { sql, codec } = withCtx(c);
   const id = numericId(c.req.param('id'), (v) => codec.decodeEntityID(v));
-  if (id === null) return c.json(fail(c, Err.notFound('OAuth client not found')) as never);
+  if (id === null) return fail(c, Err.notFound('OAuth client not found'));
   await sql('UPDATE oauth_grants SET deleted_at = now() WHERE client_id = $1 AND deleted_at IS NULL', [id]);
   await sql('UPDATE oauth_clients SET deleted_at = now(), updated_at = now() WHERE id = $1', [id]);
-  return c.json(ok(c) as never);
+  return ok(c);
 });
 
 /** `POST /admin/oauthClient/batch/delete` —— 批量删应用。 */
@@ -1468,7 +1468,7 @@ adminContentRoutes.post('/oauthClient/batch/delete', async (c) => {
   const { sql } = withCtx(c);
   const body = await readBody(c);
   const ids = idList(body.ids);
-  if (ids.length === 0) return c.json(fail(c, Err.param('No client selected')) as never);
+  if (ids.length === 0) return fail(c, Err.param('No client selected'));
   await forEachId(
     sql,
     () => 'UPDATE oauth_grants SET deleted_at = now() WHERE client_id = $1 AND deleted_at IS NULL',
@@ -1479,5 +1479,5 @@ adminContentRoutes.post('/oauthClient/batch/delete', async (c) => {
     () => 'UPDATE oauth_clients SET deleted_at = now(), updated_at = now() WHERE id = $1',
     ids,
   );
-  return c.json(ok(c) as never);
+  return ok(c);
 });

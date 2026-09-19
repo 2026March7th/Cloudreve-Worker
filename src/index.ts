@@ -235,7 +235,7 @@ app.get('/f/:id/:name', async (c) => {
     const target = await download.visitDirectLink(c.req.param('id'));
     return c.redirect(target, 302);
   } catch (e) {
-    return c.json(fail(c, e) as never, 404);
+    return fail(c, e, 404);
   }
 });
 
@@ -283,7 +283,7 @@ async function serveFrontend(c: Context<AppBindings>): Promise<Response> {
 app.notFound(async (c) => {
   // API 路径保持信封格式；其它路径交给官方前端（前端路由由前端自己处理）
   if (c.req.path.startsWith('/api/')) {
-    return c.json(fail(c, new AppError(CodeNotFound, 'API endpoint not found')) as never);
+    return fail(c, new AppError(CodeNotFound, 'API endpoint not found'));
   }
   return serveFrontend(c);
 });
@@ -291,7 +291,7 @@ app.notFound(async (c) => {
 app.onError((err, c) => {
   // 未预期的异常统一转成标准信封，避免把堆栈暴露给客户端
   const wrapped = err instanceof AppError ? err : new AppError(50005, 'Internal server error', err);
-  return c.json(fail(c, wrapped) as never);
+  return fail(c, wrapped);
 });
 
 // ---------------------------------------------------------------------------

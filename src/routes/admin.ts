@@ -58,8 +58,8 @@ export const adminRoutes = new Hono<AppBindings>();
 /** 所有管理端点统一先做管理员校验。 */
 adminRoutes.use('*', async (c, next) => {
   const ctx = ctxOf(c);
-  if (!ctx.user) return c.json(fail(c, Err.loginRequired()) as never);
-  if (!ctx.isAdmin) return c.json(fail(c, Err.adminRequired()) as never);
+  if (!ctx.user) return fail(c, Err.loginRequired());
+  if (!ctx.isAdmin) return fail(c, Err.adminRequired());
   await next();
 });
 
@@ -111,7 +111,7 @@ adminRoutes.post('/settings', async (c) => {
     if (body.keys?.length && !body.keys.includes(r.name)) continue;
     out[r.name] = r.value ?? '';
   }
-  return c.json(ok(c, out) as never);
+  return ok(c, out);
 });
 
 /** 修改设置 */
@@ -119,7 +119,7 @@ adminRoutes.patch('/settings', async (c) => {
   const ctx = ctxOf(c);
   const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
   if (!body || typeof body !== 'object' || Object.keys(body).length === 0) {
-    return c.json(fail(c, Err.param('No settings provided')) as never);
+    return fail(c, Err.param('No settings provided'));
   }
 
   const sql = (await import('../db')).getSql(ctx.env);
@@ -134,7 +134,7 @@ adminRoutes.patch('/settings', async (c) => {
     updated.push(key);
   }
   await invalidateSettings(ctx.env);
-  return c.json(ok(c, { updated }) as never);
+  return ok(c, { updated });
 });
 
 // ---------------------------------------------------------------------------
@@ -213,10 +213,10 @@ adminRoutes.post('/group', async (c) => {
 adminRoutes.get('/group/:id', async (c) => {
   const ctx = ctxOf(c);
   const id = numericId(c.req.param('id'), (v) => ctx.codec.decodeGroupID(v));
-  if (id === null) return c.json(fail(c, new AppError(40039, 'Group not found')) as never);
+  if (id === null) return fail(c, new AppError(40039, 'Group not found'));
   const group = await ctx.groups.byId(id);
-  if (!group) return c.json(fail(c, new AppError(40039, 'Group not found')) as never);
-  return c.json(ok(c, groupToResponse(ctx.codec, group, await groupExtras(ctx, group))) as never);
+  if (!group) return fail(c, new AppError(40039, 'Group not found'));
+  return ok(c, groupToResponse(ctx.codec, group, await groupExtras(ctx, group)));
 });
 
 
@@ -263,7 +263,7 @@ adminRoutes.put('/group', async (c) => {
   const ctx = ctxOf(c);
   const raw = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
   const body = unwrapBody<Record<string, unknown>>(raw, 'group');
-  if (!body.name) return c.json(fail(c, Err.param('name is required')) as never);
+  if (!body.name) return fail(c, Err.param('name is required'));
 
   const perms = parsePermission(body.permissions, new BooleanSet());
 
@@ -276,18 +276,18 @@ adminRoutes.put('/group', async (c) => {
       settings: (body.settings as Record<string, unknown>) ?? {},
       storagePolicyId: policyIdFromGroupBody(body, ctx.codec),
     });
-    return c.json(ok(c, groupToResponse(ctx.codec, group, await groupExtras(ctx, group))) as never);
+    return ok(c, groupToResponse(ctx.codec, group, await groupExtras(ctx, group)));
   } catch (e) {
-    return c.json(fail(c, e) as never);
+    return fail(c, e);
   }
 });
 
 adminRoutes.put('/group/:id', async (c) => {
   const ctx = ctxOf(c);
   const id = numericId(c.req.param('id'), (v) => ctx.codec.decodeGroupID(v));
-  if (id === null) return c.json(fail(c, new AppError(40039, 'Group not found')) as never);
+  if (id === null) return fail(c, new AppError(40039, 'Group not found'));
   const group = await ctx.groups.byId(id);
-  if (!group) return c.json(fail(c, new AppError(40039, 'Group not found')) as never);
+  if (!group) return fail(c, new AppError(40039, 'Group not found'));
 
   const raw = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
   const body = unwrapBody<Record<string, unknown>>(raw, 'group');
@@ -316,25 +316,25 @@ adminRoutes.put('/group/:id', async (c) => {
       ok(c, groupToResponse(ctx.codec, updated!, await groupExtras(ctx, updated!))) as never,
     );
   } catch (e) {
-    return c.json(fail(c, e) as never);
+    return fail(c, e);
   }
 });
 
 adminRoutes.delete('/group/:id', async (c) => {
   const ctx = ctxOf(c);
   const id = numericId(c.req.param('id'), (v) => ctx.codec.decodeGroupID(v));
-  if (id === null) return c.json(fail(c, new AppError(40039, 'Group not found')) as never);
+  if (id === null) return fail(c, new AppError(40039, 'Group not found'));
 
   // 系统内置组（1=管理员 2=默认用户 3=匿名）禁止删除，与原版一致
   if ([1, 2, 3].includes(id)) {
-    return c.json(fail(c, new AppError(40040, 'Cannot perform this action on system group')) as never);
+    return fail(c, new AppError(40040, 'Cannot perform this action on system group'));
   }
   const used = await ctx.groups.countUsers(id);
   if (used > 0) {
-    return c.json(fail(c, new AppError(40041, 'This group is being used by users')) as never);
+    return fail(c, new AppError(40041, 'This group is being used by users'));
   }
   await ctx.groups.softDelete(id);
-  return c.json(ok(c) as never);
+  return ok(c);
 });
 
 // ---------------------------------------------------------------------------
@@ -356,9 +356,9 @@ adminRoutes.post('/user', async (c) => {
       groupId: body.group_id as string | undefined,
       status: body.status as string | undefined,
     });
-    return c.json(ok(c, res) as never);
+    return ok(c, res);
   } catch (e) {
-    return c.json(fail(c, e) as never);
+    return fail(c, e);
   }
 });
 
@@ -376,9 +376,9 @@ adminRoutes.patch('/user/:id', async (c) => {
     if (body.new_password) {
       await service.resetUserPassword(c.req.param('id'), String(body.new_password));
     }
-    return c.json(ok(c) as never);
+    return ok(c);
   } catch (e) {
-    return c.json(fail(c, e) as never);
+    return fail(c, e);
   }
 });
 
@@ -386,9 +386,9 @@ adminRoutes.delete('/user/:id', async (c) => {
   const ctx = ctxOf(c);
   try {
     await new UserService(ctx).deleteUser(c.req.param('id'));
-    return c.json(ok(c) as never);
+    return ok(c);
   } catch (e) {
-    return c.json(fail(c, e) as never);
+    return fail(c, e);
   }
 });
 
@@ -403,17 +403,17 @@ adminRoutes.delete('/user/:id', async (c) => {
 adminRoutes.post('/user/:id/reset-link', async (c) => {
   const ctx = ctxOf(c);
   const uid = ctx.codec.decodeUserID(c.req.param('id'));
-  if (uid === null) return c.json(fail(c, Err.userNotFound()) as never);
+  if (uid === null) return fail(c, Err.userNotFound());
 
   const user = await ctx.users.byId(uid);
-  if (!user) return c.json(fail(c, Err.userNotFound()) as never);
+  if (!user) return fail(c, Err.userNotFound());
 
   try {
     // 复用邮箱那条路：同样拒绝被封禁 / 未激活的账号
     const res = await new UserService(ctx).createResetUrl(user.email);
-    return c.json(ok(c, res) as never);
+    return ok(c, res);
   } catch (e) {
-    return c.json(fail(c, e) as never);
+    return fail(c, e);
   }
 });
 
@@ -525,10 +525,10 @@ adminRoutes.post('/policy', async (c) => {
 adminRoutes.get('/policy/:id', async (c) => {
   const ctx = ctxOf(c);
   const id = numericId(c.req.param('id'), (v) => ctx.codec.decodePolicyID(v));
-  if (id === null) return c.json(fail(c, new AppError(40035, 'Policy not found')) as never);
+  if (id === null) return fail(c, new AppError(40035, 'Policy not found'));
 
   const policy = await ctx.policies.byId(id);
-  if (!policy) return c.json(fail(c, new AppError(40035, 'Policy not found')) as never);
+  if (!policy) return fail(c, new AppError(40035, 'Policy not found'));
 
   const extras: Parameters<typeof policyToResponse>[2] = {
     groups: await policyGroups(ctx, id),
@@ -540,7 +540,7 @@ adminRoutes.get('/policy/:id', async (c) => {
     extras.entitiesSize = stats.size;
   }
 
-  return c.json(ok(c, policyToResponse(ctx.codec, policy, extras)) as never);
+  return ok(c, policyToResponse(ctx.codec, policy, extras));
 });
 
 /**
@@ -568,7 +568,7 @@ adminRoutes.put('/policy', async (c) => {
   const raw = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
   const body = unwrapBody<Record<string, unknown>>(raw, 'policy');
   if (!body.name || !body.type) {
-    return c.json(fail(c, Err.param('name and type are required')) as never);
+    return fail(c, Err.param('name and type are required'));
   }
   const type = String(body.type);
   if (!isPolicyTypeSupported(type)) {
@@ -578,18 +578,18 @@ adminRoutes.put('/policy', async (c) => {
   }
   try {
     const policy = await ctx.policies.create(policyCreateArgs(body, type));
-    return c.json(ok(c, policyToResponse(ctx.codec, policy)) as never);
+    return ok(c, policyToResponse(ctx.codec, policy));
   } catch (e) {
-    return c.json(fail(c, e) as never);
+    return fail(c, e);
   }
 });
 
 adminRoutes.put('/policy/:id', async (c) => {
   const ctx = ctxOf(c);
   const id = numericId(c.req.param('id'), (v) => ctx.codec.decodePolicyID(v));
-  if (id === null) return c.json(fail(c, new AppError(40035, 'Policy not found')) as never);
+  if (id === null) return fail(c, new AppError(40035, 'Policy not found'));
   const policy = await ctx.policies.byId(id);
-  if (!policy) return c.json(fail(c, new AppError(40035, 'Policy not found')) as never);
+  if (!policy) return fail(c, new AppError(40035, 'Policy not found'));
 
   const raw = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
   const body = unwrapBody<Record<string, unknown>>(raw, 'policy');
@@ -632,30 +632,30 @@ adminRoutes.put('/policy/:id', async (c) => {
       ok(c, policyToResponse(ctx.codec, updated!, { groups: await policyGroups(ctx, id) })) as never,
     );
   } catch (e) {
-    return c.json(fail(c, e) as never);
+    return fail(c, e);
   }
 });
 
 adminRoutes.delete('/policy/:id', async (c) => {
   const ctx = ctxOf(c);
   const id = numericId(c.req.param('id'), (v) => ctx.codec.decodePolicyID(v));
-  if (id === null) return c.json(fail(c, new AppError(40035, 'Policy not found')) as never);
+  if (id === null) return fail(c, new AppError(40035, 'Policy not found'));
 
   // 默认策略（id=1）禁止删除，与上游 `SingleStoragePolicyService.Delete` 一致
   if (id === 1) {
-    return c.json(fail(c, new AppError(40036, 'Cannot delete the default storage policy')) as never);
+    return fail(c, new AppError(40036, 'Cannot delete the default storage policy'));
   }
 
   const fileCount = await ctx.policies.countFiles(id);
   if (fileCount > 0) {
-    return c.json(fail(c, new AppError(40037, 'This policy still has files')) as never);
+    return fail(c, new AppError(40037, 'This policy still has files'));
   }
   const groupCount = await ctx.policies.countGroups(id);
   if (groupCount > 0) {
-    return c.json(fail(c, new AppError(40038, 'This policy is bound to user groups')) as never);
+    return fail(c, new AppError(40038, 'This policy is bound to user groups'));
   }
   await ctx.policies.softDelete(id);
-  return c.json(ok(c) as never);
+  return ok(c);
 });
 
 // ---------------------------------------------------------------------------
@@ -695,7 +695,7 @@ adminRoutes.post('/policy/cors', async (c) => {
 /** 获取 OAuth 回调地址。对应 `AdminGetPolicyOAuthCallbackURL`。 */
 adminRoutes.get('/policy/oauth/redirect', async (c) => {
   const ctx = ctxOf(c);
-  return c.json(ok(c, oauthCallbackUrlFor(ctx.settings.siteUrl)) as never);
+  return ok(c, oauthCallbackUrlFor(ctx.settings.siteUrl));
 });
 
 /**
@@ -715,12 +715,12 @@ adminRoutes.post('/policy/oauth/signin', async (c) => {
 
   const id = Number(body.id);
   if (!Number.isFinite(id) || id <= 0) {
-    return c.json(fail(c, Err.param('Invalid policy ID')) as never);
+    return fail(c, Err.param('Invalid policy ID'));
   }
 
   const policy = await ctx.policies.byId(id);
   if (!policy || policy.type !== 'onedrive') {
-    return c.json(fail(c, new AppError(40035, 'Policy not found')) as never);
+    return fail(c, new AppError(40035, 'Policy not found'));
   }
 
   const redirect = oauthCallbackUrlFor(ctx.settings.siteUrl);
@@ -738,9 +738,9 @@ adminRoutes.post('/policy/oauth/signin', async (c) => {
     const { OneDriveDriver } = await import('../storage/onedrive');
     const driver = new OneDriveDriver(ctx.env, updated!);
     // scope 与上游一致
-    return c.json(ok(c, driver.authorizeUrl(['offline_access', 'files.readwrite.all'])) as never);
+    return ok(c, driver.authorizeUrl(['offline_access', 'files.readwrite.all']));
   } catch (e) {
-    return c.json(fail(c, e) as never);
+    return fail(c, e);
   }
 });
 
@@ -748,19 +748,19 @@ adminRoutes.post('/policy/oauth/signin', async (c) => {
 adminRoutes.get('/policy/oauth/status/:id', async (c) => {
   const ctx = ctxOf(c);
   const id = numericId(c.req.param('id'), (v) => ctx.codec.decodePolicyID(v));
-  if (id === null) return c.json(fail(c, new AppError(40035, 'Policy not found')) as never);
+  if (id === null) return fail(c, new AppError(40035, 'Policy not found'));
 
   const policy = await ctx.policies.byId(id);
   if (!policy || policy.type !== 'onedrive') {
-    return c.json(fail(c, new AppError(40035, 'Policy not found')) as never);
+    return fail(c, new AppError(40035, 'Policy not found'));
   }
 
   try {
     const { OneDriveDriver } = await import('../storage/onedrive');
     const status = await new OneDriveDriver(ctx.env, policy).credentialStatus();
-    return c.json(ok(c, status) as never);
+    return ok(c, status);
   } catch (e) {
-    return c.json(fail(c, e) as never);
+    return fail(c, e);
   }
 });
 
@@ -776,27 +776,27 @@ adminRoutes.post('/policy/oauth/callback', async (c) => {
   const ctx = ctxOf(c);
   const body = (await c.req.json().catch(() => ({}))) as { code?: unknown; state?: unknown };
   if (!body.code || !body.state) {
-    return c.json(fail(c, Err.param('code and state are required')) as never);
+    return fail(c, Err.param('code and state are required'));
   }
 
   const id = Number(body.state);
   if (!Number.isFinite(id) || id <= 0) {
-    return c.json(fail(c, Err.param('Invalid state')) as never);
+    return fail(c, Err.param('Invalid state'));
   }
 
   const policy = await ctx.policies.byId(id);
-  if (!policy) return c.json(fail(c, new AppError(40035, 'Policy not found')) as never);
+  if (!policy) return fail(c, new AppError(40035, 'Policy not found'));
   if (policy.type !== 'onedrive') {
-    return c.json(fail(c, Err.param('Invalid policy type')) as never);
+    return fail(c, Err.param('Invalid policy type'));
   }
 
   try {
     const { OneDriveDriver } = await import('../storage/onedrive');
     const credential = await new OneDriveDriver(ctx.env, policy).exchangeCode(String(body.code));
     await ctx.policies.update(id, {}, { accessKey: credential.refresh_token });
-    return c.json(ok(c) as never);
+    return ok(c);
   } catch (e) {
-    return c.json(fail(c, Err.param(e instanceof Error ? e.message : String(e))) as never);
+    return fail(c, Err.param(e instanceof Error ? e.message : String(e)));
   }
 });
 
@@ -807,23 +807,23 @@ adminRoutes.post('/policy/oauth/callback', async (c) => {
 adminRoutes.get('/policy/oauth/root/:id', async (c) => {
   const ctx = ctxOf(c);
   const id = numericId(c.req.param('id'), (v) => ctx.codec.decodePolicyID(v));
-  if (id === null) return c.json(fail(c, new AppError(40035, 'Policy not found')) as never);
+  if (id === null) return fail(c, new AppError(40035, 'Policy not found'));
 
   const policy = await ctx.policies.byId(id);
-  if (!policy) return c.json(fail(c, new AppError(40035, 'Policy not found')) as never);
+  if (!policy) return fail(c, new AppError(40035, 'Policy not found'));
   if (policy.type !== 'onedrive') {
-    return c.json(fail(c, Err.param('Invalid policy type')) as never);
+    return fail(c, Err.param('Invalid policy type'));
   }
 
   const url = c.req.query('url');
-  if (!url) return c.json(fail(c, Err.param('url is required')) as never);
+  if (!url) return fail(c, Err.param('url is required'));
 
   try {
     const { OneDriveDriver } = await import('../storage/onedrive');
     const root = await new OneDriveDriver(ctx.env, policy).getSiteIdByUrl(url);
-    return c.json(ok(c, root) as never);
+    return ok(c, root);
   } catch (e) {
-    return c.json(fail(c, e) as never);
+    return fail(c, e);
   }
 });
 
@@ -835,16 +835,16 @@ adminRoutes.get('/policy/oauth/root/:id', async (c) => {
 adminRoutes.get('/policy/:id/oauth', async (c) => {
   const ctx = ctxOf(c);
   const id = numericId(c.req.param('id'), (v) => ctx.codec.decodePolicyID(v));
-  if (id === null) return c.json(fail(c, new AppError(40035, 'Policy not found')) as never);
+  if (id === null) return fail(c, new AppError(40035, 'Policy not found'));
   const policy = await ctx.policies.byId(id);
-  if (!policy) return c.json(fail(c, new AppError(40035, 'Policy not found')) as never);
+  if (!policy) return fail(c, new AppError(40035, 'Policy not found'));
   if (policy.type !== 'onedrive') {
-    return c.json(fail(c, Err.param('Policy is not an OneDrive policy')) as never);
+    return fail(c, Err.param('Policy is not an OneDrive policy'));
   }
 
   const { OneDriveDriver } = await import('../storage/onedrive');
   const driver = new OneDriveDriver(ctx.env, policy);
-  return c.json(ok(c, driver.authorizeUrl(['offline_access', 'files.readwrite.all'])) as never);
+  return ok(c, driver.authorizeUrl(['offline_access', 'files.readwrite.all']));
 });
 
 
@@ -866,16 +866,16 @@ adminRoutes.post('/tool/mail', async (c) => {
     to?: string;
   };
 
-  if (!body.to) return c.json(fail(c, Err.param('Recipient is required')) as never);
+  if (!body.to) return fail(c, Err.param('Recipient is required'));
   if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(body.to)) {
-    return c.json(fail(c, Err.param('Invalid email address')) as never);
+    return fail(c, Err.param('Invalid email address'));
   }
 
   try {
     await new MailService(ctx).sendTestEmail(body.to, body.settings ?? {});
-    return c.json(ok(c) as never);
+    return ok(c);
   } catch (e) {
-    return c.json(fail(c, e) as never);
+    return fail(c, e);
   }
 });
 
@@ -886,7 +886,7 @@ adminRoutes.post('/tool/mail', async (c) => {
  * （每次现算，见 `services/download.ts`），因此这里确实是无事可做 ——
  * 返回成功是如实回答，不是假装。
  */
-adminRoutes.delete('/tool/entityUrlCache', async (c) => c.json(ok(c) as never));
+adminRoutes.delete('/tool/entityUrlCache', async (c) => ok(c));
 
 // ---------------------------------------------------------------------------
 // 未实现的工具端点
@@ -899,7 +899,7 @@ const NOT_IMPLEMENTED_ADMIN: Record<string, string> = {
 
 for (const [path, message] of Object.entries(NOT_IMPLEMENTED_ADMIN)) {
   adminRoutes.all(path, (c) =>
-    c.json(fail(c, new AppError(CodeFeatureNotEnabled, message)) as never),
+    fail(c, new AppError(CodeFeatureNotEnabled, message)),
   );
 }
 

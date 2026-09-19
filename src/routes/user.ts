@@ -43,21 +43,21 @@ userRoutes.post('/', async (c) => {
   };
 
   if (!ctx.settings.registerEnabled) {
-    return c.json(fail(c, new AppError(40019, 'Registration is not enabled')) as never);
+    return fail(c, new AppError(40019, 'Registration is not enabled'));
   }
   if (!body.email || !body.password) {
-    return c.json(fail(c, Err.param('Email and password are required')) as never);
+    return fail(c, Err.param('Email and password are required'));
   }
   if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(body.email)) {
-    return c.json(fail(c, Err.param('Invalid email address')) as never);
+    return fail(c, Err.param('Invalid email address'));
   }
   if (body.password.length < 6 || body.password.length > 128) {
-    return c.json(fail(c, Err.param('Password length must be between 6 and 128')) as never);
+    return fail(c, Err.param('Password length must be between 6 and 128'));
   }
   if (ctx.settings.regCaptcha) {
     const passed = await verifyCaptcha(c.env, body.ticket, body.captcha);
     if (!passed) {
-      return c.json(fail(c, new AppError(40026, 'CAPTCHA verification failed')) as never);
+      return fail(c, new AppError(40026, 'CAPTCHA verification failed'));
     }
   }
 
@@ -67,44 +67,44 @@ userRoutes.post('/', async (c) => {
     switch (result.kind) {
       case 'needActivation':
         // 需要邮件激活 → 203（原版 CodeNotFullySuccess）
-        return c.json(okWithCode(c, CodeNotFullySuccess) as never);
+        return okWithCode(c, CodeNotFullySuccess);
       case 'resent':
         // 邮箱已存在但未激活，激活邮件已重发 → 40033（原版 CodeEmailSent）
-        return c.json(fail(c, new AppError(CodeEmailSent, result.msg)) as never);
+        return fail(c, new AppError(CodeEmailSent, result.msg));
       default:
-        return c.json(ok(c, result.user) as never);
+        return ok(c, result.user);
     }
   } catch (e) {
-    return c.json(fail(c, e) as never);
+    return fail(c, e);
   }
 });
 
 /** 当前用户 */
 userRoutes.get('/me', async (c) => {
   const ctx = ctxOf(c);
-  if (!ctx.user) return c.json(fail(c, Err.loginRequired()) as never);
-  return c.json(ok(c, await new UserService(ctx).buildUserResponse(ctx.user, true)) as never);
+  if (!ctx.user) return fail(c, Err.loginRequired());
+  return ok(c, await new UserService(ctx).buildUserResponse(ctx.user, true));
 });
 
 /** 指定用户（脱敏） */
 userRoutes.get('/info/:id', async (c) => {
   const ctx = ctxOf(c);
   const uid = ctx.codec.decodeUserID(c.req.param('id'));
-  if (uid === null) return c.json(fail(c, Err.userNotFound()) as never);
+  if (uid === null) return fail(c, Err.userNotFound());
   const user = await ctx.users.byId(uid);
-  if (!user) return c.json(fail(c, Err.userNotFound()) as never);
+  if (!user) return fail(c, Err.userNotFound());
 
   const self = ctx.user?.id === uid;
   const service = new UserService(ctx);
   const res = await service.buildUserResponse(user, self);
   if (!self) res.avatar = service.buildAvatarUrl(user);
-  return c.json(ok(c, res) as never);
+  return ok(c, res);
 });
 
 /** 容量 */
 userRoutes.get('/capacity', async (c) => {
   const ctx = ctxOf(c);
-  if (!ctx.user) return c.json(fail(c, Err.loginRequired()) as never);
+  if (!ctx.user) return fail(c, Err.loginRequired());
   const capacity = await new UserService(ctx).capacity();
   return c.json(
     ok(c, {
@@ -122,7 +122,7 @@ userRoutes.get('/avatar/:id', async (c) => {
     // 没有上传过头像时重定向到 gravatar（原版行为）
     const uid = ctx.codec.decodeUserID(c.req.param('id'));
     const user = uid !== null ? await ctx.users.byId(uid) : null;
-    if (!user) return c.json(fail(c, Err.userNotFound()) as never);
+    if (!user) return fail(c, Err.userNotFound());
     return c.redirect(new UserService(ctx).buildAvatarUrl(user), 302);
   }
   return new Response(avatar.body, {
@@ -136,7 +136,7 @@ userRoutes.get('/avatar/:id', async (c) => {
 /** 用户设置 */
 userRoutes.get('/setting', async (c) => {
   const ctx = ctxOf(c);
-  if (!ctx.user) return c.json(fail(c, Err.loginRequired()) as never);
+  if (!ctx.user) return fail(c, Err.loginRequired());
   const settings = ctx.user.settings ?? {};
   return c.json(
     ok(c, {
@@ -157,7 +157,7 @@ userRoutes.get('/setting', async (c) => {
 
 userRoutes.patch('/setting', async (c) => {
   const ctx = ctxOf(c);
-  if (!ctx.user) return c.json(fail(c, Err.loginRequired()) as never);
+  if (!ctx.user) return fail(c, Err.loginRequired());
   const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
   try {
     const res = await new UserService(ctx).updateSettings({
@@ -174,9 +174,9 @@ userRoutes.patch('/setting', async (c) => {
       two_fa_enabled: body.two_fa_enabled as boolean | undefined,
       two_fa_code: body.two_fa_code as string | undefined,
     });
-    return c.json(ok(c, res) as never);
+    return ok(c, res);
   } catch (e) {
-    return c.json(fail(c, e) as never);
+    return fail(c, e);
   }
 });
 
@@ -189,11 +189,11 @@ userRoutes.patch('/setting', async (c) => {
  */
 userRoutes.get('/setting/2fa', async (c) => {
   const ctx = ctxOf(c);
-  if (!ctx.user) return c.json(fail(c, Err.loginRequired()) as never);
+  if (!ctx.user) return fail(c, Err.loginRequired());
   try {
-    return c.json(ok(c, await new UserService(ctx).init2FA()) as never);
+    return ok(c, await new UserService(ctx).init2FA());
   } catch (e) {
-    return c.json(fail(c, e) as never);
+    return fail(c, e);
   }
 });
 
@@ -207,21 +207,21 @@ userRoutes.get('/setting/2fa', async (c) => {
  */
 userRoutes.put('/authn', async (c) => {
   const ctx = ctxOf(c);
-  if (!ctx.user) return c.json(fail(c, Err.loginRequired()) as never);
+  if (!ctx.user) return fail(c, Err.loginRequired());
   const service = new PasskeyService(ctx, c.env, ctx.codec);
   try {
-    return c.json(ok(c, await service.prepareRegister(ctx.user)) as never);
+    return ok(c, await service.prepareRegister(ctx.user));
   } catch (e) {
-    return c.json(fail(c, e) as never);
+    return fail(c, e);
   }
 });
 
 userRoutes.post('/authn', async (c) => {
   const ctx = ctxOf(c);
-  if (!ctx.user) return c.json(fail(c, Err.loginRequired()) as never);
+  if (!ctx.user) return fail(c, Err.loginRequired());
   const body = (await c.req.json().catch(() => ({}))) as { response?: string; name?: string };
   if (!body.response || !body.name) {
-    return c.json(fail(c, Err.param('response and name are required')) as never);
+    return fail(c, Err.param('response and name are required'));
   }
   const service = new PasskeyService(ctx, c.env, ctx.codec);
   try {
@@ -229,38 +229,38 @@ userRoutes.post('/authn', async (c) => {
       ok(c, await service.finishRegister(ctx.user, { response: body.response, name: body.name })) as never,
     );
   } catch (e) {
-    return c.json(fail(c, e) as never);
+    return fail(c, e);
   }
 });
 
 userRoutes.delete('/authn', async (c) => {
   const ctx = ctxOf(c);
-  if (!ctx.user) return c.json(fail(c, Err.loginRequired()) as never);
+  if (!ctx.user) return fail(c, Err.loginRequired());
   const credentialId = c.req.query('id');
-  if (!credentialId) return c.json(fail(c, Err.param('id is required')) as never);
+  if (!credentialId) return fail(c, Err.param('id is required'));
   const service = new PasskeyService(ctx, c.env, ctx.codec);
   try {
     await service.remove(ctx.user, credentialId);
-    return c.json(ok(c) as never);
+    return ok(c);
   } catch (e) {
-    return c.json(fail(c, e) as never);
+    return fail(c, e);
   }
 });
 
 /** 上传头像 */
 userRoutes.put('/setting/avatar', async (c) => {
   const ctx = ctxOf(c);
-  if (!ctx.user) return c.json(fail(c, Err.loginRequired()) as never);
+  if (!ctx.user) return fail(c, Err.loginRequired());
   const contentType = c.req.header('Content-Type') ?? 'application/octet-stream';
   if (!contentType.startsWith('image/')) {
-    return c.json(fail(c, Err.param('Avatar must be an image')) as never);
+    return fail(c, Err.param('Avatar must be an image'));
   }
   const body = await c.req.arrayBuffer();
   try {
     await new UserService(ctx).uploadAvatar(body, contentType);
-    return c.json(ok(c) as never);
+    return ok(c);
   } catch (e) {
-    return c.json(fail(c, e) as never);
+    return fail(c, e);
   }
 });
 
@@ -268,17 +268,17 @@ userRoutes.put('/setting/avatar', async (c) => {
 userRoutes.get('/shares/:id', async (c) => {
   const ctx = ctxOf(c);
   const uid = ctx.codec.decodeUserID(c.req.param('id'));
-  if (uid === null) return c.json(fail(c, Err.userNotFound()) as never);
+  if (uid === null) return fail(c, Err.userNotFound());
   const user = await ctx.users.byId(uid);
-  if (!user) return c.json(fail(c, Err.userNotFound()) as never);
+  if (!user) return fail(c, Err.userNotFound());
 
   const settings = user.settings ?? {};
   // 用户可以选择隐藏公开分享（原版 ProfileHideShare）
   if (settings.share_links_in_profile === 'hide_share') {
-    return c.json(ok(c, { shares: [], pagination: { page: 0, page_size: 0, total_items: 0 } }) as never);
+    return ok(c, { shares: [], pagination: { page: 0, page_size: 0, total_items: 0 } });
   }
   if (settings.profile_off) {
-    return c.json(fail(c, new AppError(404, 'Profile is disabled')) as never);
+    return fail(c, new AppError(404, 'Profile is disabled'));
   }
 
   const pageSize = Math.min(Number(c.req.query('page_size') ?? 20) || 20, 100);
@@ -298,7 +298,7 @@ userRoutes.get('/shares/:id', async (c) => {
     publicOnly,
   });
 
-  return c.json(ok(c, res) as never);
+  return ok(c, res);
 });
 
 /**
@@ -308,10 +308,10 @@ userRoutes.get('/shares/:id', async (c) => {
  */
 userRoutes.get('/search', async (c) => {
   const ctx = ctxOf(c);
-  if (!ctx.user) return c.json(fail(c, Err.loginRequired()) as never);
+  if (!ctx.user) return fail(c, Err.loginRequired());
   const keyword = (c.req.query('keyword') ?? '').trim();
   if (keyword.length < 2) {
-    return c.json(fail(c, Err.param('keyword must be at least 2 characters')) as never);
+    return fail(c, Err.param('keyword must be at least 2 characters'));
   }
   try {
     const users = await ctx.users.searchActive(keyword, 10);
@@ -329,7 +329,7 @@ userRoutes.get('/search', async (c) => {
       ) as never,
     );
   } catch (e) {
-    return c.json(fail(c, e) as never);
+    return fail(c, e);
   }
 });
 
@@ -349,20 +349,20 @@ userRoutes.post('/reset', async (c) => {
   };
 
   if (!body.email) {
-    return c.json(fail(c, Err.param('Email is required')) as never);
+    return fail(c, Err.param('Email is required'));
   }
   if (ctx.settings.forgetCaptcha) {
     const passed = await verifyCaptcha(c.env, body.ticket, body.captcha);
     if (!passed) {
-      return c.json(fail(c, new AppError(40026, 'CAPTCHA verification failed')) as never);
+      return fail(c, new AppError(40026, 'CAPTCHA verification failed'));
     }
   }
 
   try {
     await new UserService(ctx).sendResetEmail(body.email);
-    return c.json(ok(c) as never);
+    return ok(c);
   } catch (e) {
-    return c.json(fail(c, e) as never);
+    return fail(c, e);
   }
 });
 
@@ -371,13 +371,13 @@ userRoutes.patch('/reset/:id', async (c) => {
   const ctx = ctxOf(c);
   const body = (await c.req.json().catch(() => ({}))) as { password?: string; secret?: string };
   if (!body.password || !body.secret) {
-    return c.json(fail(c, Err.param('password and secret are required')) as never);
+    return fail(c, Err.param('password and secret are required'));
   }
   try {
     const res = await new UserService(ctx).resetPassword(c.req.param('id'), body.secret, body.password);
-    return c.json(ok(c, res) as never);
+    return ok(c, res);
   } catch (e) {
-    return c.json(fail(c, e) as never);
+    return fail(c, e);
   }
 });
 
@@ -400,8 +400,8 @@ userRoutes.get('/activate/:id', async (c) => {
       c.req.query('sign') ?? '',
       `/api/v4/user/activate/${id}`,
     );
-    return c.json(ok(c, res) as never);
+    return ok(c, res);
   } catch (e) {
-    return c.json(fail(c, e) as never);
+    return fail(c, e);
   }
 });

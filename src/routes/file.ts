@@ -54,13 +54,13 @@ fileRoutes.get('/', async (c) => {
   const ctx = ctxOf(c);
 
   const rawUri = c.req.query('uri');
-  if (!rawUri) return c.json(fail(c, Err.param('uri is required')) as never);
+  if (!rawUri) return fail(c, Err.param('uri is required'));
 
   let uri: URI;
   try {
     uri = URI.parse(rawUri);
   } catch {
-    return c.json(fail(c, Err.param('Invalid uri')) as never);
+    return fail(c, Err.param('Invalid uri'));
   }
 
   // 这里**不能**一刀切要求登录：匿名访问分享目录是合法路径（原版靠匿名用户组放行，
@@ -80,9 +80,9 @@ fileRoutes.get('/', async (c) => {
   try {
     const service = new FileSystemService(ctx);
     const res = await service.list(uri, { page, pageSize, orderBy, orderDirection, typeFilter });
-    return c.json(ok(c, res) as never);
+    return ok(c, res);
   } catch (e) {
-    return c.json(fail(c, e) as never);
+    return fail(c, e);
   }
 });
 
@@ -112,13 +112,13 @@ fileRoutes.get('/info', async (c) => {
         : URI.my(await service.pathOf(target));
       file = await service.mustResolve(backUri);
     } else {
-      return c.json(fail(c, Err.param('uri or id is required')) as never);
+      return fail(c, Err.param('uri or id is required'));
     }
     return c.json(
       ok(c, await service.buildFileResponse(file, { extended, folderSummary: wantSummary })) as never,
     );
   } catch (e) {
-    return c.json(fail(c, e) as never);
+    return fail(c, e);
   }
 });
 
@@ -128,56 +128,56 @@ fileRoutes.get('/info', async (c) => {
 
 fileRoutes.post('/create', async (c) => {
   const ctx = ctxOf(c);
-  if (!ctx.user) return c.json(fail(c, Err.loginRequired()) as never);
+  if (!ctx.user) return fail(c, Err.loginRequired());
   const body = (await c.req.json().catch(() => ({}))) as {
     uri?: string;
     type?: string;
     metadata?: Record<string, string>;
     err_on_conflict?: boolean;
   };
-  if (!body.uri || !body.type) return c.json(fail(c, Err.param('uri and type are required')) as never);
+  if (!body.uri || !body.type) return fail(c, Err.param('uri and type are required'));
   if (body.type !== 'file' && body.type !== 'folder') {
-    return c.json(fail(c, Err.param('type must be "file" or "folder"')) as never);
+    return fail(c, Err.param('type must be "file" or "folder"'));
   }
   try {
     const res = await new FileSystemService(ctx).create(URI.parse(body.uri), body.type, {
       metadata: body.metadata,
       errOnConflict: body.err_on_conflict,
     });
-    return c.json(ok(c, res) as never);
+    return ok(c, res);
   } catch (e) {
-    return c.json(fail(c, e) as never);
+    return fail(c, e);
   }
 });
 
 fileRoutes.post('/rename', async (c) => {
   const ctx = ctxOf(c);
-  if (!ctx.user) return c.json(fail(c, Err.loginRequired()) as never);
+  if (!ctx.user) return fail(c, Err.loginRequired());
   const body = (await c.req.json().catch(() => ({}))) as { uri?: string; new_name?: string };
   if (!body.uri || !body.new_name) {
-    return c.json(fail(c, Err.param('uri and new_name are required')) as never);
+    return fail(c, Err.param('uri and new_name are required'));
   }
   try {
     const res = await new FileSystemService(ctx).rename(URI.parse(body.uri), body.new_name);
-    return c.json(ok(c, res) as never);
+    return ok(c, res);
   } catch (e) {
-    return c.json(fail(c, e) as never);
+    return fail(c, e);
   }
 });
 
 fileRoutes.post('/move', async (c) => {
   const ctx = ctxOf(c);
-  if (!ctx.user) return c.json(fail(c, Err.loginRequired()) as never);
+  if (!ctx.user) return fail(c, Err.loginRequired());
   const body = (await c.req.json().catch(() => ({}))) as {
     uris?: string[];
     dst?: string;
     copy?: boolean;
   };
   if (!body.uris?.length || !body.dst) {
-    return c.json(fail(c, Err.param('uris and dst are required')) as never);
+    return fail(c, Err.param('uris and dst are required'));
   }
   if (body.uris.length > ctx.settings.maxBatchedFile) {
-    return c.json(fail(c, new AppError(40074, 'Too many uris')) as never);
+    return fail(c, new AppError(40074, 'Too many uris'));
   }
   try {
     const service = new FileSystemService(ctx);
@@ -186,9 +186,9 @@ fileRoutes.post('/move', async (c) => {
       URI.parse(body.dst),
       body.copy === true,
     );
-    return c.json(ok(c) as never);
+    return ok(c);
   } catch (e) {
-    return c.json(fail(c, e) as never);
+    return fail(c, e);
   }
 });
 
@@ -205,7 +205,7 @@ fileRoutes.post('/url', async (c) => {
     entity?: string;
     no_cache?: boolean;
   };
-  if (!body.uris?.length) return c.json(fail(c, Err.param('uris is required')) as never);
+  if (!body.uris?.length) return fail(c, Err.param('uris is required'));
 
   try {
     const service = new FileSystemService(ctx);
@@ -219,22 +219,22 @@ fileRoutes.post('/url', async (c) => {
     if (body.redirect && body.uris.length === 1 && res.urls[0]) {
       return c.redirect(res.urls[0].url, 302);
     }
-    return c.json(ok(c, res) as never);
+    return ok(c, res);
   } catch (e) {
-    return c.json(fail(c, e) as never);
+    return fail(c, e);
   }
 });
 
 fileRoutes.get('/thumb', async (c) => {
   const ctx = ctxOf(c);
   const rawUri = c.req.query('uri');
-  if (!rawUri) return c.json(fail(c, Err.param('uri is required')) as never);
+  if (!rawUri) return fail(c, Err.param('uri is required'));
   try {
     const service = new FileSystemService(ctx);
     const download = new DownloadService(ctx, service);
-    return c.json(ok(c, await download.thumb(URI.parse(rawUri))) as never);
+    return ok(c, await download.thumb(URI.parse(rawUri)));
   } catch (e) {
-    return c.json(fail(c, e) as never);
+    return fail(c, e);
   }
 });
 
@@ -253,18 +253,18 @@ const serveContent = async (c: AppRequest) => {
   if (!sign) {
     const authHeader = c.req.header('Authorization');
     if (!authHeader?.startsWith('Bearer Cr ')) {
-      return c.json(fail(c, new AppError(403, 'authorization header is missing')) as never);
+      return fail(c, new AppError(403, 'authorization header is missing'));
     }
     try {
       await ctx.signer.check(url.pathname, authHeader.slice('Bearer Cr '.length));
     } catch (e) {
-      return c.json(fail(c, e) as never);
+      return fail(c, e);
     }
   } else {
     try {
       await ctx.signer.check(url.pathname, sign);
     } catch (e) {
-      return c.json(fail(c, e) as never);
+      return fail(c, e);
     }
   }
 
@@ -294,7 +294,7 @@ const serveContent = async (c: AppRequest) => {
       headers,
     });
   } catch (e) {
-    return c.json(fail(c, e) as never);
+    return fail(c, e);
   }
 };
 
@@ -317,12 +317,12 @@ fileRoutes.options('/content/*', (c) => {
 /** 覆盖文件内容（PUT 原始字节流） */
 fileRoutes.put('/content', async (c) => {
   const ctx = ctxOf(c);
-  if (!ctx.user) return c.json(fail(c, Err.loginRequired()) as never);
+  if (!ctx.user) return fail(c, Err.loginRequired());
   const rawUri = c.req.query('uri');
-  if (!rawUri) return c.json(fail(c, Err.param('uri is required')) as never);
+  if (!rawUri) return fail(c, Err.param('uri is required'));
 
   const body = c.req.raw.body;
-  if (!body) return c.json(fail(c, Err.param('Request body is required')) as never);
+  if (!body) return fail(c, Err.param('Request body is required'));
 
   try {
     const service = new FileSystemService(ctx);
@@ -334,9 +334,9 @@ fileRoutes.put('/content', async (c) => {
       Number(c.req.header('Content-Length') ?? 0),
       c.req.header('Content-Type') ?? '',
     );
-    return c.json(ok(c) as never);
+    return ok(c);
   } catch (e) {
-    return c.json(fail(c, e) as never);
+    return fail(c, e);
   }
 });
 
@@ -346,53 +346,53 @@ fileRoutes.put('/content', async (c) => {
 
 fileRoutes.delete('/', async (c) => {
   const ctx = ctxOf(c);
-  if (!ctx.user) return c.json(fail(c, Err.loginRequired()) as never);
+  if (!ctx.user) return fail(c, Err.loginRequired());
   const body = (await c.req.json().catch(() => ({}))) as {
     uris?: string[];
     unlink?: boolean;
     skip_soft_delete?: boolean;
   };
-  if (!body.uris?.length) return c.json(fail(c, Err.param('uris is required')) as never);
+  if (!body.uris?.length) return fail(c, Err.param('uris is required'));
   if (body.uris.length > ctx.settings.maxBatchedFile) {
-    return c.json(fail(c, new AppError(40074, 'Too many uris')) as never);
+    return fail(c, new AppError(40074, 'Too many uris'));
   }
   try {
     await new FileSystemService(ctx).delete(
       body.uris.map((u) => URI.parse(u)),
       { unlinkOnly: body.unlink, skipSoftDelete: body.skip_soft_delete },
     );
-    return c.json(ok(c) as never);
+    return ok(c);
   } catch (e) {
-    return c.json(fail(c, e) as never);
+    return fail(c, e);
   }
 });
 
 fileRoutes.post('/restore', async (c) => {
   const ctx = ctxOf(c);
-  if (!ctx.user) return c.json(fail(c, Err.loginRequired()) as never);
+  if (!ctx.user) return fail(c, Err.loginRequired());
   const body = (await c.req.json().catch(() => ({}))) as { uris?: string[] };
-  if (!body.uris?.length) return c.json(fail(c, Err.param('uris is required')) as never);
+  if (!body.uris?.length) return fail(c, Err.param('uris is required'));
   try {
     await new FileSystemService(ctx).restore(body.uris.map((u) => URI.parse(u)));
-    return c.json(ok(c) as never);
+    return ok(c);
   } catch (e) {
-    return c.json(fail(c, e) as never);
+    return fail(c, e);
   }
 });
 
 fileRoutes.delete('/trash', async (c) => {
   const ctx = ctxOf(c);
-  if (!ctx.user) return c.json(fail(c, Err.loginRequired()) as never);
+  if (!ctx.user) return fail(c, Err.loginRequired());
   try {
     await new FileSystemService(ctx).emptyTrash();
-    return c.json(ok(c) as never);
+    return ok(c);
   } catch (e) {
-    return c.json(fail(c, e) as never);
+    return fail(c, e);
   }
 });
 
 /** 强制解锁（边缘版没有文件锁，直接成功） */
-fileRoutes.delete('/lock', async (c) => c.json(ok(c) as never));
+fileRoutes.delete('/lock', async (c) => ok(c));
 
 // ---------------------------------------------------------------------------
 // 元数据与视图
@@ -400,13 +400,13 @@ fileRoutes.delete('/lock', async (c) => c.json(ok(c) as never));
 
 fileRoutes.patch('/metadata', async (c) => {
   const ctx = ctxOf(c);
-  if (!ctx.user) return c.json(fail(c, Err.loginRequired()) as never);
+  if (!ctx.user) return fail(c, Err.loginRequired());
   const body = (await c.req.json().catch(() => ({}))) as {
     uris?: string[];
     patches?: { key: string; value?: string; private?: boolean; remove?: boolean }[];
   };
   if (!body.uris?.length || !body.patches?.length) {
-    return c.json(fail(c, Err.param('uris and patches are required')) as never);
+    return fail(c, Err.param('uris and patches are required'));
   }
   try {
     const service = new FileSystemService(ctx);
@@ -421,29 +421,29 @@ fileRoutes.patch('/metadata', async (c) => {
         }
       }
     }
-    return c.json(ok(c) as never);
+    return ok(c);
   } catch (e) {
-    return c.json(fail(c, e) as never);
+    return fail(c, e);
   }
 });
 
 fileRoutes.patch('/view', async (c) => {
   const ctx = ctxOf(c);
-  if (!ctx.user) return c.json(fail(c, Err.loginRequired()) as never);
+  if (!ctx.user) return fail(c, Err.loginRequired());
   const body = (await c.req.json().catch(() => ({}))) as {
     uri?: string;
     view?: Record<string, unknown>;
   };
-  if (!body.uri) return c.json(fail(c, Err.param('uri is required')) as never);
+  if (!body.uri) return fail(c, Err.param('uri is required'));
   try {
     const service = new FileSystemService(ctx);
     const file = await service.mustResolve(URI.parse(body.uri));
     const props = { ...(file.props ?? {}) };
     if (body.view) props.view = body.view as never;
     await ctx.files.patchProps(file.id, props as Record<string, unknown>);
-    return c.json(ok(c) as never);
+    return ok(c);
   } catch (e) {
-    return c.json(fail(c, e) as never);
+    return fail(c, e);
   }
 });
 
@@ -453,7 +453,7 @@ fileRoutes.patch('/view', async (c) => {
 
 fileRoutes.put('/upload', async (c) => {
   const ctx = ctxOf(c);
-  if (!ctx.user) return c.json(fail(c, Err.loginRequired()) as never);
+  if (!ctx.user) return fail(c, Err.loginRequired());
   const body = (await c.req.json().catch(() => ({}))) as {
     uri?: string;
     size?: number;
@@ -463,7 +463,7 @@ fileRoutes.put('/upload', async (c) => {
     metadata?: Record<string, string>;
     entity_type?: string;
   };
-  if (!body.uri) return c.json(fail(c, Err.param('uri is required')) as never);
+  if (!body.uri) return fail(c, Err.param('uri is required'));
 
   try {
     const service = new FileSystemService(ctx);
@@ -477,49 +477,49 @@ fileRoutes.put('/upload', async (c) => {
       metadata: body.metadata,
       entityType: body.entity_type,
     });
-    return c.json(ok(c, res) as never);
+    return ok(c, res);
   } catch (e) {
-    return c.json(fail(c, e) as never);
+    return fail(c, e);
   }
 });
 
 fileRoutes.post('/upload/:sessionId/:index', async (c) => {
   const ctx = ctxOf(c);
-  if (!ctx.user) return c.json(fail(c, Err.loginRequired()) as never);
+  if (!ctx.user) return fail(c, Err.loginRequired());
 
   const sessionId = c.req.param('sessionId');
   const index = Number(c.req.param('index'));
   const contentLength = Number(c.req.header('Content-Length') ?? 0);
 
   if (!Number.isInteger(index) || index < 0) {
-    return c.json(fail(c, new AppError(40012, 'Invalid chunk index')) as never);
+    return fail(c, new AppError(40012, 'Invalid chunk index'));
   }
   const body = c.req.raw.body;
-  if (!body) return c.json(fail(c, Err.param('Request body is required')) as never);
+  if (!body) return fail(c, Err.param('Request body is required'));
 
   try {
     const service = new FileSystemService(ctx);
     const upload = new UploadService(ctx, service);
     upload.onUploadFinished = (file) => hookFtsIndex(c, ctx, file);
     await upload.uploadChunk(sessionId, index, body, contentLength);
-    return c.json(ok(c) as never);
+    return ok(c);
   } catch (e) {
-    return c.json(fail(c, e) as never);
+    return fail(c, e);
   }
 });
 
 fileRoutes.delete('/upload', async (c) => {
   const ctx = ctxOf(c);
-  if (!ctx.user) return c.json(fail(c, Err.loginRequired()) as never);
+  if (!ctx.user) return fail(c, Err.loginRequired());
   const body = (await c.req.json().catch(() => ({}))) as { id?: string; uri?: string };
-  if (!body.id) return c.json(fail(c, Err.param('id is required')) as never);
+  if (!body.id) return fail(c, Err.param('id is required'));
   try {
     const service = new FileSystemService(ctx);
     const upload = new UploadService(ctx, service);
     await upload.deleteSession(body.id, body.uri);
-    return c.json(ok(c) as never);
+    return ok(c);
   } catch (e) {
-    return c.json(fail(c, e) as never);
+    return fail(c, e);
   }
 });
 
@@ -529,27 +529,27 @@ fileRoutes.delete('/upload', async (c) => {
 
 fileRoutes.put('/pin', async (c) => {
   const ctx = ctxOf(c);
-  if (!ctx.user) return c.json(fail(c, Err.loginRequired()) as never);
+  if (!ctx.user) return fail(c, Err.loginRequired());
   const body = (await c.req.json().catch(() => ({}))) as { uri?: string; name?: string };
-  if (!body.uri) return c.json(fail(c, Err.param('uri is required')) as never);
+  if (!body.uri) return fail(c, Err.param('uri is required'));
   try {
     await new UserService(ctx).pin(body.uri, body.name, true);
-    return c.json(ok(c) as never);
+    return ok(c);
   } catch (e) {
-    return c.json(fail(c, e) as never);
+    return fail(c, e);
   }
 });
 
 fileRoutes.delete('/pin', async (c) => {
   const ctx = ctxOf(c);
-  if (!ctx.user) return c.json(fail(c, Err.loginRequired()) as never);
+  if (!ctx.user) return fail(c, Err.loginRequired());
   const body = (await c.req.json().catch(() => ({}))) as { uri?: string };
-  if (!body.uri) return c.json(fail(c, Err.param('uri is required')) as never);
+  if (!body.uri) return fail(c, Err.param('uri is required'));
   try {
     await new UserService(ctx).pin(body.uri, undefined, false);
-    return c.json(ok(c) as never);
+    return ok(c);
   } catch (e) {
-    return c.json(fail(c, e) as never);
+    return fail(c, e);
   }
 });
 
@@ -559,29 +559,29 @@ fileRoutes.delete('/pin', async (c) => {
 
 fileRoutes.put('/source', async (c) => {
   const ctx = ctxOf(c);
-  if (!ctx.user) return c.json(fail(c, Err.loginRequired()) as never);
+  if (!ctx.user) return fail(c, Err.loginRequired());
   const body = (await c.req.json().catch(() => ({}))) as { uris?: string[] };
-  if (!body.uris?.length) return c.json(fail(c, Err.param('uris is required')) as never);
+  if (!body.uris?.length) return fail(c, Err.param('uris is required'));
   try {
     const service = new FileSystemService(ctx);
     const download = new DownloadService(ctx, service);
     const links = await download.createDirectLink(URI.parse(body.uris[0]!));
-    return c.json(ok(c, { link: links[0]?.url ?? '' }) as never);
+    return ok(c, { link: links[0]?.url ?? '' });
   } catch (e) {
-    return c.json(fail(c, e) as never);
+    return fail(c, e);
   }
 });
 
 fileRoutes.delete('/source/:id', async (c) => {
   const ctx = ctxOf(c);
-  if (!ctx.user) return c.json(fail(c, Err.loginRequired()) as never);
+  if (!ctx.user) return fail(c, Err.loginRequired());
   try {
     const service = new FileSystemService(ctx);
     const download = new DownloadService(ctx, service);
     await download.deleteDirectLink(c.req.param('id'));
-    return c.json(ok(c) as never);
+    return ok(c);
   } catch (e) {
-    return c.json(fail(c, e) as never);
+    return fail(c, e);
   }
 });
 
@@ -596,44 +596,44 @@ fileRoutes.delete('/source/:id', async (c) => {
 /** 把文件的当前版本切换成指定历史版本。 */
 fileRoutes.post('/version/current', async (c) => {
   const ctx = ctxOf(c);
-  if (!ctx.user) return c.json(fail(c, Err.loginRequired()) as never);
+  if (!ctx.user) return fail(c, Err.loginRequired());
   const body = (await c.req.json().catch(() => ({}))) as { uri?: string; version?: string };
   if (!body.uri || !body.version) {
-    return c.json(fail(c, Err.param('uri and version are required')) as never);
+    return fail(c, Err.param('uri and version are required'));
   }
 
   const versionId = ctx.codec.decodeEntityID(body.version);
   if (versionId === null) {
-    return c.json(fail(c, Err.param('unknown version id')) as never);
+    return fail(c, Err.param('unknown version id'));
   }
 
   try {
     await new FileSystemService(ctx).setCurrentVersion(URI.parse(body.uri), versionId);
-    return c.json(ok(c) as never);
+    return ok(c);
   } catch (e) {
-    return c.json(fail(c, e) as never);
+    return fail(c, e);
   }
 });
 
 /** 删除文件的某个历史版本。 */
 fileRoutes.delete('/version', async (c) => {
   const ctx = ctxOf(c);
-  if (!ctx.user) return c.json(fail(c, Err.loginRequired()) as never);
+  if (!ctx.user) return fail(c, Err.loginRequired());
   const body = (await c.req.json().catch(() => ({}))) as { uri?: string; version?: string };
   if (!body.uri || !body.version) {
-    return c.json(fail(c, Err.param('uri and version are required')) as never);
+    return fail(c, Err.param('uri and version are required'));
   }
 
   const versionId = ctx.codec.decodeEntityID(body.version);
   if (versionId === null) {
-    return c.json(fail(c, Err.param('unknown version id')) as never);
+    return fail(c, Err.param('unknown version id'));
   }
 
   try {
     await new FileSystemService(ctx).deleteVersion(URI.parse(body.uri), versionId);
-    return c.json(ok(c) as never);
+    return ok(c);
   } catch (e) {
-    return c.json(fail(c, e) as never);
+    return fail(c, e);
   }
 });
 
@@ -674,10 +674,10 @@ function hookFtsIndex(
  */
 fileRoutes.get('/search', async (c) => {
   const ctx = ctxOf(c);
-  if (!guard(c)) return c.json(fail(c, Err.loginRequired()) as never);
+  if (!guard(c)) return fail(c, Err.loginRequired());
 
   const query = (c.req.query('query') ?? '').trim();
-  if (!query) return c.json(ok(c, { hits: [], total: 0 }) as never);
+  if (!query) return ok(c, { hits: [], total: 0 });
 
   const offset = Math.max(0, Number(c.req.query('offset') ?? 0) || 0);
   const limit = 50;
@@ -695,7 +695,7 @@ fileRoutes.get('/search', async (c) => {
         if (service.isInTrash(file)) continue;
         hits.push({ file: await service.buildFileResponse(file), content: hit.text });
       }
-      return c.json(ok(c, { hits, total: found.total }) as never);
+      return ok(c, { hits, total: found.total });
     } catch (e) {
       // 索引服务挂了不该让整个搜索不可用，静默回落到文件名匹配
       console.error('full text search failed, falling back to name match', e);
@@ -716,9 +716,9 @@ fileRoutes.get('/search', async (c) => {
         content: '',
       });
     }
-    return c.json(ok(c, { hits, total }) as never);
+    return ok(c, { hits, total });
   } catch (e) {
-    return c.json(fail(c, e) as never);
+    return fail(c, e);
   }
 });
 
@@ -734,11 +734,11 @@ const NOT_IMPLEMENTED: Record<string, string> = {
 };
 
 fileRoutes.all('/archive/:sessionID/archive.zip', (c) =>
-  c.json(fail(c, new AppError(CodeFeatureNotEnabled, 'Archive download is not implemented')) as never),
+  fail(c, new AppError(CodeFeatureNotEnabled, 'Archive download is not implemented')),
 );
 
 for (const [path, message] of Object.entries(NOT_IMPLEMENTED)) {
-  fileRoutes.all(path, (c) => c.json(fail(c, new AppError(CodeFeatureNotEnabled, message)) as never));
+  fileRoutes.all(path, (c) => fail(c, new AppError(CodeFeatureNotEnabled, message)));
 }
 
 export { guard };

@@ -39,9 +39,9 @@ callbackRoutes.post('/onedrive/:sessionID/:key', async (c) => {
       };
     }
     await upload.completeByCallback(c.req.param('sessionID'), c.req.param('key'));
-    return c.json(ok(c) as never);
+    return ok(c);
   } catch (e) {
-    return c.json(fail(c, e) as never);
+    return fail(c, e);
   }
 });
 
