@@ -88,5 +88,9 @@ function isProduction(c: Context): boolean {
 
 function jsonResponse(c: Context, body: Envelope, status: 200 | 404 = 200): Response {
   // 与原版一致：默认 HTTP 200 + 自定义业务码；仅个别路径（/f/ 404）用非 200
-  return c.json(body as never, status);
+  const res = c.json(body as never, status);
+  // 禁止任何层（浏览器、CF 边缘）缓存 API 信封：曾因缓存了修复前返回的
+  // 字符串版 custom_nav_items，导致前端对字符串 .map 一直报错。
+  res.headers.set('Cache-Control', 'no-store, no-cache, must-revalidate');
+  return res;
 }

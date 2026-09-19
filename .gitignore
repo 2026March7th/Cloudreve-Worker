@@ -27,6 +27,7 @@ Thumbs.db
 _gap.json
 _gap_result.txt
 _*
+node_*.txt
 /trace.log
 /curl.log
 /tsc_*.txt
