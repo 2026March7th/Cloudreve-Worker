@@ -204,13 +204,19 @@ async function seedSystemData(env: Env): Promise<void> {
         (name, type, server, bucket_name, is_private, max_size,
          dir_name_rule, file_name_rule, settings)
       VALUES
-        ('R2 Default', 'r2', '', '', true, 0,
+        ('R2 Default', 's3', '', '', true, 0,
          'uploads/{uid}/{path}', '{uid}_{randomkey8}_{originname}', '{}'::jsonb)
       RETURNING id
     `) as Array<{ id: number | string }>;
     const policyId = Number(inserted[0]!.id);
     await sql`UPDATE groups SET storage_policy_id = ${policyId} WHERE id = 2 AND storage_policy_id IS NULL`;
   }
+
+  // 数据修复：早期版本把默认策略 type 播种成了自造值 'r2'，而上游前端
+  // PolicyType 枚举没有它，StoragePolicyCard 里 PolicyPropsMap['r2'].img
+  // 直接抛 undefined 导致存储策略页崩。R2 兼容 S3 API，统一归一到 's3'。
+  // 幂等：无 'r2' 行时为空更新。
+  await sql`UPDATE storage_policies SET type = 's3', updated_at = now() WHERE type = 'r2'`;
 
   // 默认 OAuth 客户端。官方版里「Cloudreve Web / Cloudreve Desktop」两个内置
   // 应用由闭源部分播种（开源仓库的 migrator 无此步骤，已核对），边缘版按

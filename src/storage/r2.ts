@@ -58,7 +58,8 @@ function parseRange(
 }
 
 export class R2Driver implements StorageDriver {
-  readonly type = 'r2';
+  // R2 兼容 S3 API；策略类型按上游词表呈现为 's3'（前端枚举无 'r2'）。
+  readonly type = 's3';
   readonly chunkSize: number;
   readonly settings;
 

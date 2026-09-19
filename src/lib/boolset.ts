@@ -123,8 +123,9 @@ export const PolicyType = {
   OneDrive: 'onedrive',
   Remote: 'remote',
   Obs: 'obs',
-  /** 边缘版新增：Cloudflare R2，用 Worker 的 R2 绑定直接读写。 */
-  R2: 'r2',
+  // 注意：不引入自造类型。R2 走 S3 兼容 API，对内对外都用 's3'
+  //（上游前端 PolicyType 枚举没有 'r2'，出现未知 type 会让
+  // StoragePolicyCard 的 PolicyPropsMap[type].img 直接抛 undefined）。
 } as const;
 
 export type PolicyTypeValue = (typeof PolicyType)[keyof typeof PolicyType];
