@@ -30,16 +30,18 @@ Workers & Pages → Create → 选仓库，只填两格：
 | 框 | 命令 |
 |---|---|
 | **构建命令** | `npm install` |
-| **部署命令** | `npx wrangler deploy` |
+| **部署命令** | `npm run deploy` |
 
-输出目录留空。然后到 **设置 → 变量与机密** 添加 `DATABASE_URL`，保存后重新部署一次。KV 和 R2 按 `wrangler.toml` 自动创建，不用改任何 ID。
+输出目录留空。`npm run deploy` 会**自动创建 KV 和 R2 并回填 ID**，不需要改 `wrangler.toml`。
+
+然后在项目的**设置 → 环境变量**里添加 `DATABASE_URL`（第 1 步的连接串），保存后重新部署 —— 部署脚本会自动把它写入 Worker 的运行时 Secret，不用再去面板手动加。`SITE_URL` 同样加在这个环境变量里即可。
 
 ## 环境变量
 
 | 变量 | 必填 | 说明 |
 |---|---|---|
-| `DATABASE_URL` | ✅ | Neon 连接串（Secret 类型）。在 [neon.tech](https://neon.tech) 建项目后复制 |
-| `SITE_URL` | 建议 | 站点对外地址，影响分享短链、邮件激活链接。默认空，部署后在面板里改成 Worker 地址 |
+| `DATABASE_URL` | ✅ | Neon 连接串。加在部署项目的环境变量里，`npm run deploy` 会自动写成运行时 Secret；也可部署后在 Worker 的「变量和机密」里手动加 |
+| `SITE_URL` | 建议 | 站点对外地址（Worker 地址），加在部署项目的环境变量里即可自动生效 |
 | `JWT_SECRET` | 可选 | 令牌签名密钥（32 位以上随机串）。不设会自动生成并入库 |
 | `FRONTEND_URL` | 可选 | 官方前端单独部署在别处时才填，Worker 会把非 API 请求反代过去 |
 | `LOG_LEVEL` | 可选 | `debug` / `info` / `warn` / `error`，默认 `info` |

@@ -30,9 +30,12 @@ FRONTEND_URL = ""
 LOG_LEVEL = "info"
 
 # ---------------------------------------------------------------------------
-# KV / R2：**用「Deploy to Cloudflare」按钮部署时不用改这两个占位 ID** ——
-# 按钮会自动创建真实的 KV namespace 和 R2 bucket 并回填到你的仓库里。
-# 只有用 `wrangler deploy` 手工部署时才需要替换成真实 ID。
+# KV / R2：占位 ID **不用改**。
+#   - 「Deploy to Cloudflare」按钮：部署时自动创建资源并回填。
+#   - 面板手动接仓库（部署命令 `npm run deploy`）：scripts/deploy.mjs 会
+#     自动创建 KV/R2 并把真实 ID 写进本文件。
+#   - 本机手工 `npx wrangler deploy`：才需要先 `wrangler kv namespace create KV`
+#     把返回的 id 换到这里。
 # ---------------------------------------------------------------------------
 [[kv_namespaces]]
 binding = "KV"
