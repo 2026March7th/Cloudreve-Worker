@@ -201,7 +201,11 @@ export async function loadSettings(env: Env): Promise<SettingsProvider> {
   }
 
   const sql = getSql(env);
-  const rows = (await sql`SELECT name, value FROM settings WHERE deleted_at IS NULL`) as SettingRow[];
+  // 空闲后（Neon 免费版会自动休眠计算节点）第一条查询偶尔会撞上瞬态错误，
+  // 定时任务一小时才来一次，正好踩在这个场景上 —— 限流/网络抖动统一退避重试。
+  const rows = (await withRetry(
+    () => sql`SELECT name, value FROM settings WHERE deleted_at IS NULL`,
+  )) as SettingRow[];
   const map = new Map<string, string>();
   for (const r of rows) {
     map.set(r.name, r.value ?? '');

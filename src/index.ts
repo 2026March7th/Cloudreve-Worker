@@ -263,6 +263,18 @@ export default {
    * KV 里的上传会话 / 验证码靠 TTL 自动过期，不需要在这里处理。
    */
   async scheduled(_event: ScheduledController, env: Env, _ctx: ExecutionContext): Promise<void> {
+    // 自举没完成（刚部署、还没人访问过）时 settings 表可能还不存在，
+    // 定时任务直接跳过 —— 第一次网页请求会完成自举。
+    try {
+      if (!(await env.KV.get(BOOTSTRAP_FLAG))) {
+        console.log('trash collector: skipped (bootstrap not finished yet)');
+        return;
+      }
+    } catch {
+      // KV 都不可用就没什么可清理的，等下一轮
+      return;
+    }
+
     try {
       const settings = await loadSettings(env);
       const appCtx = new AppContext(
@@ -276,9 +288,28 @@ export default {
         console.log(`trash collector: purged ${removed} expired item(s)`);
       }
     } catch (e) {
-      // 定时任务不该因为一次失败就中断后续调度；这里只记日志，不向上抛
-      console.error('trash collector failed', e);
+      // 定时任务不该因为一次失败就中断后续调度；这里只记日志，不向上抛。
+      // 部分错误对象（跨序列化边界）会丢 message，把全部字段 dump 出来
+      // 才能在日志里看到真实原因，而不是只剩一行堆栈帧。
+      console.error('trash collector failed', describeError(e));
     }
   },
 };
+
+/** 把任意抛出的值整理成带完整上下文的字符串，专治没有 message 的错误对象。 */
+function describeError(e: unknown): string {
+  if (e instanceof Error) {
+    const cause = e.cause !== undefined ? ` | cause: ${describeError(e.cause)}` : '';
+    const extra = Object.getOwnPropertyNames(e)
+      .filter((k) => !['stack', 'message', 'cause'].includes(k))
+      .map((k) => `${k}=${JSON.stringify((e as unknown as Record<string, unknown>)[k])}`)
+      .join(', ');
+    return `${e.name}: ${e.message || '(no message)'}${extra ? ` | ${extra}` : ''}${cause}\n${e.stack ?? ''}`;
+  }
+  try {
+    return JSON.stringify(e) ?? String(e);
+  } catch {
+    return String(e);
+  }
+}
 

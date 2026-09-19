@@ -40,7 +40,19 @@ export function isRateLimitError(err: unknown): boolean {
   return /\b429\b|rate.?limit|too many/i.test(msg);
 }
 
-/** 带退避的重试：只对限流类错误生效，其他错误原样抛出。 */
+/**
+ * 值得重试的瞬态错误：限流，或**没有任何 message** 的错误。
+ * 正常的数据库错误（缺表、语法、约束冲突）都带明确 message；
+ * message 为空的基本是 fetch 层的瞬态失败 / 错误对象跨序列化边界丢失内容，
+ * 对这类错误盲目重试一次是安全的，还能避免把噪音刷进日志。
+ */
+function isTransientError(err: unknown): boolean {
+  if (isRateLimitError(err)) return true;
+  const msg = err instanceof Error ? err.message : String(err);
+  return msg.trim().length === 0;
+}
+
+/** 带退避的重试：只对瞬态错误生效，其他错误原样抛出。 */
 export async function withRetry<T>(fn: () => Promise<T>, attempts = 3): Promise<T> {
   let lastErr: unknown;
   for (let i = 0; i < attempts; i++) {
@@ -48,7 +60,7 @@ export async function withRetry<T>(fn: () => Promise<T>, attempts = 3): Promise<
       return await fn();
     } catch (err) {
       lastErr = err;
-      if (!isRateLimitError(err) || i === attempts - 1) throw err;
+      if (!isTransientError(err) || i === attempts - 1) throw err;
       await sleep(1200 * (i + 1));
     }
   }
