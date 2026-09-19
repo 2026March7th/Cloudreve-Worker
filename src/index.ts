@@ -42,6 +42,10 @@ import { FileSystemService } from './services/fs';
 import { ShareService } from './services/share';
 
 const BOOTSTRAP_FLAG = 'bootstrap:done:v2';
+/** 自举失败后的冷却键（20 秒 TTL）：期间请求直接快速失败，不再重放自举。 */
+const BOOTSTRAP_COOLDOWN = 'bootstrap:cooldown:v1';
+/** 同一 isolate 内的并发请求共享一次自举。 */
+let bootstrapPromise: Promise<void> | null = null;
 
 const app = new Hono<AppBindings>();
 
@@ -52,12 +56,32 @@ const app = new Hono<AppBindings>();
 app.use('*', async (c, next) => {
   // 冷启动自举：自动建表、播种系统组与默认策略、补齐设置表。
   // 三件事都幂等，用 KV 标记避免每个请求都打一遍数据库。
-  // 这样部署完直接打开站点就能用 —— 不需要本机跑 migrate / seed。
+  // 失败有 20 秒冷却期：期间的请求直接回 503，避免所有请求同时重放
+  // 自举把 Neon 打出限流（那正是「站点配置加载失败 429」的根源）。
   const bootstrapped = await c.env.KV.get(BOOTSTRAP_FLAG);
   if (!bootstrapped) {
-    await provision(c.env);
-    await ensureSettings(c.env);
-    await c.env.KV.put(BOOTSTRAP_FLAG, '1');
+    if (await c.env.KV.get(BOOTSTRAP_COOLDOWN)) {
+      return c.json(
+        { code: 50006, msg: '站点正在初始化（刚部署或数据库暂时不可用），请几秒后刷新重试' },
+        503,
+      ) as never;
+    }
+    if (!bootstrapPromise) {
+      bootstrapPromise = (async () => {
+        await provision(c.env);
+        await ensureSettings(c.env);
+        await c.env.KV.put(BOOTSTRAP_FLAG, '1');
+      })().catch(async (err) => {
+        bootstrapPromise = null;
+        try {
+          await c.env.KV.put(BOOTSTRAP_COOLDOWN, '1', { expirationTtl: 20 });
+        } catch {
+          /* KV 也不可用时只能让下一个请求再试 */
+        }
+        throw err;
+      });
+    }
+    await bootstrapPromise;
   }
   await next();
 });

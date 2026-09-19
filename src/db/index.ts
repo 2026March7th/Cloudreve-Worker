@@ -28,6 +28,33 @@ export function getSql(env: Env): Sql {
   return sql;
 }
 
+// ---------------------------------------------------------------------------
+// 限流容错。Neon 免费版会对突发请求回 429；冷启动虽然已经把请求合并成
+// 个位数，仍要对瞬时限流做退避重试，避免整个自举失败。
+// ---------------------------------------------------------------------------
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+export function isRateLimitError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return /\b429\b|rate.?limit|too many/i.test(msg);
+}
+
+/** 带退避的重试：只对限流类错误生效，其他错误原样抛出。 */
+export async function withRetry<T>(fn: () => Promise<T>, attempts = 3): Promise<T> {
+  let lastErr: unknown;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      if (!isRateLimitError(err) || i === attempts - 1) throw err;
+      await sleep(1200 * (i + 1));
+    }
+  }
+  throw lastErr;
+}
+
 /**
  * 把可能以字符串形式返回的 BIGINT / NUMERIC 归一化成 number。
  * 数据库里 size / storage 这类值不可能超过 Number.MAX_SAFE_INTEGER

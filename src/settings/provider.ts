@@ -6,7 +6,7 @@
  * 跨请求的缓存交给 KV（`settings:all`，60 秒），避免每个请求都打一次数据库。
  */
 import type { Env } from '../env';
-import { getSql, toJson } from '../db';
+import { getSql, toJson, withRetry } from '../db';
 import type { SettingRow } from '../db/types';
 import { DEFAULT_SETTINGS, GENERATED_SETTINGS } from './defaults';
 import { randomString } from '../lib/crypto';
@@ -246,14 +246,17 @@ export async function ensureSettings(env: Env): Promise<void> {
 
   if (toInsert.length === 0) return;
 
-  // 逐条插入，冲突则跳过（并发冷启动时安全）
-  for (const item of toInsert) {
-    await sql`
-      INSERT INTO settings (name, value)
-      VALUES (${item.name}, ${item.value})
-      ON CONFLICT (name) DO NOTHING
-    `;
-  }
+  // 全部缺失键合并成一个事务提交（= 1 个 HTTP 请求）。逐条插在免费版
+  // Workers 里会撞 50-subrequest 上限，并发冷启动还会触发 Neon 429。
+  await withRetry(() =>
+    sql.transaction(
+      toInsert.map((item) => sql`
+        INSERT INTO settings (name, value)
+        VALUES (${item.name}, ${item.value})
+        ON CONFLICT (name) DO NOTHING
+      `),
+    ),
+  );
   await invalidateSettings(env);
 }
 

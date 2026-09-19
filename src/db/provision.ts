@@ -19,7 +19,7 @@ import m0001 from '../../migrations/0001_init.sql';
 import m0002 from '../../migrations/0002_admin_content.sql';
 import m0003 from '../../migrations/0003_dav_passkey.sql';
 import m0004 from '../../migrations/0004_node_settings.sql';
-import { getSql } from './index';
+import { getSql, withRetry } from './index';
 import type { Env } from '../env';
 
 const MIGRATIONS: ReadonlyArray<readonly [name: string, sqlText: string]> = [
@@ -57,7 +57,15 @@ function isBenignError(err: unknown): boolean {
   return /already exists|duplicate/i.test(msg);
 }
 
-/** 应用全部迁移（幂等）。 */
+/**
+ * 应用全部迁移（幂等）。
+ *
+ * **每个文件用一次 `sql.transaction()` 整体提交** —— 关键约束：Workers 免费版
+ * 单请求只有 50 个 subrequest，而逐条执行 0001 就要 52 个请求，必然爆掉；
+ * Neon 免费版还会对突发请求直接回 429。合并后 4 个文件只有 4 个请求。
+ * 事务里语句按序执行，失败整体回滚 —— 全部语句幂等，并发冷启动时第二遍重放
+ * 即可收敛。
+ */
 async function applyMigrations(env: Env): Promise<void> {
   const sql = getSql(env);
   const done = await env.KV.get(MARKER_KEY);
@@ -65,13 +73,12 @@ async function applyMigrations(env: Env): Promise<void> {
   if (done === last) return;
 
   for (const [name, sqlText] of MIGRATIONS) {
-    for (const statement of splitStatements(sqlText)) {
-      try {
-        await sql(statement);
-      } catch (err) {
-        if (!isBenignError(err)) {
-          throw new Error(`migration ${name} failed: ${err instanceof Error ? err.message : String(err)}`);
-        }
+    const queries = splitStatements(sqlText).map((statement) => sql(statement));
+    try {
+      await withRetry(() => sql.transaction(queries));
+    } catch (err) {
+      if (!isBenignError(err)) {
+        throw new Error(`migration ${name} failed: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
   }
@@ -158,25 +165,29 @@ async function seedSystemData(env: Env): Promise<void> {
     },
   ];
 
-  for (const group of groups) {
-    const maxBit = group.permissions.length ? Math.max(...group.permissions) : -1;
-    const bytes = new Uint8Array(Math.max(1, (maxBit >> 3) + 1));
-    for (const bit of group.permissions) {
-      bytes[bit >> 3] |= 1 << (bit & 7);
-    }
-    let hex = '';
-    for (const b of bytes) hex += b.toString(16).padStart(2, '0');
+  // 三个系统组 + 序列校正合并成一个事务（= 1 个 HTTP 请求）
+  await withRetry(() =>
+    sql.transaction([
+      ...groups.map((group) => {
+        const maxBit = group.permissions.length ? Math.max(...group.permissions) : -1;
+        const bytes = new Uint8Array(Math.max(1, (maxBit >> 3) + 1));
+        for (const bit of group.permissions) {
+          bytes[bit >> 3] |= 1 << (bit & 7);
+        }
+        let hex = '';
+        for (const b of bytes) hex += b.toString(16).padStart(2, '0');
 
-    await sql`
-      INSERT INTO groups (id, name, max_storage, speed_limit, permissions, settings, storage_policy_id)
-      VALUES (${group.id}, ${group.name}, ${group.maxStorage}, NULL, ${`\\x${hex}`}::bytea,
-              ${JSON.stringify(group.settings)}::jsonb, NULL)
-      ON CONFLICT (id) DO NOTHING
-    `;
-  }
-
-  // 让自增序列跟在手工指定的 id 之后，避免后续插入主键冲突
-  await sql`SELECT setval(pg_get_serial_sequence('groups', 'id'), (SELECT MAX(id) FROM groups))`;
+        return sql`
+          INSERT INTO groups (id, name, max_storage, speed_limit, permissions, settings, storage_policy_id)
+          VALUES (${group.id}, ${group.name}, ${group.maxStorage}, NULL, ${`\\x${hex}`}::bytea,
+                  ${JSON.stringify(group.settings)}::jsonb, NULL)
+          ON CONFLICT (id) DO NOTHING
+        `;
+      }),
+      // 让自增序列跟在手工指定的 id 之后，避免后续插入主键冲突
+      sql`SELECT setval(pg_get_serial_sequence('groups', 'id'), (SELECT MAX(id) FROM groups))`,
+    ]),
+  );
 
   // 默认 R2 存储策略 + 默认组绑定（对齐 seed.mjs）
   const policyRows = (await sql`SELECT id FROM storage_policies WHERE deleted_at IS NULL ORDER BY id LIMIT 1`) as Array<{
