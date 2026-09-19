@@ -144,25 +144,28 @@ async function computeMetrics(ctx: ReturnType<typeof ctxOf>): Promise<Record<str
   };
 }
 
-/** 单指标近 12 天逐日新增：用 generate_series 生成日期序列后 LEFT JOIN，一次查询搞定。 */
+/** 单指标近 12 天逐日新增：用 generate_series 生成日期序列后 LEFT JOIN，一次查询搞定。
+ *  `files` 表没有 `deleted_at`（见 migrations/0001_init.sql 注释），所以按表名跳过软删除过滤。 */
 async function dailyCounts(sql: Sql, table: string, windowStart: number): Promise<number[]> {
   const startISO = new Date(windowStart).toISOString();
+  const softDelete = table !== 'files';
   const rows = (await sql(
     `SELECT d.d AS day, COUNT(t.created_at)::bigint AS c
        FROM generate_series($1::timestamptz, $1::timestamptz + interval '${SUMMARY_RANGE_DAYS - 1} day', interval '1 day') AS d(d)
        LEFT JOIN ${table} t
          ON t.created_at >= d.d AND t.created_at < d.d + interval '1 day'
-         AND t.deleted_at IS NULL
+         ${softDelete ? 'AND t.deleted_at IS NULL' : ''}
        GROUP BY d.d ORDER BY d.d`,
     [startISO],
   )) as { c: unknown }[];
   return rows.map((r) => Number(r.c ?? 0));
 }
 
-/** 全量计数（不限时间）。 */
+/** 全量计数（不限时间）。`files` 表无 `deleted_at`，跳过软删除过滤。 */
 async function countAll(sql: Sql, table: string): Promise<number> {
+  const softDelete = table !== 'files';
   const rows = (await sql(
-    `SELECT COUNT(*)::bigint AS c FROM ${table} WHERE deleted_at IS NULL`,
+    `SELECT COUNT(*)::bigint AS c FROM ${table}${softDelete ? ' WHERE deleted_at IS NULL' : ''}`,
     [],
   )) as { c: unknown }[];
   return Number(rows[0]?.c ?? 0);

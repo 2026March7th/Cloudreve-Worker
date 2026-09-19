@@ -459,7 +459,7 @@ adminContentRoutes.get('/file/:id', async (c) => {
   const id = numericId(c.req.param('id'), (v) => codec.decodeFileID(v));
   if (id === null) return fail(c, Err.fileNotFound());
 
-  const rows = (await sql('SELECT * FROM files WHERE id = $1 AND deleted_at IS NULL LIMIT 1', [
+  const rows = (await sql('SELECT * FROM files WHERE id = $1 LIMIT 1', [
     id,
   ])) as Record<string, unknown>[];
   if (!rows[0]) return fail(c, Err.fileNotFound());
@@ -810,10 +810,15 @@ adminContentRoutes.post('/share/batch/delete', async (c) => {
 // 任务队列
 // ---------------------------------------------------------------------------
 
-/** 任务对外形态，对齐前端 `Task`。 */
-function taskToResponse(codec: HashIDCodec, t: Record<string, unknown>) {
+/** 任务对外形态，对齐前端 `Task`（`api/dashboard.ts`）。 */
+function taskToResponse(
+  codec: HashIDCodec,
+  t: Record<string, unknown>,
+  user?: Record<string, unknown> | null,
+) {
   const id = num(t.id);
   const userId = num(t.user_tasks);
+  const publicState = (t.public_state ?? {}) as Record<string, unknown>;
   return {
     id,
     created_at: iso(t.created_at),
@@ -821,14 +826,42 @@ function taskToResponse(codec: HashIDCodec, t: Record<string, unknown>) {
     deleted_at: iso(t.deleted_at),
     type: String(t.type ?? ''),
     status: String(t.status ?? 'queued'),
-    public_state: t.public_state ?? {},
+    public_state: publicState,
     private_state: t.private_state ?? '',
     correlation_id: t.correlation_id ?? null,
     user_tasks: userId,
     user_hash_id: userId ? codec.encodeUserID(userId) : undefined,
     task_hash_id: codec.encodeTaskID(id),
-    edges: {},
+    // 前端 TaskRow 读取的三个字段：summary 来自 public_state.summary，
+    // 边缘版没有从属节点（node 恒空，前端有 `task?.node?.name` 守卫），
+    // edges.user 供行内用户徽章 / 用户详情跳转使用。
+    summary: publicState.summary ?? null,
+    node: null,
+    edges: user
+      ? {
+          user: {
+            id: num(user.id),
+            nick: String(user.nick ?? ''),
+            created_at: iso(user.created_at),
+          },
+        }
+      : {},
   };
+}
+
+/** 批量取任务归属用户（nick / created_at），供 `edges.user` 联查。 */
+async function taskUsersMap(
+  sql: Sql,
+  rows: Record<string, unknown>[],
+): Promise<Map<number, Record<string, unknown>>> {
+  const ids = [...new Set(rows.map((t) => num(t.user_tasks)).filter((v) => v > 0))];
+  const map = new Map<number, Record<string, unknown>>();
+  if (ids.length === 0) return map;
+  const users = (await sql`
+    SELECT id, nick, created_at FROM users WHERE id = ANY(${ids}::int[])
+  `) as Record<string, unknown>[];
+  for (const u of users) map.set(num(u.id), u);
+  return map;
 }
 
 /**
@@ -928,20 +961,24 @@ adminContentRoutes.post('/queue', async (c) => {
     params,
   )) as Record<string, unknown>[];
 
+  const userMap = await taskUsersMap(sql, rows);
+
   return ok(c, {
-      tasks: rows.map((t) => taskToResponse(codec, t)),
+      tasks: rows.map((t) => taskToResponse(codec, t, userMap.get(num(t.user_tasks)))),
       pagination: paginationOf(page, pageSize, num(countRows[0]?.total)),
     });
 });
 
 /** `GET /admin/queue/:id` —— 任务详情。 */
 adminContentRoutes.get('/queue/:id', async (c) => {
-  const { codec, ctx } = withCtx(c);
+  const { sql, codec, ctx } = withCtx(c);
   const id = numericId(c.req.param('id'), (v) => codec.decodeTaskID(v));
   if (id === null) return fail(c, Err.notFound('Task not found'));
   const task = await ctx.tasks.byId(id);
   if (!task) return fail(c, Err.notFound('Task not found'));
-  return ok(c, taskToResponse(codec, task as unknown as Record<string, unknown>));
+  const t = task as unknown as Record<string, unknown>;
+  const userMap = await taskUsersMap(sql, [t]);
+  return ok(c, taskToResponse(codec, t, userMap.get(num(t.user_tasks))));
 });
 
 /** `POST /admin/queue/batch/delete` —— 批量删任务。 */

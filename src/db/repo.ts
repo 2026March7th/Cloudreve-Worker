@@ -968,7 +968,6 @@ export class FileRepo {
         AND m.deleted_at IS NULL
        WHERE f.file_children IS NULL
          AND f.name <> ''
-         AND f.deleted_at IS NULL
          AND m.value ~ '^[0-9]+$'
          AND m.value::bigint <= $1::bigint
        LIMIT $3`,

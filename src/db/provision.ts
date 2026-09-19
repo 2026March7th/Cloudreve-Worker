@@ -20,6 +20,7 @@ import m0002 from '../../migrations/0002_admin_content.sql';
 import m0003 from '../../migrations/0003_dav_passkey.sql';
 import m0004 from '../../migrations/0004_node_settings.sql';
 import { getSql, withRetry } from './index';
+import { randomString } from '../lib/crypto';
 import type { Env } from '../env';
 
 const MIGRATIONS: ReadonlyArray<readonly [name: string, sqlText: string]> = [
@@ -209,6 +210,41 @@ async function seedSystemData(env: Env): Promise<void> {
     `) as Array<{ id: number | string }>;
     const policyId = Number(inserted[0]!.id);
     await sql`UPDATE groups SET storage_policy_id = ${policyId} WHERE id = 2 AND storage_policy_id IS NULL`;
+  }
+
+  // 默认 OAuth 客户端。官方版里「Cloudreve Web / Cloudreve Desktop」两个内置
+  // 应用由闭源部分播种（开源仓库的 migrator 无此步骤，已核对），边缘版按
+  // 前端可用 scope 自建。guid 固定 + ON CONFLICT DO NOTHING 保证幂等；
+  // secret 只在首次插入时随机生成，重复播种不会覆盖。
+  const defaultClients = [
+    {
+      guid: 'c54e1b95-4f30-4b57-9e2a-3d9ff1b11c0e',
+      name: 'Cloudreve Web',
+      scopes: ['openid', 'email', 'profile', 'offline_access'],
+    },
+    {
+      guid: '8a3f9d6c-2b14-4a7e-b6c5-1e0d7f4a92b3',
+      name: 'Cloudreve Desktop',
+      scopes: [
+        'openid',
+        'email',
+        'profile',
+        'offline_access',
+        'UserInfo.Read',
+        'Files.Read',
+        'Files.Write',
+        'Shares.Read',
+        'DavAccount.Read',
+      ],
+    },
+  ];
+  for (const cl of defaultClients) {
+    await sql`
+      INSERT INTO oauth_clients (guid, secret, name, homepage_url, redirect_uris, scopes, props, is_enabled)
+      VALUES (${cl.guid}, ${randomString(48)}, ${cl.name}, 'https://cloudreve.org',
+              '[]'::jsonb, ${JSON.stringify(cl.scopes)}::jsonb, '{}'::jsonb, true)
+      ON CONFLICT (guid) DO NOTHING
+    `;
   }
 }
 
