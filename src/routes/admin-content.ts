@@ -351,6 +351,10 @@ adminContentRoutes.post('/user/batch/delete', async (c) => {
     () => `UPDATE users SET status = 'sys_banned', deleted_at = now(), updated_at = now() WHERE id = $1`,
     ids,
   );
+  // 上游 PR #3355：删除用户连带吊销其 OAuth 授权，防止已签发的 refresh token
+  // 继续访问第三方应用（边缘版用户只软封禁，授权行同样软删）。
+  await sql`UPDATE oauth_grants SET deleted_at = now(), updated_at = now()
+            WHERE user_id = ANY(${ids}::int[]) AND deleted_at IS NULL`;
   return ok(c);
 });
 

@@ -255,7 +255,9 @@ export class FileSystemService {
 
     const owner = share.user_shares ? await this.ctx.users.byId(share.user_shares) : null;
     const root = share.file_shares ? await this.ctx.files.byId(share.file_shares) : null;
-    if (isShareInvalid(share, root, owner)) throw Err.shareNotFound();
+    // 上游 PR #3524：属主当前所属组失去 Share 权限位时分享失效
+    const ownerGroup = owner?.group_users ? await this.ctx.groups.byId(owner.group_users) : null;
+    if (isShareInvalid(share, root, owner, ownerGroup)) throw Err.shareNotFound();
 
     const viewer = this.ctx.user;
     const isOwner = viewer !== undefined && viewer.id === share.user_shares;

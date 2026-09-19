@@ -236,6 +236,18 @@ export class DownloadService {
 
     const file = await this.ctx.files.byId(link.file_id);
     if (!file || !file.primary_entity) throw Err.fileNotFound();
+
+    // 上游 PR #3524（GetFileFromDirectLink）：属主被封禁/删除，或其当前
+    // 所在组已无源流能力（source_batch <= 0）时，直链立即失效。
+    const owner = file.owner_id ? await this.ctx.users.byId(file.owner_id) : null;
+    if (!owner || owner.status !== 'active') {
+      throw new AppError(404, 'Direct link not found');
+    }
+    const ownerGroup = owner.group_users ? await this.ctx.groups.byId(owner.group_users) : null;
+    if (!ownerGroup || !ownerGroup.settings || (ownerGroup.settings.source_batch ?? 0) <= 0) {
+      throw new AppError(404, 'Direct link not found');
+    }
+
     const entity = await this.ctx.entities.byId(file.primary_entity);
     if (!entity) throw new AppError(CodeEntityNotExist, 'Entity not found');
 

@@ -208,8 +208,10 @@ export class ShareService {
 
     // 原版 `ShareInfoService.Get` 在解锁之前先跑一遍 `IsValidShare`，
     // 失败一律按 404 + "Share link expired" 返回（不区分具体原因，避免探测）。
+    // 上游 PR #3524：属主当前所属组失去 Share 权限位时同样判失效。
     const owner = share.user_shares ? await this.ctx.users.byId(share.user_shares) : null;
-    if (isShareInvalid(share, file, owner)) {
+    const ownerGroup = owner?.group_users ? await this.ctx.groups.byId(owner.group_users) : null;
+    if (isShareInvalid(share, file, owner, ownerGroup)) {
       throw new AppError(CodeNotFound, 'Share link expired');
     }
 
@@ -386,7 +388,8 @@ export class ShareService {
     file: FileRow | null,
     owner: UserRow | null,
   ): Promise<boolean> {
-    return isShareInvalid(share, file, owner);
+    const ownerGroup = owner?.group_users ? await this.ctx.groups.byId(owner.group_users) : null;
+    return isShareInvalid(share, file, owner, ownerGroup);
   }
 
   private buildOwner(owner: UserRow | null): ShareResponse['owner'] {
@@ -475,7 +478,8 @@ export class ShareService {
 
     const owner = share.user_shares ? await this.ctx.users.byId(share.user_shares) : null;
     const file = share.file_shares ? await this.ctx.files.byId(share.file_shares) : null;
-    if (isShareInvalid(share, file, owner)) throw Err.shareNotFound();
+    const ownerGroup = owner?.group_users ? await this.ctx.groups.byId(owner.group_users) : null;
+    if (isShareInvalid(share, file, owner, ownerGroup)) throw Err.shareNotFound();
 
     const isOwner = this.ctx.user !== undefined && this.ctx.user.id === share.user_shares;
     if (share.password && !isOwner && (password ?? '') !== share.password) {

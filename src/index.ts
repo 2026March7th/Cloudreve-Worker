@@ -41,6 +41,7 @@ import { davRoutes } from './routes/dav';
 import { DownloadService } from './services/download';
 import { FileSystemService } from './services/fs';
 import { ShareService } from './services/share';
+import { isSocialMediaBot, renderSharePreview } from './services/share-preview';
 
 /**
  * 自举完成标记。**版本号要随「自举内容变化」递增**：KV 里的旧标记不会
@@ -214,19 +215,30 @@ app.use('/f/*', contentCors);
  * 分享短链。原版 `sharesvc.ShortLinkRedirectService` 不查库，直接把
  * `cloudreve://<id>[:password]@share` 拼进前端地址重定向；分享不存在这类情况
  * 交给前端展示「链接失效」。这里保持一致 —— 失败也照常跳，不吞错误码。
+ *
+ * 例外（上游 PR #3234）：社交媒体爬虫不重定向，直接渲染带 og:* meta 的
+ * 预览页，社交平台卡片能展示分享名/大小/属主。
  */
 app.get('/s/:id', (c) => {
   const ctx = ctxOf(c);
   const share = new ShareService(ctx, new FileSystemService(ctx));
   const query = new URL(c.req.url).searchParams;
-  return c.redirect(share.shortLinkRedirect(c.req.param('id'), undefined, query), 302);
+  const target = share.shortLinkRedirect(c.req.param('id'), undefined, query);
+  if (isSocialMediaBot(c.req.header('User-Agent'))) {
+    return renderSharePreview(c, ctx, c.req.param('id'), undefined, target);
+  }
+  return c.redirect(target, 302);
 });
 
 app.get('/s/:id/:password', (c) => {
   const ctx = ctxOf(c);
   const share = new ShareService(ctx, new FileSystemService(ctx));
   const query = new URL(c.req.url).searchParams;
-  return c.redirect(share.shortLinkRedirect(c.req.param('id'), c.req.param('password'), query), 302);
+  const target = share.shortLinkRedirect(c.req.param('id'), c.req.param('password'), query);
+  if (isSocialMediaBot(c.req.header('User-Agent'))) {
+    return renderSharePreview(c, ctx, c.req.param('id'), c.req.param('password'), target);
+  }
+  return c.redirect(target, 302);
 });
 
 /**
