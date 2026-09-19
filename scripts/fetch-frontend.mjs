@@ -13,7 +13,7 @@
  * 面板的两格命令不需要变。任何一步失败都会带出真实报错并以非零码退出。
  */
 import { spawnSync } from 'node:child_process';
-import { cpSync, existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
@@ -57,9 +57,33 @@ function cleanup() {
   rmSync(SRC_DIR, { recursive: true, force: true });
 }
 
+/**
+ * 官方前端的 index.html 是个模板：{siteName} / {pwa_small_icon} /
+ * var(--defaultThemeColor) 这些占位符在原版里由 Go 后端运行时填充
+ * （middleware/frontend.go），静态部署拿不到这一步，浏览器会直接看到
+ * "{siteName}" 字面量、favicon 指向不存在的地址。这里按原版
+ * inventory/setting.go 的默认值填充（幂等：已填充过的文件不再变动）。
+ * 管理后台改站点名后，PWA 名称与站内标题跟随设置 —— manifest.json 由
+ * Worker 动态生成，页面标题由前端应用加载配置后自行更新。
+ */
+function patchIndexHtml() {
+  const file = path.join(TARGET, 'index.html');
+  if (!existsSync(file)) return;
+  const html = readFileSync(file, 'utf8');
+  const patched = html
+    .replaceAll('{siteName}', 'Cloudreve')
+    .replaceAll('{siteDes}', 'Cloudreve')
+    .replaceAll('{siteScript}', '')
+    .replaceAll('{pwa_small_icon}', '/static/img/favicon.ico')
+    .replaceAll('{pwa_medium_icon}', '/static/img/logo192.png')
+    .replaceAll('var(--defaultThemeColor)', '#1976d2');
+  if (patched !== html) writeFileSync(file, patched);
+}
+
 // --- 1. 已有产物 ---
 if (existsSync(path.join(TARGET, 'index.html'))) {
-  console.log('  frontend/ 已存在，直接复用。');
+  console.log('  frontend/ 已存在，补一遍占位符填充后直接复用。');
+  patchIndexHtml();
   process.exit(0);
 }
 console.log('  未发现 frontend/，开始获取官方前端…');
@@ -81,6 +105,7 @@ try {
       cpSync(inner, TARGET, { recursive: true });
       cleanup();
       if (existsSync(path.join(TARGET, 'index.html'))) {
+        patchIndexHtml();
         console.log('✅ 前端就绪（Release 预构建包）。');
         process.exit(0);
       }
@@ -134,5 +159,6 @@ if (!existsSync(path.join(built, 'index.html'))) {
 rmSync(TARGET, { recursive: true, force: true });
 cpSync(built, TARGET, { recursive: true });
 cleanup();
+patchIndexHtml();
 
 console.log(`✅ 官方前端就绪：${TARGET}`);

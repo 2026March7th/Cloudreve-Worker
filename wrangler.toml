@@ -51,15 +51,17 @@ bucket_name = "cloudreve-worker"
 # scripts/fetch-frontend.mjs 自动获取（优先 Release 预构建包，否则拉上游
 # 源码现构建，固定在上游 .gitmodules 指定的提交 19da0fe1）。
 #
-# run_worker_first 保证 API / 短链 / 直链优先走 Worker，其余交给静态资源
-# 与 SPA 回落。想把前端单独部署到别处（Pages 等），不删 frontend/ 也行，
+# run_worker_first 保证 API / 短链 / 直链 / PWA manifest 优先走 Worker，
+# 其余交给静态资源与 SPA 回落（manifest.json 由 Worker 动态生成，静态产物
+# 里没有这个文件，不进 Worker 就会被 SPA 回落成 index.html）。
+# 想把前端单独部署到别处（Pages 等），不删 frontend/ 也行，
 # 配 FRONTEND_URL 后反代优先于 [assets]。
 # ---------------------------------------------------------------------------
 [assets]
 directory = "./frontend"
 binding = "ASSETS"
 not_found_handling = "single-page-application"
-run_worker_first = ["/api/*", "/s/*", "/f/*"]
+run_worker_first = ["/api/*", "/s/*", "/f/*", "/manifest.json"]
 
 # ---------------------------------------------------------------------------
 # 定时任务：回收站到期清理（对应原版的 trash_collector 队列任务）

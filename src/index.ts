@@ -136,6 +136,35 @@ app.route('/api/v4/callback', callbackRoutes);
 app.route('/api/v4/devices', devicesRoutes);
 app.route('/dav', davRoutes);
 
+/**
+ * PWA manifest。官方前端的构建产物里**没有**这个文件 —— 原版由 Go 后端
+ * 动态生成（`routers/controllers/site.go` 的 Manifest），index.html 里的
+ * `<link rel="manifest">` 指向它。字段结构与原版完全一致，值跟随站点设置。
+ * 注意 run_worker_first 必须包含 /manifest.json，否则会被静态资源层
+ * 按 SPA 回落成 index.html（浏览器报 Manifest syntax error）。
+ */
+app.get('/manifest.json', (c) => {
+  const s = ctxOf(c).settings;
+  c.header('Cache-Control', 'public, no-cache');
+  return c.json({
+    short_name: s.siteName,
+    name: s.siteName,
+    icons: [
+      {
+        src: s.get('pwa_small_icon', '/static/img/favicon.ico'),
+        sizes: '64x64 32x32 24x24 16x16',
+        type: 'image/x-icon',
+      },
+      { src: s.get('pwa_medium_icon', '/static/img/logo192.png'), type: 'image/png', sizes: '192x192' },
+      { src: s.get('pwa_large_icon', '/static/img/logo512.png'), type: 'image/png', sizes: '512x512' },
+    ],
+    start_url: '.',
+    display: s.get('pwa_display', 'standalone'),
+    theme_color: s.get('pwa_theme_color', '#000000'),
+    background_color: s.get('pwa_background_color', '#ffffff'),
+  }) as never;
+});
+
 // ---------------------------------------------------------------------------
 // 内容跨域。对应原版 `middleware.ContentCORS()`，只挂在两个「内容」路由组上：
 //   - /api/v4/file/content/:id/:speed/:name   实体内容（预览 / 下载）
