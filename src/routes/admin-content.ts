@@ -831,19 +831,68 @@ function taskToResponse(codec: HashIDCodec, t: Record<string, unknown>) {
   };
 }
 
-/** `GET /admin/queue/metrics` —— 各状态任务计数。对应 `AdminGetQueueMetrics`。 */
+/**
+ * `GET /admin/queue/metrics` —— 各队列任务计数。对应上游 `AdminGetQueueMetrics`
+ * （`service/admin/task.go:21`），它返回 **数组** `[]QueueMetric`，每个标准队列
+ * 一条（media_meta / recycle / io_intense / remote_download / thumb）。
+ *
+ * 之前这里错误地回了一个扁平对象 `{by_status, busy_workers, ...}`，前端
+ * `Queue.tsx` 拿到后直接 `setMetrics(res)` 再 `metrics.map(...)`，于是
+ * `metrics.map is not a function` 把整个「离线下载队列」设置页打崩。
+ *
+ * 边缘版没有常驻 worker（任务在请求内联执行），`busy_workers` 恒为 0；其余计数
+ * 从 `tasks` 表按 type+status 分组后归类到 5 个队列。
+ */
 adminContentRoutes.get('/queue/metrics', async (c) => {
   const { ctx } = withCtx(c);
-  const byStatus = await ctx.tasks.countByStatus();
-  return ok(c, {
-      by_status: byStatus,
-      // 边缘版没有常驻 worker：任务是请求内联执行的，因此不存在繁忙 worker
-      busy_workers: 0,
-      success_tasks: 0,
-      failure_tasks: 0,
-      submitted_tasks: byStatus.queued ?? 0,
-      suspending_tasks: byStatus.suspending ?? 0,
-    });
+  const byTypeStatus = await ctx.tasks.countByTypeStatus();
+
+  // 任务类型 → 队列的归属，对齐上游 5 个标准队列。
+  const QUEUE_TYPES: Record<string, string[]> = {
+    media_meta: ['media_meta'],
+    recycle: ['entity_recycle_routine', 'explicit_entity_recycle'],
+    io_intense: [
+      'create_archive',
+      'extract_archive',
+      'import',
+      'upload_sentinel_check',
+      'full_text_index',
+      'full_text_copy',
+      'full_text_change_owner',
+      'full_text_delete',
+      'full_text_rebuild',
+    ],
+    remote_download: ['remote_download'],
+    thumb: ['thumb'],
+  };
+
+  const agg: Record<string, { submitted: number; success: number; failure: number; suspending: number }> = {
+    media_meta: { submitted: 0, success: 0, failure: 0, suspending: 0 },
+    recycle: { submitted: 0, success: 0, failure: 0, suspending: 0 },
+    io_intense: { submitted: 0, success: 0, failure: 0, suspending: 0 },
+    remote_download: { submitted: 0, success: 0, failure: 0, suspending: 0 },
+    thumb: { submitted: 0, success: 0, failure: 0, suspending: 0 },
+  };
+
+  for (const row of byTypeStatus) {
+    const queue = Object.keys(QUEUE_TYPES).find((q) => QUEUE_TYPES[q].includes(row.type));
+    if (!queue) continue;
+    agg[queue].submitted += row.total;
+    if (row.status === 'completed') agg[queue].success += row.total;
+    else if (row.status === 'error') agg[queue].failure += row.total;
+    else if (row.status === 'suspending') agg[queue].suspending += row.total;
+  }
+
+  const metrics = Object.keys(QUEUE_TYPES).map((name) => ({
+    name,
+    busy_workers: 0,
+    success_tasks: agg[name].success,
+    failure_tasks: agg[name].failure,
+    submitted_tasks: agg[name].submitted,
+    suspending_tasks: agg[name].suspending,
+  }));
+
+  return ok(c, metrics);
 });
 
 /**

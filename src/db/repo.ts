@@ -1472,6 +1472,25 @@ export class TaskRepo {
     for (const r of rows) out[String(r.status)] = toNum(r.total);
     return out;
   }
+
+  /**
+   * 按「任务类型 + 状态」分组计数。供 `/admin/queue/metrics` 把任务归类到
+   * 5 个标准队列（media_meta / recycle / io_intense / remote_download / thumb）。
+   * 边缘版没有常驻 worker，任务是请求内联跑完的，所以队列计数只能从 `tasks`
+   * 表反推，而不是读内存里的队列追踪器。
+   */
+  async countByTypeStatus(): Promise<{ type: string; status: string; total: number }[]> {
+    const rows = (await this.sql`
+      SELECT type, status, COUNT(*)::int AS total
+      FROM tasks WHERE deleted_at IS NULL
+      GROUP BY type, status
+    `) as Record<string, unknown>[];
+    return rows.map((r) => ({
+      type: String(r.type),
+      status: String(r.status),
+      total: toNum(r.total),
+    }));
+  }
 }
 
 // ---------------------------------------------------------------------------
