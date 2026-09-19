@@ -425,7 +425,8 @@ adminContentRoutes.post('/file', async (c) => {
   const orderCol = orderColumn(body.order_by, ['id', 'name', 'size', 'created_at', 'updated_at']);
   const orderDir = orderDirection(body.order_direction);
 
-  const where = `f.deleted_at IS NULL AND f.type = 0
+  // files 表没有 deleted_at 列（回收站按 entities 软删，见 migrations/0001 注释）
+  const where = `f.type = 0
       AND ($1::text = '' OR f.name ILIKE '%' || $1 || '%')
       AND ($2::int IS NULL OR f.owner_id = $2)
       AND ($3::int IS NULL OR f.storage_policy_files = $3)
@@ -635,7 +636,7 @@ adminContentRoutes.get('/entity/:id', async (c) => {
   const files = (await sql(
     `SELECT f.* FROM files f
      JOIN file_entities fe ON fe.file_id = f.id
-     WHERE fe.entity_id = $1 AND f.deleted_at IS NULL ORDER BY f.id ASC`,
+     WHERE fe.entity_id = $1 ORDER BY f.id ASC`,
     [id],
   )) as Record<string, unknown>[];
 
