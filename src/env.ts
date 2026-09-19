@@ -19,9 +19,9 @@ export interface Env {
   // 之所以这样安排：官方前端的面板只有这组 SMTP 字段，配置若放环境变量，
   // 管理员在面板里改了什么都不会生效，面板就成了摆设。
 
-  // --- 变量（wrangler.toml [vars]） ---
-  /** 本站对外地址，用于拼分享链接 / 下载直链 */
-  SITE_URL: string;
+  // --- 变量（可选，wrangler.toml 故意不声明 [vars]，见该文件注释） ---
+  /** 本站对外地址，用于拼分享链接 / 下载直链；缺省回落到设置里的 siteURL */
+  SITE_URL?: string;
   /**
    * 官方前端的地址。两种用法二选一：
    *   - 配了 `[assets]`（推荐）：官方前端构建产物随 Worker 一起发布，此变量留空；
@@ -29,7 +29,6 @@ export interface Env {
    *     非 /api 的请求会原样反代过去。
    */
   FRONTEND_URL?: string;
-  LOG_LEVEL?: string;
   ENVIRONMENT?: string;
   /**
    * 允许跨域访问 API 的源，逗号分隔（如 `https://a.com,https://b.com`）。

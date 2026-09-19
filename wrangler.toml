@@ -14,20 +14,12 @@ globs = ["**/*.sql"]
 fallthrough = true
 
 # ---------------------------------------------------------------------------
-# 变量（非机密）。机密（DATABASE_URL）不要写在这里 —— 它声明在
-# .dev.vars.example 里，「Deploy to Cloudflare」按钮会在部署页让你填。
+# 这里**故意不写 [vars]**：「Deploy to Cloudflare」按钮会把 [vars] 里的每一项
+# 都渲染成部署页的必填框，可选变量放进去会强迫所有用户填写。
+# 需要时自己在面板（或 wrangler.toml）里加，代码对以下变量全部可缺省：
+#   SITE_URL / FRONTEND_URL / LOG_LEVEL / CORS_ALLOW_ORIGINS / R2_PUBLIC_BASE
+# 机密（DATABASE_URL 等）声明在 .dev.vars.example，由部署页收集。
 # ---------------------------------------------------------------------------
-[vars]
-# 站点对外地址，用于生成分享短链 / 下载直链 / 回调地址。
-# 部署完成后在 Cloudflare 面板 → 设置 → 变量里改成你的真实地址，
-# 例如 https://cloudreve-worker.<你的子域>.workers.dev
-SITE_URL = ""
-# 官方前端的地址。**只在没有配置 [assets] 时才需要填**：
-# 填了就把非 /api 的请求原样反代过去（前端可独立部署在 Pages 等）。
-# 如果按下面的 [assets] 把官方前端构建产物随 Worker 一起发布，这里留空即可。
-FRONTEND_URL = ""
-# 日志级别: debug | info | warn | error
-LOG_LEVEL = "info"
 
 # ---------------------------------------------------------------------------
 # KV / R2：占位 ID **不用改**。

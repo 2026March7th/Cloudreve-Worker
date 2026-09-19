@@ -236,7 +236,7 @@ not_found_handling = "single-page-application"
 run_worker_first = ["/api/*", "/s/*", "/f/*"]
 ```
 
-`[vars]` 里的 `FRONTEND_URL` 保持空字符串。
+方案 A 不需要配 `FRONTEND_URL`，不配就不反代，请求全走静态资源。
 
 > `run_worker_first` 是关键：它保证 `/api/*`、`/s/*`（分享短链）、`/f/*`（文件直链）
 > 优先交给 Worker，其余路径走静态资源与 SPA 回落。漏了它前端路由会 404。
@@ -263,7 +263,8 @@ npm run typecheck    # 可选，确认没有类型错误
 npm run deploy
 ```
 
-成功后把 `[vars]` 里的 `SITE_URL` 改成真实域名再 `npm run deploy` 一次：
+成功后设置 `SITE_URL` 再 `npm run deploy` 一次（两种加法任选：面板 →
+环境变量里加；或 wrangler.toml 里加一段 `[vars]`）：
 
 ```toml
 [vars]

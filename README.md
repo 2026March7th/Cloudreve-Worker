@@ -38,13 +38,14 @@ Workers & Pages → Create → 选仓库，只填两格：
 
 ## 环境变量
 
+部署页只要求填 `DATABASE_URL` 一项，其余全部可选——想要时自己在面板（Workers → 设置 → 变量和机密）里加，不加也能跑：
+
 | 变量 | 必填 | 说明 |
 |---|---|---|
 | `DATABASE_URL` | ✅ | Neon 连接串。加在部署项目的环境变量里，`npm run deploy` 会自动写成运行时 Secret；也可部署后在 Worker 的「变量和机密」里手动加 |
-| `SITE_URL` | 建议 | 站点对外地址（Worker 地址），加在部署项目的环境变量里即可自动生效 |
+| `SITE_URL` | 建议 | 站点对外地址（Worker 地址），分享短链 / 下载直链用它；不设则回落到管理后台的 `siteURL` 设置 |
 | `JWT_SECRET` | 可选 | 令牌签名密钥（32 位以上随机串）。不设会自动生成并入库 |
 | `FRONTEND_URL` | 可选 | 官方前端单独部署在别处时才填，Worker 会把非 API 请求反代过去 |
-| `LOG_LEVEL` | 可选 | `debug` / `info` / `warn` / `error`，默认 `info` |
 
 邮件、全文检索（Meilisearch + Tika）、存储策略等全部在**管理后台**配置，不占环境变量。详见 [DEPLOY.md](./DEPLOY.md)。
 
