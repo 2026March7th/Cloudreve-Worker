@@ -82,8 +82,7 @@ adminRoutes.get('/summary', async (c) => {
     WHERE deleted_at IS NULL AND reference_count > 0 AND type = 0
   `) as Record<string, unknown>[];
 
-  return c.json(
-    ok(c, {
+  return ok(c, {
       site_url: ctx.settings.siteUrl,
       version: BACKEND_VERSION,
       user_count: userCount,
@@ -93,8 +92,7 @@ adminRoutes.get('/summary', async (c) => {
       pending_tasks: pendingTasks,
       policy_count: policies.length,
       supported_policies: SUPPORTED_POLICY_TYPES,
-    }) as never,
-  );
+    });
 });
 
 /** 读取设置 */
@@ -198,16 +196,14 @@ adminRoutes.post('/group', async (c) => {
   for (const g of groups) {
     out.push(groupToResponse(ctx.codec, g, await groupExtras(ctx, g)));
   }
-  return c.json(
-    ok(c, {
+  return ok(c, {
       groups: out,
       pagination: {
         page: Number(body.page ?? 0) || 0,
         page_size: Number(body.page_size ?? 20) || 20,
         total_items: groups.length,
       },
-    }) as never,
-  );
+    });
 });
 
 adminRoutes.get('/group/:id', async (c) => {
@@ -312,9 +308,7 @@ adminRoutes.put('/group/:id', async (c) => {
   try {
     await ctx.groups.patch(id, patch);
     const updated = await ctx.groups.byId(id);
-    return c.json(
-      ok(c, groupToResponse(ctx.codec, updated!, await groupExtras(ctx, updated!))) as never,
-    );
+    return ok(c, groupToResponse(ctx.codec, updated!, await groupExtras(ctx, updated!)));
   } catch (e) {
     return fail(c, e);
   }
@@ -507,8 +501,7 @@ adminRoutes.post('/policy', async (c) => {
   const ctx = ctxOf(c);
   const body = (await c.req.json().catch(() => ({}))) as { page?: number; page_size?: number };
   const policies = await ctx.policies.list();
-  return c.json(
-    ok(c, {
+  return ok(c, {
       policies: policies.map((p) => policyToResponse(ctx.codec, p)),
       // 前端 `ListStoragePolicyResponse` 要求 pagination 存在
       pagination: {
@@ -517,8 +510,7 @@ adminRoutes.post('/policy', async (c) => {
         total_items: policies.length,
       },
       supported_types: SUPPORTED_POLICY_TYPES,
-    }) as never,
-  );
+    });
 });
 
 /** 策略详情。对应上游 `SingleStoragePolicyService.Get`（`service/admin/policy.go:229`）。 */
@@ -572,9 +564,7 @@ adminRoutes.put('/policy', async (c) => {
   }
   const type = String(body.type);
   if (!isPolicyTypeSupported(type)) {
-    return c.json(
-      fail(c, new AppError(40006, `Policy type "${type}" is not supported by the edge build`)) as never,
-    );
+    return fail(c, new AppError(40006, `Policy type "${type}" is not supported by the edge build`));
   }
   try {
     const policy = await ctx.policies.create(policyCreateArgs(body, type));
@@ -594,9 +584,7 @@ adminRoutes.put('/policy/:id', async (c) => {
   const raw = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
   const body = unwrapBody<Record<string, unknown>>(raw, 'policy');
   if (body.type !== undefined && !isPolicyTypeSupported(String(body.type))) {
-    return c.json(
-      fail(c, new AppError(40006, `Policy type "${body.type}" is not supported`)) as never,
-    );
+    return fail(c, new AppError(40006, `Policy type "${body.type}" is not supported`));
   }
 
   try {
@@ -628,9 +616,7 @@ adminRoutes.put('/policy/:id', async (c) => {
 
     // 上游 Update 之后紧接着调 Get，这里照做：返回带 edges 的详情
     const updated = await ctx.policies.byId(id);
-    return c.json(
-      ok(c, policyToResponse(ctx.codec, updated!, { groups: await policyGroups(ctx, id) })) as never,
-    );
+    return ok(c, policyToResponse(ctx.codec, updated!, { groups: await policyGroups(ctx, id) }));
   } catch (e) {
     return fail(c, e);
   }
@@ -682,14 +668,12 @@ function oauthCallbackUrlFor(siteUrl: string): string {
 adminRoutes.post('/policy/cors', async (c) => {
   const raw = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
   const body = unwrapBody<Record<string, unknown>>(raw, 'policy');
-  return c.json(
-    fail(
+  return fail(
       c,
       Err.param(
         `CORS setup is not available for policy type "${String(body.type ?? '')}"`,
       ),
-    ) as never,
-  );
+    );
 });
 
 /** 获取 OAuth 回调地址。对应 `AdminGetPolicyOAuthCallbackURL`。 */

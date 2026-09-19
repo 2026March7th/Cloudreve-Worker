@@ -46,13 +46,11 @@ callbackRoutes.post('/onedrive/:sessionID/:key', async (c) => {
 });
 
 callbackRoutes.all('/*', (c) =>
-  c.json(
-    fail(
+  fail(
       c,
       new AppError(
         CodeFeatureNotEnabled,
         'Only the OneDrive upload callback is implemented in the edge build',
       ),
-    ) as never,
-  ),
+    ),
 );

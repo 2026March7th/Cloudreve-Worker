@@ -208,9 +208,7 @@ adminContentRoutes.post('/user', async (c) => {
     out.push(userToResponse(codec, u, edges.group, edges.policy));
   }
 
-  return c.json(
-    ok(c, { users: out, pagination: paginationOf(page, pageSize, num(countRows[0]?.total)) }) as never,
-  );
+  return ok(c, { users: out, pagination: paginationOf(page, pageSize, num(countRows[0]?.total)) });
 });
 
 /** `GET /admin/user/:id` —— 用户详情。 */
@@ -226,12 +224,10 @@ adminContentRoutes.get('/user/:id', async (c) => {
 
   const user = rows[0];
   const edges = await userEdges(ctx, num(user.group_users));
-  return c.json(
-    ok(c, {
+  return ok(c, {
       ...userToResponse(codec, user, edges.group, edges.policy),
       capacity: { total: num(edges.group?.max_storage), used: num(user.storage) },
-    }) as never,
-  );
+    });
 });
 
 /**
@@ -454,9 +450,7 @@ adminContentRoutes.post('/file', async (c) => {
 
   const out = [];
   for (const f of rows) out.push(await fileToResponse(codec, ctx, f));
-  return c.json(
-    ok(c, { files: out, pagination: paginationOf(page, pageSize, num(countRows[0]?.total)) }) as never,
-  );
+  return ok(c, { files: out, pagination: paginationOf(page, pageSize, num(countRows[0]?.total)) });
 });
 
 /** `GET /admin/file/:id` —— 文件详情（含元数据、实体、直链、分享）。 */
@@ -490,8 +484,7 @@ adminContentRoutes.get('/file/:id', async (c) => {
   )) as Record<string, unknown>[];
 
   const base = await fileToResponse(codec, ctx, rows[0]);
-  return c.json(
-    ok(c, {
+  return ok(c, {
       ...base,
       edges: {
         ...base.edges,
@@ -510,8 +503,7 @@ adminContentRoutes.get('/file/:id', async (c) => {
         })),
         shares: shares.map((s) => ({ id: num(s.id), downloads: num(s.downloads) })),
       },
-    }) as never,
-  );
+    });
 });
 
 /** `PUT /admin/file/:id` —— 改文件名。对应 `UpsertFileService`。 */
@@ -623,12 +615,10 @@ adminContentRoutes.post('/entity', async (c) => {
     params,
   )) as Record<string, unknown>[];
 
-  return c.json(
-    ok(c, {
+  return ok(c, {
       entities: rows.map((e) => entityToResponse(codec, e)),
       pagination: paginationOf(page, pageSize, num(countRows[0]?.total)),
-    }) as never,
-  );
+    });
 });
 
 /** `GET /admin/entity/:id` —— 实体详情，带上引用了它的文件。 */
@@ -656,8 +646,7 @@ adminContentRoutes.get('/entity/:id', async (c) => {
     if (owner && !map[owner]) map[owner] = codec.encodeUserID(owner);
   }
 
-  return c.json(
-    ok(c, {
+  return ok(c, {
       ...entityToResponse(codec, rows[0]),
       user_hash_id_map: map,
       edges: {
@@ -669,8 +658,7 @@ adminContentRoutes.get('/entity/:id', async (c) => {
           user_hash_id: codec.encodeUserID(num(f.owner_id)),
         })),
       },
-    }) as never,
-  );
+    });
 });
 
 /**
@@ -777,12 +765,10 @@ adminContentRoutes.post('/share', async (c) => {
     params,
   )) as Record<string, unknown>[];
 
-  return c.json(
-    ok(c, {
+  return ok(c, {
       shares: rows.map((s) => shareToResponse(codec, ctx.settings.siteUrl, s)),
       pagination: paginationOf(page, pageSize, num(countRows[0]?.total)),
-    }) as never,
-  );
+    });
 });
 
 /** `GET /admin/share/:id` —— 分享详情。 */
@@ -804,12 +790,10 @@ adminContentRoutes.get('/share/:id', async (c) => {
       >[])
     : [];
 
-  return c.json(
-    ok(c, {
+  return ok(c, {
       ...shareToResponse(codec, ctx.settings.siteUrl, rows[0]),
       edges: { file: fileRows[0] ? await fileToResponse(codec, ctx, fileRows[0]) : undefined },
-    }) as never,
-  );
+    });
 });
 
 /** `POST /admin/share/batch/delete` —— 批量删分享。 */
@@ -851,8 +835,7 @@ function taskToResponse(codec: HashIDCodec, t: Record<string, unknown>) {
 adminContentRoutes.get('/queue/metrics', async (c) => {
   const { ctx } = withCtx(c);
   const byStatus = await ctx.tasks.countByStatus();
-  return c.json(
-    ok(c, {
+  return ok(c, {
       by_status: byStatus,
       // 边缘版没有常驻 worker：任务是请求内联执行的，因此不存在繁忙 worker
       busy_workers: 0,
@@ -860,8 +843,7 @@ adminContentRoutes.get('/queue/metrics', async (c) => {
       failure_tasks: 0,
       submitted_tasks: byStatus.queued ?? 0,
       suspending_tasks: byStatus.suspending ?? 0,
-    }) as never,
-  );
+    });
 });
 
 /**
@@ -897,12 +879,10 @@ adminContentRoutes.post('/queue', async (c) => {
     params,
   )) as Record<string, unknown>[];
 
-  return c.json(
-    ok(c, {
+  return ok(c, {
       tasks: rows.map((t) => taskToResponse(codec, t)),
       pagination: paginationOf(page, pageSize, num(countRows[0]?.total)),
-    }) as never,
-  );
+    });
 });
 
 /** `GET /admin/queue/:id` —— 任务详情。 */
@@ -1002,12 +982,10 @@ adminContentRoutes.post('/node', async (c) => {
   const countRows = (await sql(
     'SELECT COUNT(*)::int AS total FROM nodes WHERE deleted_at IS NULL',
   )) as Record<string, unknown>[];
-  return c.json(
-    ok(c, {
+  return ok(c, {
       nodes: rows.map(nodeToResponse),
       pagination: paginationOf(page, pageSize, num(countRows[0]?.total)),
-    }) as never,
-  );
+    });
 });
 
 adminContentRoutes.get('/node/:id', async (c) => {
@@ -1341,9 +1319,7 @@ adminContentRoutes.post('/oauthClient', async (c) => {
     out.push(oauthClientToResponse(r, num(grantRows[0]?.total)));
   }
 
-  return c.json(
-    ok(c, { clients: out, pagination: paginationOf(page, pageSize, num(countRows[0]?.total)) }) as never,
-  );
+  return ok(c, { clients: out, pagination: paginationOf(page, pageSize, num(countRows[0]?.total)) });
 });
 
 /** `GET /admin/oauthClient/:id` —— OAuth 应用详情。 */

@@ -114,9 +114,7 @@ fileRoutes.get('/info', async (c) => {
     } else {
       return fail(c, Err.param('uri or id is required'));
     }
-    return c.json(
-      ok(c, await service.buildFileResponse(file, { extended, folderSummary: wantSummary })) as never,
-    );
+    return ok(c, await service.buildFileResponse(file, { extended, folderSummary: wantSummary }));
   } catch (e) {
     return fail(c, e);
   }

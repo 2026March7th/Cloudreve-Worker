@@ -98,15 +98,13 @@ sessionRoutes.get('/prepare', async (c) => {
   if (!user) {
     return fail(c, new AppError(CodeNotFound, 'User not found'));
   }
-  return c.json(
-    ok(c, {
+  return ok(c, {
       // 上游语义是「该用户**已注册过** passkey」（login.go:262，
       // len(Passkey) > 0），不是站点设置 authn_enabled —— 搞混了前端
       // 会在有密码的账号上误弹「无密码账号，请选择认证方式」。
       webauthn_enabled: (await ctx.passkeys.listByUser(user.id)).length > 0,
       password_enabled: Boolean(user.password),
-    }) as never,
-  );
+    });
 });
 
 /**
@@ -158,12 +156,10 @@ sessionRoutes.post('/authn', async (c) => {
     });
     // 上游链路 FinishLoginAuthn → UserIssueToken，返回与密码登录相同的结构
     const result = await new UserService(ctx).issueToken(user);
-    return c.json(
-      ok(c, {
+    return ok(c, {
         user: await new UserService(ctx).buildUserResponse(user, true),
         token: result,
-      }) as never,
-    );
+      });
   } catch (e) {
     return fail(c, e);
   }
@@ -179,9 +175,7 @@ sessionRoutes.get('/oauth/app/:app_id', async (c) => {
   const ctx = ctxOf(c);
   const service = new OAuthService(ctx, c.env);
   try {
-    return c.json(
-      ok(c, await service.getAppRegistration(c.req.param('app_id'), ctx.user?.id ?? null)) as never,
-    );
+    return ok(c, await service.getAppRegistration(c.req.param('app_id'), ctx.user?.id ?? null));
   } catch (e) {
     return fail(c, e);
   }

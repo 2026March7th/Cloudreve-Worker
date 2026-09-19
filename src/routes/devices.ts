@@ -78,8 +78,7 @@ devicesRoutes.get('/dav', async (c) => {
     pageSize,
   });
   const hasMore = (page + 1) * pageSize < total;
-  return c.json(
-    ok(c, {
+  return ok(c, {
       accounts: accounts.map((a) => davAccountToResponse(ctx.codec, a)),
       pagination: {
         page,
@@ -87,8 +86,7 @@ devicesRoutes.get('/dav', async (c) => {
         total_items: total,
         next_page_token: hasMore ? String(page + 1) : undefined,
       },
-    }) as never,
-  );
+    });
 });
 
 devicesRoutes.put('/dav', async (c) => {

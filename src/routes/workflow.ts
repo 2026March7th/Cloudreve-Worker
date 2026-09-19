@@ -76,12 +76,10 @@ workflowRoutes.get('/', async (c) => {
   const filtered =
     category === 'downloaded' ? tasks.filter((t) => t.status === 'completed') : tasks;
 
-  return c.json(
-    ok(c, {
+  return ok(c, {
       tasks: filtered.map((t) => taskToResponse(ctx.codec, t)),
       pagination: { page: 0, page_size: pageSize, total_items: filtered.length },
-    }) as never,
-  );
+    });
 });
 
 /**
@@ -105,22 +103,18 @@ workflowRoutes.get('/progress/:id', async (c) => {
     const props = task.public_state?.summary?.props ?? {};
     const total = Number(props.total ?? 0);
     const current = done ? total : Number(props.indexed ?? 0);
-    return c.json(
-      ok(c, {
+    return ok(c, {
         default: { total, current, identifier: 'default' },
-      }) as never,
-    );
+      });
   }
 
-  return c.json(
-    ok(c, {
+  return ok(c, {
       default: {
         total: 1,
         current: done ? 1 : 0,
         identifier: 'default',
       },
-    }) as never,
-  );
+    });
 });
 
 // ---------------------------------------------------------------------------
@@ -146,15 +140,13 @@ workflowRoutes.post('/archive', async (c) => {
 
 /** 解压需要一个 ZIP **读取器**（含 inflate），边缘版没做，见 README。 */
 workflowRoutes.post('/extract', (c) =>
-  c.json(
-    fail(
+  fail(
       c,
       new AppError(
         CodeFeatureNotEnabled,
         'Extracting archives is not implemented in the edge build',
       ),
-    ) as never,
-  ),
+    ),
 );
 
 // ---------------------------------------------------------------------------
@@ -175,15 +167,13 @@ workflowRoutes.post('/download', async (c) => {
   if (!urls.length && body.src_file) {
     const read = await ctx.files.byId(Number(body.src_file)).catch(() => null);
     void read;
-    return c.json(
-      fail(
+    return fail(
         c,
         new AppError(
           CodeFeatureNotEnabled,
           'Importing a URL list file is not implemented in the edge build',
         ),
-      ) as never,
-    );
+      );
   }
   if (!urls.length) return fail(c, Err.param('src is required'));
 
@@ -245,15 +235,13 @@ workflowRoutes.delete('/download/:id', async (c) => {
  * 加上导入通常是量大且耗时的活（正是 Workers 最不擅长的），所以不做。
  */
 workflowRoutes.post('/import', (c) =>
-  c.json(
-    fail(
+  fail(
       c,
       new AppError(
         CodeFeatureNotEnabled,
         'Importing objects from a storage policy is not implemented in the edge build',
       ),
-    ) as never,
-  ),
+    ),
 );
 
 /**
@@ -275,15 +263,13 @@ workflowRoutes.post('/rebuildFtsIndex', async (c) => {
   const search = new SearchService(ctx);
 
   if (!search.available) {
-    return c.json(
-      fail(
+    return fail(
         c,
         new AppError(
           CodeFeatureNotEnabled,
           'Full text search is not configured. Set fts_enabled and the Meilisearch endpoint in the admin panel first.',
         ),
-      ) as never,
-    );
+      );
   }
 
   try {

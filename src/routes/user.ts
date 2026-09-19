@@ -106,12 +106,10 @@ userRoutes.get('/capacity', async (c) => {
   const ctx = ctxOf(c);
   if (!ctx.user) return fail(c, Err.loginRequired());
   const capacity = await new UserService(ctx).capacity();
-  return c.json(
-    ok(c, {
+  return ok(c, {
       total: capacity.total,
       used: capacity.used,
-    }) as never,
-  );
+    });
 });
 
 /** 头像 */
@@ -138,8 +136,7 @@ userRoutes.get('/setting', async (c) => {
   const ctx = ctxOf(c);
   if (!ctx.user) return fail(c, Err.loginRequired());
   const settings = ctx.user.settings ?? {};
-  return c.json(
-    ok(c, {
+  return ok(c, {
       version_retention_enabled: settings.version_retention === true,
       version_retention_ext: settings.version_retention_ext ?? [],
       version_retention_max: settings.version_retention_max ?? 0,
@@ -151,8 +148,7 @@ userRoutes.get('/setting', async (c) => {
       disable_view_sync: settings.disable_view_sync === true,
       share_links_in_profile: settings.share_links_in_profile ?? '',
       oauth_grants: [],
-    }) as never,
-  );
+    });
 });
 
 userRoutes.patch('/setting', async (c) => {
@@ -225,9 +221,7 @@ userRoutes.post('/authn', async (c) => {
   }
   const service = new PasskeyService(ctx, c.env, ctx.codec);
   try {
-    return c.json(
-      ok(c, await service.finishRegister(ctx.user, { response: body.response, name: body.name })) as never,
-    );
+    return ok(c, await service.finishRegister(ctx.user, { response: body.response, name: body.name }));
   } catch (e) {
     return fail(c, e);
   }
@@ -316,8 +310,7 @@ userRoutes.get('/search', async (c) => {
   try {
     const users = await ctx.users.searchActive(keyword, 10);
     const service = new UserService(ctx);
-    return c.json(
-      ok(
+    return ok(
         c,
         users.map((u) => ({
           id: ctx.codec.encodeUserID(u.id),
@@ -326,8 +319,7 @@ userRoutes.get('/search', async (c) => {
           created_at: u.created_at.toISOString(),
           email: u.email,
         })),
-      ) as never,
-    );
+      );
   } catch (e) {
     return fail(c, e);
   }
