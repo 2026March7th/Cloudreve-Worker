@@ -24,6 +24,7 @@ import { fail, ok } from './lib/response';
 import { AppError, CodeNotFound } from './lib/errors';
 import { ensureSettings, loadSettings } from './settings/provider';
 import { provision } from './db/provision';
+import { ensureEnvAdmin } from './services/envAdmin';
 import { HashIDCodec } from './lib/hashid';
 import { JWTService } from './lib/jwt';
 import { AppContext } from './services/context';
@@ -46,6 +47,18 @@ const BOOTSTRAP_FLAG = 'bootstrap:done:v2';
 const BOOTSTRAP_COOLDOWN = 'bootstrap:cooldown:v1';
 /** 同一 isolate 内的并发请求共享一次自举。 */
 let bootstrapPromise: Promise<void> | null = null;
+/** 环境变量管理员检查每个 isolate 只跑一次（KV 标记去重，见 services/envAdmin.ts）。 */
+let envAdminPromise: Promise<void> | null = null;
+
+/** 应用 ADMIN_EMAIL / ADMIN_PASSWORD 环境变量（配置了才生效）。失败只记日志，不拦请求。 */
+function ensureEnvAdminOnce(env: Env): Promise<void> {
+  if (!envAdminPromise) {
+    envAdminPromise = ensureEnvAdmin(env).catch((e) => {
+      console.error('env admin bootstrap failed', describeError(e));
+    });
+  }
+  return envAdminPromise;
+}
 
 const app = new Hono<AppBindings>();
 
@@ -83,6 +96,9 @@ app.use('*', async (c, next) => {
     }
     await bootstrapPromise;
   }
+  // 兜底管理员（ADMIN_EMAIL / ADMIN_PASSWORD，可选）——放在自举之外，
+  // 后配的环境变量也能在下一个冷启动 isolate 里生效。
+  await ensureEnvAdminOnce(c.env);
   await next();
 });
 

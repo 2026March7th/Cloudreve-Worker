@@ -46,6 +46,7 @@ Workers & Pages → Create → 选仓库，只填两格：
 | `SITE_URL` | 建议 | 站点对外地址（Worker 地址），分享短链 / 下载直链用它；不设则回落到管理后台的 `siteURL` 设置 |
 | `JWT_SECRET` | 可选 | 令牌签名密钥（32 位以上随机串）。不设会自动生成并入库 |
 | `FRONTEND_URL` | 可选 | 官方前端默认已随 Worker 一起发布；只有把前端单独部署到别处（如 Pages）时才填，填了反代优先于内置资源 |
+| `ADMIN_EMAIL` + `ADMIN_PASSWORD` | 可选 | 兜底管理员：两者都配置后，Worker 保证该邮箱存在、密码一致、属于管理员组。用于找回管理员权限（手机部署没有本机 CLI）。建议存成 **Secret**；网页里改过密码后只要不动这对变量就不会被覆盖，删掉变量则完全不再干预 |
 
 邮件、全文检索（Meilisearch + Tika）、存储策略等全部在**管理后台**配置，不占环境变量。详见 [DEPLOY.md](./DEPLOY.md)。
 

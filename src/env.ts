@@ -38,6 +38,13 @@ export interface Env {
   CORS_ALLOW_ORIGINS?: string;
   /** 可选的 R2 公共域名，配置后 R2 直链不带签名 */
   R2_PUBLIC_BASE?: string;
+  /**
+   * 兜底管理员（两者都配了才生效）：保证这个邮箱存在、密码一致、属于
+   * 管理员组。用于找回管理员权限 —— 手机部署没有本机 CLI，没处跑
+   * 原版的 `cloudreve --reset-admin-password`。见 `services/envAdmin.ts`。
+   */
+  ADMIN_EMAIL?: string;
+  ADMIN_PASSWORD?: string;
 
   // --- 绑定 ---
   /** KV：会话吊销名单、上传会话状态、验证码、实体 URL 缓存、OneDrive token 缓存 */

@@ -135,6 +135,11 @@ npx wrangler r2 bucket create cloudreve-worker
 > 想看每条语句的执行结果、或要在本机调试时才有用。
 >
 > 管理员账号也不再需要 seed：**第一个注册的用户自动进管理员组**。
+> 管理员密码丢了？手机部署没有本机 CLI，走环境变量兜底：在 Worker 的
+> **设置 → 变量和机密**里加 `ADMIN_EMAIL` + `ADMIN_PASSWORD`（建议存成
+> Secret 类型），保存后下一个冷启动 isolate 会自动把这个邮箱设回管理员
+> 组并重置成该密码（幂等：变量值不变就不重复落库，网页里改的密码不会被
+> 覆盖）。恢复访问后把这对变量删掉即可。
 
 这两步在**本机**跑（连的是同一个 Neon 库），脚本会读取 `DATABASE_URL` 环境变量，
 或者 `edge/.dev.vars` 文件。
