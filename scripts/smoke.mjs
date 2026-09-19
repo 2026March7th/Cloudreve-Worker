@@ -78,6 +78,8 @@ async function main() {
   if (envelopeOk('config/basic', basic)) {
     check('config/basic: data.title 存在', typeof basic.json.data.title === 'string' && basic.json.data.title.length > 0);
     check('config/basic: 匿名用户 anonymous=true', basic.json.data.user?.anonymous === true);
+    // 前端 NavBar 对 custom_nav_items 直接 .map：必须是数组（或缺失），绝不能是字符串
+    check('config/basic: custom_nav_items 是数组', basic.json.data.custom_nav_items === undefined || Array.isArray(basic.json.data.custom_nav_items), `实际类型 ${typeof basic.json.data.custom_nav_items}`);
   }
 
   const loginCfg = await req('GET', '/api/v4/site/config/login');
@@ -87,7 +89,16 @@ async function main() {
     check('config/login: register_enabled / authn 字段存在', 'register_enabled' in loginCfg.json.data && 'authn' in loginCfg.json.data);
   }
 
-  envelopeOk('config/explorer', await req('GET', '/api/v4/site/config/explorer'), { needData: false });
+  const explorerCfg = await req('GET', '/api/v4/site/config/explorer');
+  if (envelopeOk('config/explorer', explorerCfg, { needData: false })) {
+    const d = explorerCfg.json.data ?? {};
+    // 前端 redux 对这些字段按数组/对象/数字消费（ListView、viewer 等），
+    // 返回原始 JSON 字符串会在渲染期炸掉（如 i.map is not a function）
+    check('config/explorer: file_viewers 是数组', d.file_viewers === undefined || Array.isArray(d.file_viewers), `实际类型 ${typeof d.file_viewers}`);
+    check('config/explorer: custom_props 是数组', d.custom_props === undefined || Array.isArray(d.custom_props), `实际类型 ${typeof d.custom_props}`);
+    check('config/explorer: default_viewer_mapping 是对象', d.default_viewer_mapping === undefined || (typeof d.default_viewer_mapping === 'object' && !Array.isArray(d.default_viewer_mapping)), `实际类型 ${typeof d.default_viewer_mapping}`);
+    check('config/explorer: thumbnail_width/height 是数字', (d.thumbnail_width === undefined || typeof d.thumbnail_width === 'number') && (d.thumbnail_height === undefined || typeof d.thumbnail_height === 'number'), `实际 ${typeof d.thumbnail_width}/${typeof d.thumbnail_height}`);
+  }
   envelopeOk('config/app', await req('GET', '/api/v4/site/config/app'), { needData: false });
 
   const captcha = await req('GET', '/api/v4/site/captcha');

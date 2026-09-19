@@ -18,6 +18,23 @@ import { UserService } from '../services/user';
 
 const CAPTCHA_PREFIX = 'captcha:';
 const CAPTCHA_TTL = 1800; // 与原版 CaptchaTTL 一致（30 分钟）
+
+/**
+ * 设置表里部分字段存的是 JSON 字符串，但原版 SiteConfig 在 Go 侧已
+ * unmarshal 成结构化值再返回（如 `[]setting.CustomNavItem`、
+ * `types.DefaultViewerMapping`），前端 redux slice 也按数组/对象消费。
+ * 这里必须在服务端解析成真实类型；解析失败回退到空值而不是把原始
+ * 字符串透传出去（字符串.length 会骗过前端判空，然后 .map 直接崩）。
+ */
+function parseJson<T>(raw: string | undefined | null, fallback: T): T {
+  if (!raw) return fallback;
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    return (parsed ?? fallback) as T;
+  } catch {
+    return fallback;
+  }
+}
 /** 与原版 constants.BackendVersion 保持一致 */
 export const BACKEND_VERSION = '4.14.0';
 
@@ -57,19 +74,19 @@ siteRoutes.get('/config/:section', async (c) => {
       }) as never;
 
     case 'explorer':
-      // 原版这里的 file_viewers / custom_props / icons 等都是设置里的 JSON 字符串，
-      // 前端按原样解析，所以直接透传字符串；未实现的项返回空值而不是省略。
+      // JSON 型字段（file_viewers / default_viewer_mapping / custom_props）
+      // 原版返回结构化值，必须 parse 后再给前端；icons 上游就是字符串原样。
       return ok(c, {
         max_batch_size: s.maxBatchedFile,
-        file_viewers: s.get('file_viewers', '[]'),
-        default_viewer_mapping: s.get('viewer_default_apps', '{}'),
+        file_viewers: parseJson(s.get('file_viewers', '[]'), [] as unknown[]),
+        default_viewer_mapping: parseJson(s.get('viewer_default_apps', '{}'), {}),
         icons: s.get('explorer_icons', '[]'),
         map_provider: s.get('map_provider', 'openstreetmap'),
         google_map_tile_type: s.get('map_google_tile_type', 'roadmap'),
         mapbox_ak: s.get('map_mapbox_ak', ''),
-        thumbnail_width: s.get('thumb_width', '400'),
-        thumbnail_height: s.get('thumb_height', '300'),
-        custom_props: s.get('custom_props', '[]'),
+        thumbnail_width: parseInt(s.get('thumb_width', '400'), 10) || 400,
+        thumbnail_height: parseInt(s.get('thumb_height', '300'), 10) || 300,
+        custom_props: parseJson(s.get('custom_props', '[]'), [] as unknown[]),
         show_encryption_status: s.getBool('show_encryption_status', true),
         full_text_search: s.getBool('fts_enabled', false),
       }) as never;
@@ -98,7 +115,7 @@ siteRoutes.get('/config/:section', async (c) => {
         user: userPayload,
         logo: s.get('site_logo', '/static/img/logo.svg'),
         logo_light: s.get('site_logo_light', '/static/img/logo_light.svg'),
-        custom_nav_items: s.get('custom_nav_items', '[]'),
+        custom_nav_items: parseJson(s.get('custom_nav_items', '[]'), [] as unknown[]),
         custom_html: {
           headless_footer: s.get('headless_footer_html', ''),
           headless_bottom: s.get('headless_bottom_html', ''),
