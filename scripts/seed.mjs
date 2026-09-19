@@ -185,12 +185,12 @@ async function main() {
         (name, type, server, bucket_name, is_private, max_size,
          dir_name_rule, file_name_rule, settings)
       VALUES
-        ('R2 Default', 'r2', '', '', true, 0,
+        ('R2 Default', 's3', '', '', true, 0,
          'uploads/{uid}/{path}', '{uid}_{randomkey8}_{originname}', '{}'::jsonb)
       RETURNING id
     `;
     policyId = inserted[0].id;
-    console.log(`  storage policy #${policyId} (r2) created`);
+    console.log(`  storage policy #${policyId} (s3, R2 兼容) created`);
   } else {
     console.log(`  storage policy #${policyId} already exists, kept`);
   }

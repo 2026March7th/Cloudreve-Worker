@@ -42,7 +42,7 @@ import { permissionsOf } from '../services/context';
 import { fail, ok } from '../lib/response';
 import { UserService } from '../services/user';
 import { MailService } from '../services/mail';
-import { BooleanSet, GroupPermission } from '../lib/boolset';
+import { BooleanSet, GroupPermission, PolicyType } from '../lib/boolset';
 import { AppError, CodeFeatureNotEnabled, Err } from '../lib/errors';
 import { invalidateSettings } from '../settings/provider';
 import { SUPPORTED_POLICY_TYPES, isPolicyTypeSupported } from '../storage';
@@ -518,6 +518,30 @@ adminRoutes.post('/user/:id/reset-link', async (c) => {
  *     「没有组绑定此策略」（`StoragePolicyForm.tsx:21`）；
  *   - `countEntity` 查询参数带上时才回 `entities_count` / `entities_size`。
  */
+/**
+ * 上游前端 PolicyType 枚举的 11 个合法值（api/explorer.ts）。存储策略页用
+ * `PolicyPropsMap[policy.type].img` 渲染卡片 —— 库里出现枚举外的 type 会让
+ * 整页崩（'r2' 就这么炸过一次，见 provision.ts 的数据迁移）。响应层统一
+ * 归一兜底：未知 type 按边缘版唯一的 S3 兼容实现呈现。
+ */
+const KNOWN_POLICY_TYPES: ReadonlySet<string> = new Set([
+  'local',
+  'remote',
+  'oss',
+  'qiniu',
+  'onedrive',
+  'cos',
+  'upyun',
+  's3',
+  'ks3',
+  'obs',
+  'load_balance',
+]);
+
+function normalizePolicyType(type: string): string {
+  return KNOWN_POLICY_TYPES.has(type) ? type : PolicyType.S3;
+}
+
 function policyToResponse(
   codec: HashIDCodec,
   policy: StoragePolicyRow,
@@ -534,7 +558,7 @@ function policyToResponse(
     updated_at: policy.updated_at.toISOString(),
     deleted_at: policy.deleted_at ? policy.deleted_at.toISOString() : null,
     name: policy.name,
-    type: policy.type,
+    type: normalizePolicyType(policy.type),
     server: policy.server ?? '',
     bucket_name: policy.bucket_name ?? '',
     is_private: policy.is_private === true,
@@ -545,7 +569,7 @@ function policyToResponse(
     file_name_rule: policy.file_name_rule ?? '',
     settings: policy.settings ?? {},
     node_id: policy.node_id ?? 0,
-    supported: isPolicyTypeSupported(policy.type),
+    supported: isPolicyTypeSupported(normalizePolicyType(policy.type)),
     edges: {
       groups: extras.groups ?? [],
       users: [],
