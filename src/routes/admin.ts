@@ -49,7 +49,7 @@ import { SUPPORTED_POLICY_TYPES, isPolicyTypeSupported } from '../storage';
 import { BACKEND_VERSION } from './site';
 import { adminContentRoutes } from './admin-content';
 import { numericId, unwrapBody } from './shared';
-import { toByteaLiteral } from '../db';
+import { toByteaLiteral, type Sql } from '../db';
 import type { HashIDCodec } from '../lib/hashid';
 import type { GroupRow, StoragePolicyRow } from '../db/types';
 
@@ -67,33 +67,106 @@ adminRoutes.use('*', async (c, next) => {
 // 挂在同一前缀下，上面那条管理员中间件对挂载进来的路由同样生效。
 adminRoutes.route('/', adminContentRoutes);
 
-/** 概览 */
+/**
+ * 概览（管理面板首页）。对齐上游 `service/admin/site.go` 的 `SiteGetSummary`：
+ * 返回 `HomepageSummary` —— `site_urls` / `version{version,pro,commit}` /
+ * `metrics_summary`（近 12 天文件/用户/分享新增 + 总量）。
+ *
+ * 前端 `Home.tsx` 第 80 行对 `site_urls` 调 `.find`，第 136 行用 `metrics_summary`
+ * 画趋势图；缺任何一个都会崩或让「计算」功能失效，所以必须按上游契约返回，
+ * 不能像以前那样回一套自定义字段。
+ *
+ * `?generate=true` 才计算趋势（按钮触发）；否则只回 `site_urls` + `version`，
+ * 前端会显示「计算」按钮让用户主动触发，避免每次进首页都打一堆统计查询。
+ */
+const SUMMARY_RANGE_DAYS = 12;
+
 adminRoutes.get('/summary', async (c) => {
   const ctx = ctxOf(c);
-  const userCount = await ctx.users.countAll();
-  const policies = await ctx.policies.list();
-  const tasksByStatus = await ctx.tasks.countByStatus();
-  const pendingTasks = (tasksByStatus.queued ?? 0) + (tasksByStatus.processing ?? 0);
+  const generate = c.req.query('generate') === 'true' || c.req.query('generate') === '1';
 
-  // 站点容量：累加所有策略下实体的总大小
-  const sql = (await import('../db')).getSql(ctx.env);
-  const sizeRows = (await sql`
-    SELECT COALESCE(SUM(size), 0) AS total FROM entities
-    WHERE deleted_at IS NULL AND reference_count > 0 AND type = 0
-  `) as Record<string, unknown>[];
+  const version = { version: BACKEND_VERSION, pro: false, commit: 'edge' };
+  const siteUrls = ctx.settings.siteUrl ? [ctx.settings.siteUrl] : [];
 
-  return ok(c, {
-      site_url: ctx.settings.siteUrl,
-      version: BACKEND_VERSION,
-      user_count: userCount,
-      // 原版 Pro 标志恒为 false
-      pro: false,
-      capacity: Number((sizeRows[0]?.total as string) ?? 0),
-      pending_tasks: pendingTasks,
-      policy_count: policies.length,
-      supported_policies: SUPPORTED_POLICY_TYPES,
-    });
+  if (!generate) {
+    return ok(c, { site_urls: siteUrls, version } as never);
+  }
+
+  let metrics_summary: Record<string, unknown> | null = null;
+  try {
+    metrics_summary = await computeMetrics(ctx);
+  } catch (e) {
+    // 统计失败不该让整个概览 500；缺趋势数据前端会显示「计算」按钮重试
+    console.error('computeMetrics failed', e);
+  }
+
+  return ok(c, { site_urls: siteUrls, version, metrics_summary } as never);
 });
+
+/** 近 SUMMARY_RANGE_DAYS 天的每日新增统计。对齐上游 `CountByTimeRange` 语义。 */
+async function computeMetrics(ctx: ReturnType<typeof ctxOf>): Promise<Record<string, unknown>> {
+  const sql = (await import('../db')).getSql(ctx.env);
+  const now = new Date();
+  // 以 UTC 零点为边界，避免本地时区导致 SQL 与前端日期序列错位
+  const windowStart = Date.UTC(
+    now.getUTCFullYear(),
+    now.getUTCMonth(),
+    now.getUTCDate() - (SUMMARY_RANGE_DAYS - 1),
+  );
+
+  const dates: string[] = [];
+  for (let d = 0; d < SUMMARY_RANGE_DAYS; d++) {
+    dates.push(new Date(windowStart + d * 86400000).toISOString());
+  }
+
+  const [files, users, shares] = await Promise.all([
+    dailyCounts(sql, 'files', windowStart),
+    dailyCounts(sql, 'users', windowStart),
+    dailyCounts(sql, 'shares', windowStart),
+  ]);
+  const [file_total, user_total, share_total, entities_total] = await Promise.all([
+    countAll(sql, 'files'),
+    countAll(sql, 'users'),
+    countAll(sql, 'shares'),
+    countAll(sql, 'entities'),
+  ]);
+
+  return {
+    dates,
+    files,
+    users,
+    shares,
+    file_total,
+    user_total,
+    share_total,
+    entities_total,
+    generated_at: new Date().toISOString(),
+  };
+}
+
+/** 单指标近 12 天逐日新增：用 generate_series 生成日期序列后 LEFT JOIN，一次查询搞定。 */
+async function dailyCounts(sql: Sql, table: string, windowStart: number): Promise<number[]> {
+  const startISO = new Date(windowStart).toISOString();
+  const rows = (await sql(
+    `SELECT d.d AS day, COUNT(t.created_at)::bigint AS c
+       FROM generate_series($1::timestamptz, $1::timestamptz + interval '${SUMMARY_RANGE_DAYS - 1} day', interval '1 day') AS d(d)
+       LEFT JOIN ${table} t
+         ON t.created_at >= d.d AND t.created_at < d.d + interval '1 day'
+         AND t.deleted_at IS NULL
+       GROUP BY d.d ORDER BY d.d`,
+    [startISO],
+  )) as { c: unknown }[];
+  return rows.map((r) => Number(r.c ?? 0));
+}
+
+/** 全量计数（不限时间）。 */
+async function countAll(sql: Sql, table: string): Promise<number> {
+  const rows = (await sql(
+    `SELECT COUNT(*)::bigint AS c FROM ${table} WHERE deleted_at IS NULL`,
+    [],
+  )) as { c: unknown }[];
+  return Number(rows[0]?.c ?? 0);
+}
 
 /** 读取设置 */
 adminRoutes.post('/settings', async (c) => {

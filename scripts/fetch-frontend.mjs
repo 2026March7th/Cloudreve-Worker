@@ -136,6 +136,7 @@ if (!existsSync(src)) {
   console.error(`✘ 解压后找不到源码目录：${src}`);
   process.exit(1);
 }
+applyFrontendPatches(src);
 
 console.log('  安装前端依赖（首次约 1-3 分钟）…');
 runOrDie(
@@ -155,6 +156,20 @@ const built = path.join(src, 'build');
 if (!existsSync(path.join(built, 'index.html'))) {
   console.error(`✘ 构建产物里没有 index.html：${built}`);
   process.exit(1);
+}
+
+/**
+ * 本地前端补丁叠加层。仓库里的 frontend-patches/ 保存了我们对官方前端源码的
+ * 修改（去除 Pro 标记/弹窗、刷新 localStorage 缓存键等）。因为构建时前端源码是
+ * 从上游重新拉取的，这里在拉取解压后把补丁文件覆盖到对应路径，让修改能真正上线。
+ * 上游提交固定（见 COMMIT），补丁只需覆盖我们改过的文件，其余沿用上游。
+ */
+function applyFrontendPatches(srcDir) {
+  const patches = path.join(ROOT, 'frontend-patches');
+  if (!existsSync(patches)) return;
+  console.log('  叠加本地前端补丁（Pro 去除 / 缓存键刷新等）…');
+  cpSync(patches, srcDir, { recursive: true, force: true });
+  console.log('✅ 前端补丁已叠加。');
 }
 rmSync(TARGET, { recursive: true, force: true });
 cpSync(built, TARGET, { recursive: true });
