@@ -668,12 +668,19 @@ export class FileSystemService {
         owned: viewer !== undefined && dir.owner_id === viewer.id,
         uri,
       });
+    }
 
-      // 上游 getPreferredPolicy（dbfs.go:669-682）：取**父目录属主**所在
-      // 用户组绑定的存储策略下发给上传器。获取失败仅降级为缺字段，
-      // 不影响列表本身（上游也只 Warning 不阻断）。
+    // 上游 getPreferredPolicy（dbfs.go:669-682）：取**目录属主**所在用户组
+    // 绑定的存储策略下发给前端上传器。注意不能放进 `if (dir)` 里 ——
+    // My 根目录（首次登录还没建根 / 根即当前路径）时 dir 为 null，而上游
+    // 根目录的 parent 就是根文件夹、照常解析（dbfs.go:206）。缺失时前端
+    // 点「上传」直接抛 No policy selected 且文件选择器不打开。获取失败
+    // 仅降级为缺字段，不影响列表本身（上游也只 Warning 不阻断）。
+    const policyOwnerId =
+      dir?.owner_id ?? (uri.fsType === FileSystemType.My ? viewer?.id : undefined);
+    if (policyOwnerId != null) {
       try {
-        const owner = await this.ctx.users.byId(dir.owner_id);
+        const owner = await this.ctx.users.byId(policyOwnerId);
         const group = owner ? await this.ctx.groups.byId(owner.group_users) : null;
         const policy =
           group?.storage_policy_id != null

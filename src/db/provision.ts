@@ -218,6 +218,19 @@ async function seedSystemData(env: Env): Promise<void> {
   // 幂等：无 'r2' 行时为空更新。
   await sql`UPDATE storage_policies SET type = 's3', updated_at = now() WHERE type = 'r2'`;
 
+  // 数据修复：组播种原本只给组 2（注册组）绑定存储策略，组 1（站长）/
+  // 组 3（游客）恒为 NULL。而上游 getPreferredPolicy（dbfs.go:669 →
+  // inventory/policy.go:145 GetByGroup）假定**每个组都绑定了策略** ——
+  // 组无策略时列表响应缺 storage_policy，前端上传器点「上传」直接抛
+  // No policy selected 且文件选择器不打开。给未绑策略的系统组补绑
+  // 第一个可用策略。幂等：无 NULL 行时为空更新。
+  await sql`
+    UPDATE groups SET storage_policy_id = (
+      SELECT id FROM storage_policies WHERE deleted_at IS NULL ORDER BY id LIMIT 1
+    ), updated_at = now()
+    WHERE id IN (1, 2, 3) AND storage_policy_id IS NULL
+  `;
+
   // 默认 OAuth 客户端。官方版里「Cloudreve Web / Cloudreve Desktop」两个内置
   // 应用由闭源部分播种（开源仓库的 migrator 无此步骤，已核对），边缘版按
   // 前端可用 scope 自建。guid 固定 + ON CONFLICT DO NOTHING 保证幂等；
