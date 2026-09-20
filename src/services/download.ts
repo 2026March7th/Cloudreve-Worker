@@ -135,18 +135,21 @@ export class DownloadService {
     return entity;
   }
 
-  /** 构造本站代理下载地址并签名。 */
+  /** 构造本站代理下载地址并签名。`download` 为真时响应带 attachment 头。 */
   private async buildProxyUrl(
     entityId: number,
     name: string,
     expiresAt: number,
-    _download: boolean,
+    download: boolean,
   ): Promise<string> {
     const base = this.ctx.settings.siteUrl.replace(/\/+$/, '');
     const entityHash = this.ctx.codec.encodeEntityID(entityId);
     const path = `/api/v4/file/content/${entityHash}/0/${encodeURIComponent(name)}`;
     const sign = await this.ctx.signer.sign(path, expiresAt);
-    return `${base}${path}?sign=${encodeURIComponent(sign)}`;
+    // 上游语义（pkg/cluster/routes/routes.go:15）：query 里 `download` 非空
+    // 即表示强制下载；签名只覆盖 pathname，query 参数不参与签名
+    const suffix = download ? '?download=true&sign=' : '?sign=';
+    return `${base}${path}${suffix}${encodeURIComponent(sign)}`;
   }
 
   /**

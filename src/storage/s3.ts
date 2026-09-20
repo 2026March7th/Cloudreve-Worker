@@ -21,6 +21,7 @@
  * `settings.relay=true` 时切中转模式，由 Worker 签名转发分片。
  */
 import type { StoragePolicyRow } from '../db/types';
+import { attachmentDisposition } from '../lib/disposition';
 import {
   resolveChunkSize,
   type DriverCapabilities,
@@ -266,6 +267,7 @@ export class S3CompatibleDriver implements StorageDriver {
     url: URL,
     expiresSeconds: number,
     now = new Date(),
+    extraParams: Record<string, string> = {},
   ): Promise<string> {
     const { amzDate, dateStamp } = amzDates(now);
     const scope = `${dateStamp}/${this.region}/s3/aws4_request`;
@@ -276,6 +278,7 @@ export class S3CompatibleDriver implements StorageDriver {
       ['X-Amz-Date', amzDate],
       ['X-Amz-Expires', String(Math.max(1, Math.min(604800, expiresSeconds)))],
       ['X-Amz-SignedHeaders', 'host'],
+      ...Object.entries(extraParams),
     ]);
     const canonicalQuery = [...params.entries()]
       .map(([k, v]) => [awsUriEncode(k), awsUriEncode(v)])
@@ -555,7 +558,13 @@ export class S3CompatibleDriver implements StorageDriver {
       args.expire && args.expire > 0
         ? Math.max(60, Math.floor((args.expire - Date.now()) / 1000))
         : 3600;
-    return this.presign('GET', this.objectUrl(source), expires);
+    // 强制下载时让对象存储代发 attachment 头（S3 标准响应头覆盖参数）
+    const extraParams: Record<string, string> = args.isDownload
+      ? {
+          'response-content-disposition': attachmentDisposition(args.displayName),
+        }
+      : {};
+    return this.presign('GET', this.objectUrl(source), expires, new Date(), extraParams);
   }
 
   async thumb(): Promise<string | null> {

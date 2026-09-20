@@ -38,6 +38,7 @@ import { UserService } from '../services/user';
 import { URI } from '../services/uri';
 import { FileType } from '../lib/boolset';
 import { AppError, CodeFeatureNotEnabled, Err } from '../lib/errors';
+import { attachmentDisposition } from '../lib/disposition';
 
 export const fileRoutes = new Hono<AppBindings>();
 
@@ -283,6 +284,12 @@ const serveContent = async (c: AppRequest) => {
     // 与原版一致：内容接口允许跨域
     headers.set('Access-Control-Allow-Origin', '*');
     headers.set('Access-Control-Expose-Headers', 'Content-Length, Content-Range, Content-Disposition');
+
+    // 强制下载（上游 IsDownloadQuery="download"，非空即真 → attachment 头）。
+    // 没有它，JSON/文本等浏览器可渲染的类型会在新标签页直接打开而非下载。
+    if (url.searchParams.get('download')) {
+      headers.set('Content-Disposition', attachmentDisposition(name));
+    }
 
     if (c.req.method === 'HEAD') {
       return new Response(null, { status: 200, headers });
