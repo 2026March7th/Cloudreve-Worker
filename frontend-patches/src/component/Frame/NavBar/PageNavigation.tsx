@@ -66,6 +66,14 @@ NavigationItems = [
   },
 ];
 
+// 商店入口（edge 自建 Pro 功能）：shop_nav_enabled 打开时显示。
+// label 用纯文本（语言包没有 navbar.shop 键，缺键时 i18n 会原样显示 key）。
+const ShopNavigationItem: NavigationItem = {
+  label: "商店",
+  icon: [PaymentFilled, Payment],
+  path: "/shop",
+};
+
 const ConnectNavigationItem: NavigationItem = {
   label: "navbar.connect",
   icon: [PhoneLaptop, PhoneLaptopOutlined],
@@ -279,6 +287,7 @@ const PageNavigation = () => {
               <SideNavItemComponent key={item.label} item={item} />
             ))}
             {connectEnabled && <SideNavItemComponent item={ConnectNavigationItem} />}
+            {shopNavEnabled && <SideNavItemComponent item={ShopNavigationItem} />}
             <SideNavItemComponent item={TaskNavigationItem} />
             {remoteDownloadEnabled && <SideNavItemComponent item={RemoteDownloadNavigationItem} />}
           </>

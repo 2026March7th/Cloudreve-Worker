@@ -8,6 +8,7 @@ import ResponsiveTabs, { Tab } from "../../Common/ResponsiveTabs.tsx";
 import Bot from "../../Icons/Bot.tsx";
 import Color from "../../Icons/Color.tsx";
 import CubeSync from "../../Icons/CubeSync.tsx";
+import Currency from "../../Icons/Currency.tsx";
 import FilmstripImage from "../../Icons/FilmstripImage.tsx";
 import Globe from "../../Icons/Globe.tsx";
 import MailOutlined from "../../Icons/MailOutlined.tsx";
@@ -259,6 +260,24 @@ const Settings = () => {
                   ]}
                 >
                   <Media />
+                </SettingsWrapper>
+              )}
+              {/* 增值服务（edge 自建实现）：真实加载/保存这些设置键 */}
+              {tab === SettingsPageTab.VAS && (
+                <SettingsWrapper
+                  settings={[
+                    "shop_nav_enabled",
+                    "credit_enabled",
+                    "currency_code",
+                    "currency_symbol",
+                    "currency_unit",
+                    "payment",
+                    "storage_products",
+                    "group_sell_data",
+                    "credit_products",
+                  ]}
+                >
+                  <VAS />
                 </SettingsWrapper>
               )}
               {tab === SettingsPageTab.Email && (

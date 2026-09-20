@@ -172,6 +172,18 @@ export interface UserSetting {
   share_links_in_profile?: string;
   /** 用户在组策略集里选中的上传策略（edge 自建 Pro 功能），存数字 ID。 */
   upload_policy_id?: number;
+  /**
+   * 购买的容量包（edge 自建 Pro 功能）。每个元素是一份额外容量；
+   * expire_at 为空表示永久。maxStorage = 组上限 + 未过期包之和。
+   */
+  quota_packs?: { size: number; expire_at?: string | null }[];
+  /**
+   * 购买用户组（edge 自建 Pro 功能）。生效中记录当前购买组与原组，
+   * expire_at 为空表示永久；过期后由请求中间件惰性回退到原组。
+   */
+  group_pack?: { group_id: number; prev_group_id: number; expire_at?: string | null } | null;
+  /** 积分余额（edge 自建 Pro 功能）。 */
+  credit?: number;
 }
 
 export interface GroupSetting {
@@ -275,4 +287,42 @@ export interface TaskPublicState {
       download?: unknown;
     };
   };
+}
+
+// ---------------------------------------------------------------------------
+// 支付体系（edge 自建 Pro 功能，migrations/0005_payment.sql）
+// ---------------------------------------------------------------------------
+
+export type OrderStatus = 'pending' | 'paid' | 'fulfilled' | 'failed' | 'canceled';
+export type VasProductType = 'storage' | 'group' | 'credit';
+
+export interface OrderRow {
+  id: number;
+  created_at: Date;
+  updated_at: Date;
+  deleted_at: Date | null;
+  user_id: number;
+  order_no: string;
+  product_type: VasProductType;
+  product_snapshot: Record<string, unknown> | null;
+  amount: number;
+  status: OrderStatus;
+  provider: string;
+  provider_trade_no: string | null;
+  paid_at: Date | null;
+  fulfilled_at: Date | null;
+  error: string | null;
+}
+
+export interface GiftCodeRow {
+  id: number;
+  created_at: Date;
+  updated_at: Date;
+  deleted_at: Date | null;
+  code: string;
+  product_type: VasProductType;
+  product_payload: Record<string, unknown> | null;
+  batch: string | null;
+  used_by: number | null;
+  used_at: Date | null;
 }

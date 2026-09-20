@@ -79,6 +79,30 @@ export function appContext(): MiddlewareHandler<AppBindings> {
       if (claims?.client_id) scopes = claims.scopes;
     }
 
+    // 购买用户组到期惰性回退（edge 自建 Pro 功能）：没有后台定时任务，
+    // 就在解析出用户后检查一次；过期则回退到购买前的组并清掉记录。
+    // 失败静默吞掉——这里出错不该让整个请求挂掉。
+    if (user?.settings?.group_pack) {
+      const pack = user.settings.group_pack;
+      const expired = pack.expire_at && new Date(pack.expire_at).getTime() <= Date.now();
+      if (expired) {
+        try {
+          const repo = new UserRepo(env);
+          const settings = { ...user.settings, group_pack: null };
+          await repo.updateGroup(user.id, pack.prev_group_id);
+          await repo.updateSettings(user.id, settings);
+          user.group_users = pack.prev_group_id;
+          user.settings = settings;
+          const g = await repo.byIdWithGroup(user.id);
+          if (g) {
+            user.group = g.group;
+          }
+        } catch {
+          // 回退失败保持现状，下个请求再试
+        }
+      }
+    }
+
     c.set('ctx', new AppContext(env, settings, codec, jwt, user, scopes));
     c.header('X-Correlation-ID', correlationId);
 

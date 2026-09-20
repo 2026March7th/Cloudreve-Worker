@@ -38,6 +38,7 @@ import { workflowRoutes } from './routes/workflow';
 import { callbackRoutes } from './routes/callback';
 import { devicesRoutes } from './routes/devices';
 import { davRoutes } from './routes/dav';
+import { paymentRoutes, paymentAdminRoutes } from './routes/payment';
 import { DownloadService } from './services/download';
 import { FileSystemService } from './services/fs';
 import { ShareService } from './services/share';
@@ -150,6 +151,8 @@ app.route('/api/v4/file', fileRoutes);
 app.route('/api/v4/share', shareRoutes);
 app.route('/api/v4/admin', adminRoutes);
 app.route('/api/v4/workflow', workflowRoutes);
+app.route('/api/v4/payment/admin', paymentAdminRoutes);
+app.route('/api/v4/payment', paymentRoutes);
 
 /**
  * 上传回调。原版在 `/api/v4/callback` 下按驱动分成 9 个子路径，边缘版只实现

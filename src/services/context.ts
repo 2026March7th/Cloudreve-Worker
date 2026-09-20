@@ -228,12 +228,22 @@ export class AppContext {
     return getStorageDriver(this.env, policy);
   }
 
-  /** 用户容量上限；返回 null 表示不限量。 */
+  /** 用户容量上限；返回 null 表示不限量。含购买容量包（未过期部分）。 */
   get maxStorage(): number | null {
     const user = this.requireUser();
-    return user.group.max_storage === null || user.group.max_storage === undefined
-      ? null
-      : Number(user.group.max_storage);
+    const base =
+      user.group.max_storage === null || user.group.max_storage === undefined
+        ? null
+        : Number(user.group.max_storage);
+    // 购买的容量包（edge 自建 Pro 功能）：叠加在组上限之上；
+    // 过期包在读时直接过滤，不需要后台清理任务。
+    const packs = Array.isArray(user.settings?.quota_packs) ? user.settings!.quota_packs! : [];
+    const now = Date.now();
+    const bonus = packs
+      .filter((p) => p && (!p.expire_at || new Date(p.expire_at).getTime() > now))
+      .reduce((sum, p) => sum + Math.max(0, Number(p.size ?? 0)), 0);
+    if (base === null) return null; // 组不限量时叠加无意义
+    return base + bonus;
   }
 
   /** 已用容量。 */

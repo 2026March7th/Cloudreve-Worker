@@ -129,6 +129,12 @@ siteRoutes.get('/config/:section', async (c) => {
         captcha_cap_site_key: s.get('captcha_cap_site_key', ''),
         captcha_cap_asset_server: s.get('captcha_cap_asset_server', ''),
         app_promotion: s.getBool('show_app_promotion', false),
+        // 增值服务（edge 自建 Pro 功能）：商店导航显隐与货币展示
+        shop_nav_enabled: s.getBool('shop_nav_enabled', false),
+        credit_enabled: s.getBool('credit_enabled', false),
+        currency_code: s.get('currency_code', 'CNY'),
+        currency_symbol: s.get('currency_symbol', '¥'),
+        currency_unit: s.getInt('currency_unit', 100),
       }) as never;
   }
 });

@@ -230,6 +230,17 @@ export const DEFAULT_SETTINGS: Record<string, string> = {
   archive_timeout: '600',
   temp_path: 'temp',
   cron_garbage_collect: '@every 30m',
+
+  // --- 增值服务（键名与官方前端 VAS 面板一致；JSON 类的默认为空集合）---
+  shop_nav_enabled: '0',
+  credit_enabled: '0',
+  currency_code: 'CNY',
+  currency_symbol: '¥',
+  currency_unit: '100',
+  payment: '[]',
+  storage_products: '[]',
+  group_sell_data: '[]',
+  credit_products: '[]',
 };
 
 // 官方「队列」设置页读写的 6 队列 × 6 项（键名/默认值逐条取自
