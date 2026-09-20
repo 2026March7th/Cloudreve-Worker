@@ -55,7 +55,7 @@ userRoutes.post('/', async (c) => {
     return fail(c, Err.param('Password length must be between 6 and 128'));
   }
   if (ctx.settings.regCaptcha) {
-    const passed = await verifyCaptcha(c.env, body.ticket, body.captcha);
+    const passed = await verifyCaptcha(ctx, body.ticket, body.captcha);
     if (!passed) {
       return fail(c, new AppError(40026, 'CAPTCHA verification failed'));
     }
@@ -349,7 +349,7 @@ userRoutes.post('/reset', async (c) => {
     return fail(c, Err.param('Email is required'));
   }
   if (ctx.settings.forgetCaptcha) {
-    const passed = await verifyCaptcha(c.env, body.ticket, body.captcha);
+    const passed = await verifyCaptcha(ctx, body.ticket, body.captcha);
     if (!passed) {
       return fail(c, new AppError(40026, 'CAPTCHA verification failed'));
     }

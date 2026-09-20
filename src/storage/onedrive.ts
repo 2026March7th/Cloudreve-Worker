@@ -18,6 +18,7 @@
  */
 import type { Env } from '../env';
 import type { StoragePolicyRow } from '../db/types';
+import { bytesToBase64, base64ToBytes } from '../lib/crypto';
 import {
   resolveChunkSize,
   type DriverCapabilities,
@@ -490,6 +491,91 @@ export class OneDriveDriver implements StorageDriver {
       '@microsoft.graph.downloadUrl'?: string;
     };
     return { size: json.size ?? 0, downloadUrl: json['@microsoft.graph.downloadUrl'] };
+  }
+
+  /**
+   * 分页列举对象（导入任务用）。
+   *
+   * Graph 的 children 只按单目录列举，这里做惰性 BFS：把「待展开的子目录
+   * 队列 + 当前目录的下一页链接」编进 continuation token（base64 JSON），
+   * 调用方反复分页时逐层展开，最终语义与 S3 驱动的递归列举对齐。
+   * 键格式与 `get()`/`meta()` 接受的 source 一致（相对路径，不含首尾斜杠）。
+   */
+  async list(
+    prefix: string,
+    options: { continuation?: string; afterKey?: string; limit?: number } = {},
+  ): Promise<{ keys: { key: string; size: number; lastModified: Date }[]; continuation: string | null }> {
+    const limit = Math.min(200, Math.max(1, options.limit ?? 200));
+    const baseDir = prefix.replace(/^\/+|\/+$/g, '');
+
+    // 恢复 BFS 状态
+    let pending: string[] = [baseDir];
+    let nextLink: string | null = null;
+    if (options.continuation) {
+      try {
+        const state = JSON.parse(
+          new TextDecoder().decode(base64ToBytes(options.continuation)),
+        ) as { pending?: string[]; nextLink?: string | null };
+        pending = Array.isArray(state.pending) ? state.pending : [];
+        nextLink = state.nextLink ?? null;
+      } catch {
+        return { keys: [], continuation: null };
+      }
+      if (!pending.length && !nextLink) return { keys: [], continuation: null };
+    }
+
+    const keys: { key: string; size: number; lastModified: Date }[] = [];
+    while (pending.length || nextLink) {
+      const dir = pending[0] ?? '';
+      const children =
+        dir === ''
+          ? `${this.url('root:/children')}?`
+          : `${this.url(`root:/${graphPath(dir)}`)}:/children?`;
+      const pageUrl =
+        nextLink ??
+        `${children}$top=${limit}&$select=name,size,folder,lastModifiedDateTime`;
+
+      const res = await this.request('GET', pageUrl);
+      if (res.status === 404) {
+        // 目录不存在（可能已被删除）：跳过该目录继续
+        pending.shift();
+        nextLink = null;
+        if (!pending.length && !nextLink) break;
+        continue;
+      }
+      if (!res.ok) {
+        const text = await res.text().catch(() => '');
+        throw new Error(`Failed to list OneDrive objects: ${res.status} ${text.slice(0, 300)}`);
+      }
+      const json = (await res.json()) as {
+        value?: { name: string; size?: number; folder?: unknown; lastModifiedDateTime?: string }[];
+        '@odata.nextLink'?: string;
+      };
+      nextLink = json['@odata.nextLink'] ?? null;
+      for (const item of json.value ?? []) {
+        const key = dir ? `${dir}/${item.name}` : item.name;
+        if (item.folder) {
+          pending.push(key);
+        } else {
+          if (options.afterKey && key <= options.afterKey) continue;
+          keys.push({
+            key,
+            size: item.size ?? 0,
+            lastModified: item.lastModifiedDateTime ? new Date(item.lastModifiedDateTime) : new Date(),
+          });
+        }
+      }
+      if (!nextLink) pending.shift();
+      if (keys.length >= limit) break;
+    }
+
+    const more = pending.length > 0 || nextLink !== null;
+    return {
+      keys,
+      continuation: more
+        ? bytesToBase64(new TextEncoder().encode(JSON.stringify({ pending, nextLink })))
+        : null,
+    };
   }
 
   async meta(source: string): Promise<{ size: number } | null> {

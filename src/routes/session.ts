@@ -39,7 +39,7 @@ sessionRoutes.post('/token', async (c) => {
 
   // 登录验证码（站点开启时才校验）
   if (ctx.settings.loginCaptcha) {
-    const passed = await verifyCaptcha(c.env, body.ticket, body.captcha);
+    const passed = await verifyCaptcha(ctx, body.ticket, body.captcha);
     if (!passed) {
       return fail(c, new AppError(40026, 'CAPTCHA verification failed'));
     }

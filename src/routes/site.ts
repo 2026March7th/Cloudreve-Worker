@@ -15,6 +15,7 @@ import { ctxOf } from '../middleware/app';
 import { ok } from '../lib/response';
 import { randomString } from '../lib/crypto';
 import { UserService } from '../services/user';
+import type { AppContext } from '../services/context';
 
 const CAPTCHA_PREFIX = 'captcha:';
 const CAPTCHA_TTL = 1800; // 与原版 CaptchaTTL 一致（30 分钟）
@@ -181,15 +182,77 @@ siteRoutes.get('/captcha', async (c) => {
   return ok(c, { image: dataUrl, ticket }) as never;
 });
 
-/** 校验验证码（供登录/注册流程调用）。 */
+/**
+ * 校验验证码（供登录/注册/找回密码流程调用）。
+ *
+ * 对齐上游 `middleware.CaptchaRequired`（middleware/captcha.go）：
+ * 按 `captcha_type` 分派——
+ *   - turnstile → Cloudflare Turnstile siteverify（token 在 ticket 字段）；
+ *   - recaptcha → reCAPTCHA v2 siteverify（token 在 captcha 字段）；
+ *   - cap       → Cap 2.0 `/{siteKey}/siteverify`（token 在 ticket 字段）；
+ *   - normal / tcaptcha / 空 → 内置 SVG 验证码（ticket ↔ KV 答案）。
+ */
 export async function verifyCaptcha(
-  env: { KV: KVNamespace },
+  ctx: AppContext,
   ticket: string | undefined | null,
   value: string | undefined | null,
 ): Promise<boolean> {
+  const type = ctx.settings.get('captcha_type', '') || 'normal';
+
+  const formPost = async (endpoint: string, body: string): Promise<unknown> => {
+    const res = await fetch(endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body,
+    });
+    if (!res.ok) return null;
+    return (await res.json().catch(() => null)) as unknown;
+  };
+
+  if (type === 'turnstile') {
+    const secret = ctx.settings.get('captcha_turnstile_site_secret', '');
+    if (!secret || !ticket) return false;
+    const json = (await formPost(
+      'https://challenges.cloudflare.com/turnstile/v0/siteverify',
+      new URLSearchParams({ secret, response: ticket }).toString(),
+    )) as { success?: boolean } | null;
+    return json?.success === true;
+  }
+
+  if (type === 'recaptcha') {
+    const secret = ctx.settings.get('captcha_ReCaptchaSecret', '');
+    if (!secret || !value) return false;
+    const json = (await formPost(
+      'https://www.recaptcha.net/recaptcha/api/siteverify',
+      new URLSearchParams({ secret, response: value }).toString(),
+    )) as { success?: boolean } | null;
+    return json?.success === true;
+  }
+
+  if (type === 'cap') {
+    // Cap 2.0 API：POST {instance}/{siteKey}/siteverify，JSON 体
+    const instance = ctx.settings.get('captcha_cap_instance_url', '').replace(/\/+$/, '');
+    const siteKey = ctx.settings.get('captcha_cap_site_key', '');
+    const secret = ctx.settings.get('captcha_cap_secret_key', '');
+    if (!instance || !siteKey || !secret || !ticket) return false;
+    try {
+      const res = await fetch(`${instance}/${siteKey}/siteverify`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ secret, response: ticket }),
+      });
+      if (!res.ok) return false;
+      const json = (await res.json().catch(() => null)) as { success?: boolean } | null;
+      return json?.success === true;
+    } catch {
+      return false;
+    }
+  }
+
+  // normal / tcaptcha：内置 SVG 验证码
   if (!ticket || !value) return false;
-  const expected = await env.KV.get(`${CAPTCHA_PREFIX}${ticket}`);
+  const expected = await ctx.env.KV.get(`${CAPTCHA_PREFIX}${ticket}`);
   if (!expected) return false;
-  await env.KV.delete(`${CAPTCHA_PREFIX}${ticket}`); // 一次性
+  await ctx.env.KV.delete(`${CAPTCHA_PREFIX}${ticket}`); // 一次性
   return expected.toUpperCase() === value.toUpperCase();
 }

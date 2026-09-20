@@ -130,6 +130,19 @@ export class WorkflowService {
   // -------------------------------------------------------------------------
 
   /**
+   * 把一组来源 URI 展开成 zip 条目（目录递归展开，内容惰性打开）。
+   * 导出给 `/file/archive/:sessionID/archive.zip` 流式打包下载复用。
+   */
+  async archiveEntries(sources: string[]): Promise<ZipEntry[]> {
+    const items = await this.collect(sources);
+    return items.map((item) => ({
+      name: item.name,
+      modifiedAt: item.file.updated_at,
+      data: item.isDir ? null : () => this.openFileStream(item.file),
+    }));
+  }
+
+  /**
    * 把 `src` 打成 zip 写到 `dst`。
    *
    * 对应上游 `explorer.ArchiveWorkflowService` + `controllers.CreateArchive`。

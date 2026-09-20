@@ -37,12 +37,14 @@ import { UploadService } from '../services/upload';
 import { DownloadService } from '../services/download';
 import { UserService } from '../services/user';
 import { subscribe, type FsEvent } from '../services/events';
+import { WorkflowService } from '../services/workflow';
 import { readCentralDirectory, type RangeReader } from '../lib/zipread';
+import { createZipStream } from '../lib/zip';
 import { ZipError } from '../lib/zipread';
 import { drain, nameDecoder } from '../services/workflow';
 import { URI } from '../services/uri';
 import { FileType } from '../lib/boolset';
-import { AppError, CodeFeatureNotEnabled, Err } from '../lib/errors';
+import { AppError, CodeFeatureNotEnabled, CodeNotFound, Err } from '../lib/errors';
 import { attachmentDisposition } from '../lib/disposition';
 import { throttleStream } from '../lib/throttle';
 
@@ -209,12 +211,19 @@ fileRoutes.post('/url', async (c) => {
     redirect?: boolean;
     entity?: string;
     no_cache?: boolean;
+    archive?: boolean;
   };
   if (!body.uris?.length) return fail(c, Err.param('uris is required'));
 
   try {
     const service = new FileSystemService(ctx);
     const download = new DownloadService(ctx, service);
+
+    // 打包下载：返回一个签名过的 archive.zip 临时地址（上游 GetArchiveDownloadSession）
+    if (body.archive) {
+      return ok(c, await download.archiveDownload(body.uris.map((u) => URI.parse(u))));
+    }
+
     const res = await download.getUrls(
       body.uris.map((u) => URI.parse(u)),
       { download: body.download, entity: body.entity, noCache: body.no_cache },
@@ -1251,8 +1260,67 @@ fileRoutes.post('/wopi/:id', async (c) => {
   }
 });
 
-fileRoutes.all('/archive/:sessionID/archive.zip', (c) =>
-  fail(c, new AppError(CodeFeatureNotEnabled, 'Archive download is not implemented')),
-);
+/**
+ * 流式打包下载。
+ *
+ * 对应上游 `ArchiveService.DownloadArchived`（service/explorer/file.go:57）：
+ * `/file/url` 带 `archive:true` 时在 KV 里铸造 `archive_<uuid>` 会话并签名本
+ * 路径；这里校验签名后恢复会话里的请求者身份，把 URI 递归展开成 zip 条目，
+ * 用 store 模式 zip 流式吐给浏览器（不占内存、不经磁盘）。
+ */
+fileRoutes.get('/archive/:sessionID/archive.zip', async (c) => {
+  const ctx = ctxOf(c);
+
+  // 与实体内容分发同一套签名校验：签名只覆盖 pathname
+  const url = new URL(c.req.url);
+  const sign = url.searchParams.get('sign');
+  if (!sign) {
+    const authHeader = c.req.header('Authorization');
+    if (!authHeader?.startsWith('Bearer Cr ')) {
+      return fail(c, new AppError(403, 'authorization header is missing'));
+    }
+    try {
+      await ctx.signer.check(url.pathname, authHeader.slice('Bearer Cr '.length));
+    } catch (e) {
+      return fail(c, e);
+    }
+  } else {
+    try {
+      await ctx.signer.check(url.pathname, sign);
+    } catch (e) {
+      return fail(c, e);
+    }
+  }
+
+  try {
+    const sessionID = c.req.param('sessionID') ?? '';
+    const raw = await ctx.env.KV.get(`archive_${sessionID}`);
+    if (!raw) {
+      return fail(c, new AppError(CodeNotFound, 'Archive session not exist'));
+    }
+    const session = JSON.parse(raw) as { uris?: string[]; requester_id?: number };
+    if (!session.uris?.length || !session.requester_id) {
+      return fail(c, new AppError(CodeNotFound, 'Archive session not exist'));
+    }
+
+    // 恢复请求者身份（collect/权限校验都依赖 ctx.user）
+    const requester = await ctx.users.byIdWithGroup(session.requester_id);
+    if (!requester) return fail(c, new AppError(CodeNotFound, 'Archive session not exist'));
+    const userCtx = ctx.withUser(requester);
+
+    const wf = new WorkflowService(userCtx, new FileSystemService(userCtx));
+    const entries = await wf.archiveEntries(session.uris);
+    const stream = createZipStream(entries);
+
+    return new Response(stream, {
+      headers: {
+        'Content-Type': 'application/zip',
+        'Content-Disposition': attachmentDisposition('archive.zip'),
+      },
+    });
+  } catch (e) {
+    return fail(c, e);
+  }
+});
 
 export { guard };

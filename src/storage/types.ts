@@ -153,7 +153,7 @@ export interface StorageDriver {
   thumb(source: string, size: string): Promise<string | null>;
 
   /**
-   * 分页列举对象（导入任务用）。仅 S3 兼容驱动实现；其他驱动不支持。
+   * 分页列举对象（导入任务用）。S3 兼容与 OneDrive 驱动实现；其他驱动不支持。
    */
   list?(
     prefix: string,

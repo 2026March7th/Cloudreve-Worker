@@ -296,16 +296,39 @@ export class DownloadService {
     return this.buildProxyUrl(entity.id, file.name, expiresAt, true, await this.speedLimitFor(file));
   }
 
-  /** 打包下载：边缘版不支持流式 zip，返回明确的「未启用」错误。 */
-  async archiveDownload(_uris: URI[]): Promise<never> {
+  /**
+   * 打包下载：创建一个带签名的临时归档会话，返回 archive.zip 直链。
+   *
+   * 对应上游 `FileURLService.GetArchiveDownloadSession`（service/explorer/file.go:387）：
+   * KV 里存 `{uris, requester_id}`（键前缀 `archive_`，TTL 取站点设置
+   * `archive_timeout`），随后对 `/api/v4/file/archive/:sessionID/archive.zip`
+   * 签名。取包端点（routes/file.ts）按签名放行，并恢复请求者身份跑打包。
+   */
+  async archiveDownload(uris: URI[]): Promise<FileUrlResponse> {
     this.ctx.requireGroupPermission(
       GroupPermission.ArchiveDownload,
       'Archive download is not allowed for your group',
     );
-    throw new AppError(
-      40056,
-      'Archive download is not implemented in the edge build; download files individually',
+    const user = this.ctx.requireUser();
+    const sessionId = crypto.randomUUID();
+    // 上游默认 20 秒（archive_timeout）；边缘版默认放宽到 600，下限 60（KV 最低 TTL）
+    const ttl = Math.max(60, this.ctx.settings.getInt('archive_timeout', 600));
+    const now = Math.floor(Date.now() / 1000);
+    const expiresAt = now + ttl;
+
+    await this.ctx.env.KV.put(
+      `archive_${sessionId}`,
+      JSON.stringify({ uris: uris.map((u) => u.toString()), requester_id: user.id }),
+      { expirationTtl: ttl },
     );
+
+    const base = this.ctx.settings.siteUrl.replace(/\/+$/, '');
+    const path = `/api/v4/file/archive/${sessionId}/archive.zip`;
+    const sign = await this.ctx.signer.sign(path, expiresAt);
+    return {
+      urls: [{ url: `${base}${path}?sign=${encodeURIComponent(sign)}` }],
+      expires: new Date(expiresAt * 1000).toISOString(),
+    };
   }
 }
 

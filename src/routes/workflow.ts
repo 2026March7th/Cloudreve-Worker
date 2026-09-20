@@ -4,25 +4,26 @@
  *   GET    /api/v4/workflow                  任务列表
  *   GET    /api/v4/workflow/progress/:id     任务进度
  *   POST   /api/v4/workflow/archive          打包（同步执行，结果写进 dst）
- *   POST   /api/v4/workflow/extract          解压（边缘版不支持）
- *   POST   /api/v4/workflow/download         远程下载（仅 HTTP 直链）
+ *   POST   /api/v4/workflow/extract          解压（store/deflate，含非 UTF-8 文件名）
+ *   POST   /api/v4/workflow/download         远程下载（HTTP 直链 + URL 列表文件导入）
  *   PATCH  /api/v4/workflow/download/:id     选择要下载的文件
  *   DELETE /api/v4/workflow/download/:id     取消下载任务
- *   POST   /api/v4/workflow/import           从存储策略导入（边缘版不支持）
+ *   POST   /api/v4/workflow/import           从存储策略导入（R2/S3 兼容/OneDrive）
  *   POST   /api/v4/workflow/rebuildFtsIndex  重建全文索引（分批推进，配了 Meilisearch 才可用）
  *
  * 原版这些端点只是**投任务**，真正的活在后台 goroutine 池里；
- * 边缘版没有常驻进程，能同步跑完的（打包 / 远程下载）就同步跑完，
- * 重建索引这种大批量的按批推进；确实做不了的（解压、导入）直接返回
- * 明确的「不支持」，不建空任务。细节见 `services/workflow.ts` 头部的说明。
+ * 边缘版没有常驻进程，能同步跑完的（打包 / 解压 / 远程下载 / 导入）就同步跑完，
+ * 重建索引这种大批量的按批推进。细节见 `services/workflow.ts` 头部的说明。
  */
 import { Hono } from 'hono';
 import type { AppBindings } from '../middleware/app';
 import { ctxOf } from '../middleware/app';
 import { fail, ok } from '../lib/response';
 import { FileSystemService } from '../services/fs';
-import { WorkflowService } from '../services/workflow';
+import { WorkflowService, drain } from '../services/workflow';
 import { SearchService } from '../services/search';
+import { URI } from '../services/uri';
+import { FileType } from '../lib/boolset';
 import type { TaskRow } from '../db/types';
 import { AppError, CodeFeatureNotEnabled, CodeNotFound, Err } from '../lib/errors';
 import type { HashIDCodec } from '../lib/hashid';
@@ -50,6 +51,47 @@ function taskToResponse(codec: HashIDCodec, task: TaskRow) {
     resume_time: pub.resume_time,
     retry_count: pub.retry_count,
   };
+}
+
+/**
+ * 读取一个存有 URL 列表的文本文件（远程下载弹窗「导入 URL 列表」）。
+ *
+ * 对应上游 `DownloadWorkflowService` 的 `SrcFile` 分支：前端把用户选中的
+ * 文件以 URI 传进来（CreateRemoteDownload.tsx:55），服务端读出内容按行
+ * 拆分。只接受 http(s) 直链；总读取量限制在 1MB，防止把大文件拖进内存。
+ */
+async function readUrlListFile(ctx: ReturnType<typeof ctxOf>, srcFile: string): Promise<string[]> {
+  let file;
+  try {
+    file = await new FileSystemService(ctx).mustResolve(URI.parse(srcFile));
+  } catch {
+    throw new AppError(CodeNotFound, 'URL list file not found');
+  }
+  if (file.type === FileType.Folder || !file.primary_entity) {
+    throw Err.param('URL list file is invalid');
+  }
+  const entity = await ctx.entities.byId(file.primary_entity);
+  if (!entity) throw new AppError(CodeNotFound, 'URL list file has no content');
+  const policy = await ctx.policies.byId(entity.storage_policy_entities);
+  if (!policy) throw Err.policyNotAllowed();
+  const content = await ctx.driverFor(policy).get(entity.source, 'bytes=0-1048575');
+  if (!content?.body) throw new AppError(CodeNotFound, 'URL list file content is missing');
+
+  const text = new TextDecoder().decode(await drain(content.body as ReadableStream<Uint8Array>));
+  const urls = text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => {
+      if (!line || line.startsWith('#')) return false;
+      try {
+        const u = new URL(line);
+        return u.protocol === 'http:' || u.protocol === 'https:';
+      } catch {
+        return false;
+      }
+    });
+  if (!urls.length) throw Err.param('No valid HTTP(S) URL found in the list file');
+  return urls;
 }
 
 // ---------------------------------------------------------------------------
@@ -177,17 +219,10 @@ workflowRoutes.post('/download', async (c) => {
   if (!body.dst) return fail(c, Err.param('dst is required'));
 
   // 前端两种方式：直接给一组 URL，或上传一个存放 URL 列表的文件
+  // （src_file 是文件 URI，见 CreateRemoteDownload.tsx:55）
   let urls = body.src ?? [];
   if (!urls.length && body.src_file) {
-    const read = await ctx.files.byId(Number(body.src_file)).catch(() => null);
-    void read;
-    return fail(
-        c,
-        new AppError(
-          CodeFeatureNotEnabled,
-          'Importing a URL list file is not implemented in the edge build',
-        ),
-      );
+    urls = await readUrlListFile(ctx, body.src_file);
   }
   if (!urls.length) return fail(c, Err.param('src is required'));
 

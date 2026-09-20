@@ -92,31 +92,23 @@ Workers 的 isolate 模型不支持长驻进程、原生 socket、任意文件�
 
 ## 功能实现状态
 
-判定口径是**官方前端会不会调到**：前端 `src/api/api.ts` 里每个 `send()` 调用就是一条契约。按 127 条前端契约统计：
-
-```
-已实现 120 条    桩 7 条（返回 40019）    缺失 0 条
-```
+判定口径是**官方前端会不会调到**：前端 `src/api/api.ts` 里每个 `send()` 调用就是一条契约。官方前端共 127 条契约，本仓库全部有端点响应（无 404）；少数能力边缘版明确不支持，见下表，不会静默返回错误数据。
 
 复算：`python scripts/scan-frontend-contract.py <官方前端>/src/api src/routes .`
 
 ### 已实现的主要功能
 
-文件管理与回收站、分享（密码/有效期/付费位）、上传下载（R2 + OneDrive，含分片与直传回调）、文件版本自动裁剪、两步验证（TOTP）、Passkey/WebAuthn（ES256/RS256/Ed25519）、WebDAV（账号 CRUD + 完整协议服务端）、OAuth2 授权码流程（PKCE + userinfo）、打包下载（流式 ZIP 入库）、远程下载（HTTP 直链）、全文检索（Meilisearch + Tika，与原版同构）、管理后台（用户/组/策略/文件/实体/分享/节点/OAuth 应用）、SMTP 邮件（激活/找回/测试发信）。
+文件管理与回收站、分享（密码/有效期/付费位）、上传下载（R2 + OneDrive，含分片与直传回调）、文件版本自动裁剪与版本切换、两步验证（TOTP）、Passkey/WebAuthn（ES256/RS256/Ed25519）、WebDAV（账号 CRUD + 完整协议服务端）、OAuth2 授权码流程（PKCE + userinfo + 桌面客户端自动注册）、打包下载（`/workflow/archive` 入库 + `/file/archive/:id/archive.zip` 流式直链下载）、解压与压缩包在线浏览（含 GBK 等非 UTF-8 文件名）、从存储策略导入（R2/S3 兼容/OneDrive）、远程下载（HTTP 直链 + URL 列表文件导入）、事件推送（SSE）、WOPI / 在线预览会话、验证码（内置 SVG + Turnstile / reCAPTCHA / Cap）、下载限速（代理下载按用户组 `speed_limit` 生效）、全文检索（Meilisearch + Tika，与原版同构）、管理后台（用户/组/策略/文件/实体/分享/节点/OAuth 应用）、SMTP 邮件（激活/找回/测试发信 + 自定义模板）。
 
-### 未实现（7 个桩 + 几项明确说明）
+### 未实现（明确不支持的能力）
 
-| 功能 | 端点 | 说明 |
+| 功能 | 位置 | 说明 |
 |---|---|---|
-| 解压 / 浏览压缩包 | `POST /workflow/decompress`、`GET /file/archive` | 需要一个 ZIP 读取器（写入端已实现）；桩返回 40019 |
-| 从存储策略导入 | `POST /workflow/import` | 桩 |
-| 事件推送（SSE） | `GET /file/events` | 桩 |
-| WOPI / 在线预览会话 | `/file/wopi`、`/file/viewerSession` | 桩 |
-| 其它驱动上传回调 | `/callback/*`（remote/oss/cos/s3 等） | 只实现了 OneDrive 回调，其余桩 |
-| 缩略图 | `GET /file/thumb` | 只透传存储驱动的缩略图能力，不做本地转码 |
-| 限速 | — | 字段被读取但不生效 |
+| 缩略图本地转码 | `GET /admin/tool/thumbExecutable` | 不做服务端 ffmpeg/vips 转码；只透传存储驱动声明的缩略图能力（OneDrive 原生缩略图可用） |
+| 其它驱动上传回调 | `/callback/:driver/*` | 只实现 OneDrive 回调；R2/S3 等直传协议不走回调，此端点保留但返回 40019 |
 | 付费分享 | — | 没有支付体系，相关错误码保留但不会有路径返回 |
 | 多节点分派 | `/admin/node/*` | 节点 CRUD 与连通性测试可用，但任务不分派到节点（请求内同步跑完） |
+| v2 密码哈希登录 | — | 老版 `md5:hash:salt` 密码格式不迁移，全新部署不受影响 |
 
 ### 已实现、但与原版口径不同的几处
 
@@ -178,12 +170,99 @@ scripts/                deploy / fetch-frontend（自动拉取并构建官方前
 frontend/               官方前端构建产物 —— 不入库，部署时自动生成（见 scripts/fetch-frontend.mjs）
 ```
 
-## 开发
+## 从源码构建与部署（构建文档）
+
+想自己改代码或自己构建发布，照这一节走。全程只需要 Node.js 和 npm。
+
+### 前置要求
+
+| 工具 | 版本 | 用途 |
+|---|---|---|
+| [Node.js](https://nodejs.org/) | **20 或 22**（别用更老的） | 构建、类型检查、跑部署脚本 |
+| npm | 随 Node 附带 | 装依赖 |
+| Git | 任意 | 拉源码 |
+| Neon Postgres | — | 元数据库，[neon.tech](https://neon.tech) 免费注册，复制 **Connection string**（`postgresql://...`） |
+
+不需要提前装 wrangler 全局包（仓库带本地版本），也不需要手动改 `wrangler.toml` —— KV / R2 的 ID 由部署脚本自动创建并回填。
+
+### 1. 拉源码、装依赖
+
+```bash
+git clone https://github.com/LegspCpd/Cloudreve-Worker.git
+cd Cloudreve-Worker
+npm install
+```
+
+### 2. 本地开发（可选）
+
+把机密写进 `.dev.vars`（参考 `.dev.vars.example`，已被 `.gitignore` 排除）：
+
+```ini
+DATABASE_URL=postgresql://user:pass@ep-xxx.aws.neon.tech/neondb?sslmode=require
+```
+
+```bash
+npm run dev           # 起 wrangler dev 本地服务
+```
+
+首次请求会自动建表（Neon 上执行 `migrations/*.sql`）并播种系统数据，不需要手动跑迁移。要手动控制时才用：
+
+```bash
+npm run db:migrate    # 手动执行建表脚本
+npm run db:seed       # 手动播种默认用户组/OAuth 客户端等
+```
+
+### 3. 类型检查与构建
+
+```bash
+npm run typecheck     # tsc --noEmit，改完代码先跑这个
+npm run build         # 拉官方前端源码并构建 → wrangler 打包 → 产物在 dist/
+```
+
+`npm run build` 会自动从上游 `cloudreve/frontend`（固定提交）下载前端源码、Vite 构建、叠加本仓库 `frontend-patches/` 覆盖层，然后 dry-run 打包 —— **官方前端不需要你手动准备**。只想验证能构建不想产出，`npm run build` 本身就是 dry-run，不会真的发布。
+
+### 4. 部署到 Cloudflare
+
+```bash
+npx wrangler login    # 浏览器授权一次
+npm run deploy
+```
+
+`npm run deploy`（即 `scripts/deploy.mjs`）按顺序做四件事：
+
+1. 检查 KV namespace —— 账号里已有同名（`cloudreve-worker-KV` 或 `KV`）就直接复用，没有才创建，真实 ID 自动回填 `wrangler.toml`；
+2. 检查 R2 bucket —— 同上，已存在就复用；
+3. 重新拉取并构建官方前端，`wrangler deploy` 发布；
+4. 环境变量里有 `DATABASE_URL` 时自动写入 Worker 运行时 Secret。
+
+`SITE_URL` / `FRONTEND_URL` 环境变量如果设置了，部署时以 `--var` 覆盖 `wrangler.toml` 里的值。部署完打开 Worker 地址，**第一个注册的账号自动是管理员**，再到管理后台把站点 URL 改成真实地址。
+
+### 5. 更新到新版本
+
+```bash
+git pull
+npm install
+npm run deploy
+```
+
+### 6. 让 GitHub 自己构建部署（Workers Builds）
+
+仓库接 Cloudflare Workers Builds（Workers & Pages → Create → 选仓库）时只填两格：
+
+| 框 | 命令 |
+|---|---|
+| **构建命令** | `npm install` |
+| **部署命令** | `npm run deploy` |
+
+环境变量（项目设置 → 环境变量）里加 `DATABASE_URL`，可选 `SITE_URL`。每次 push 到 main 自动构建发布。仓库自带的 CI 见下节「CI 检查」。
+
+## 开发速查
 
 ```bash
 npm run typecheck     # tsc --noEmit
-npm run build         # wrangler deploy --dry-run --outdir=dist
+npm run build         # 拉前端 + wrangler dry-run 打包（产物 dist/，不发布）
 npm run dev           # 本地 wrangler dev
+npm run deploy        # 真实部署（自动 KV/R2/Secret）
 ```
 
 本地调试把机密写进 `.dev.vars`（已被 `.gitignore` 排除），参考 `.dev.vars.example`。

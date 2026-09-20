@@ -88,6 +88,18 @@ export class AppContext {
     return this.user;
   }
 
+  /**
+   * 以指定用户身份派生一个上下文（共享全部 repo/绑定，仅替换 user）。
+   * 用于「签名 URL 匿名访问但要按原请求者权限执行」的场景，
+   * 例如打包下载：会话里存了 requester_id，取包时恢复其身份。
+   * 对应上游 `GetLoginUserByID`（service/explorer/file.go:66）。
+   */
+  withUser(user: UserWithGroup): AppContext {
+    const clone = Object.create(AppContext.prototype) as AppContext;
+    Object.assign(clone, this, { user });
+    return clone;
+  }
+
   /** 当前用户所属组的权限位集。 */
   get groupPermissions(): BooleanSet {
     return permissionsOf(this.requireUser().group);
