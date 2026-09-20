@@ -1,13 +1,19 @@
 /**
  * 驱动工厂。对应原版 `pkg/filemanager/manager/fs.go` 的 `GetStorageDriver`。
  *
- * 原版是一个覆盖 10 种策略类型的 switch；边缘版只实现两种：
- *   - `s3`       → R2Driver（Cloudflare R2，走 Worker 绑定；R2 兼容 S3 API，
- *                  上游前端 PolicyType 枚举没有 'r2'，必须以 's3' 呈现）
+ *   - `s3`       → 有 AK/SK 时走 S3CompatibleDriver（AWS / 任意 S3 兼容存储）；
+ *                  无 AK/SK 且配置了 R2 绑定时走 R2Driver（Worker 绑定直连，
+ *                  向后兼容内置的「R2 Default」策略）
+ *   - `oss`      → 阿里云 OSS（S3 兼容层）
+ *   - `cos`      → 腾讯云 COS（S3 兼容层）
+ *   - `obs`      → 华为云 OBS（S3 兼容层）
+ *   - `qiniu`    → 七牛（S3 兼容层）
+ *   - `ks3`      → 金山 KS3（S3 兼容层）
  *   - `onedrive` → OneDriveDriver（Microsoft Graph）
  *
- * 其余类型（local / oss / cos / obs / ks3 / qiniu / upyun / remote /
- * load_balance）未实现，取驱动时会抛 `CodePolicyNotAllowed`。
+ * local / upyun / remote / load_balance 仍未实现（Workers 无本地文件系统、
+ * upyun 非 S3 兼容协议、remote/load_balance 依赖节点模型），取驱动时抛
+ * `CodePolicyNotAllowed`。
  */
 import type { Env } from '../env';
 import type { StoragePolicyRow } from '../db/types';
@@ -15,15 +21,32 @@ import { AppError, CodePolicyNotAllowed } from '../lib/errors';
 import { PolicyType } from '../lib/boolset';
 import { R2Driver } from './r2';
 import { OneDriveDriver } from './onedrive';
+import { S3CompatibleDriver } from './s3';
 import type { StorageDriver } from './types';
 
 /** 当前实现支持的策略类型。 */
-export const SUPPORTED_POLICY_TYPES = [PolicyType.S3, PolicyType.OneDrive] as const;
+export const SUPPORTED_POLICY_TYPES = [
+  PolicyType.S3,
+  PolicyType.Oss,
+  PolicyType.Cos,
+  PolicyType.Obs,
+  PolicyType.Qiniu,
+  PolicyType.Ks3,
+  PolicyType.OneDrive,
+] as const;
 
 export function getStorageDriver(env: Env, policy: StoragePolicyRow): StorageDriver {
   switch (policy.type) {
     case PolicyType.S3:
-      return new R2Driver(env, policy);
+      // 兼容内置 R2 策略：没填 AK/SK 就用 Worker 的 R2 绑定
+      if (!policy.access_key && env.R2) return new R2Driver(env, policy);
+      return new S3CompatibleDriver(policy);
+    case PolicyType.Oss:
+    case PolicyType.Cos:
+    case PolicyType.Obs:
+    case PolicyType.Qiniu:
+    case PolicyType.Ks3:
+      return new S3CompatibleDriver(policy);
     case PolicyType.OneDrive:
       return new OneDriveDriver(env, policy);
     default:
@@ -42,3 +65,4 @@ export function isPolicyTypeSupported(type: string): boolean {
 export * from './types';
 export { R2Driver } from './r2';
 export { OneDriveDriver } from './onedrive';
+export { S3CompatibleDriver } from './s3';
