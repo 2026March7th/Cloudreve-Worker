@@ -35,13 +35,13 @@ import {
 import { useSnackbar } from "notistack";
 import { useCallback, useContext, useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { AuditLogType } from "../../../api/explorer.ts";
+import { AuditLogType } from "../../../../api/explorer.ts";
 import {
   NoWrapCell,
   SecondaryButton,
   StyledTableContainerPaper,
-} from "../../../Common/StyledComponents.tsx";
-import TablePagination from "../../../Pages/Setting/TablePagination.tsx";
+} from "../../../../Common/StyledComponents.tsx";
+import TablePagination from "../../../../Admin/Common/TablePagination.tsx";
 import { NoMarginHelperText, SettingSection, SettingSectionContent } from "../Settings.tsx";
 import { SettingContext } from "../SettingWrapper.tsx";
 
