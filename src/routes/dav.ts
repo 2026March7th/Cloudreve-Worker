@@ -75,7 +75,11 @@ davRoutes.use('*', async (c, next) => {
 
   const ctx = ctxOf(c);
   const hit = await ctx.davAccounts.byNameAndPassword(auth.name, auth.password);
-  if (!hit) return c.body(null, 401);
+  if (!hit) {
+    // Windows WebClient 收到没有 WWW-Authenticate 的 401 不会重试凭据
+    c.header('WWW-Authenticate', 'Basic realm="cloudreve"');
+    return c.body(null, 401);
+  }
 
   const full = await ctx.users.byIdWithGroup(hit.account.owner_id);
   if (!full) return c.body(null, 401);
@@ -187,9 +191,22 @@ async function openEntityStream(
   return ctx.driverFor(policy).get(entity.source, range);
 }
 
-// ---------------------------------------------------------------------------
-// 方法实现
-// ---------------------------------------------------------------------------
+/** 判断行是否目录。根目录 `file_children` 为 null 但名字为空（见 fs.ts isRootFolder）。 */
+function isFolderRow(fs: FileSystemService, file: FileRow): boolean {
+  return file.file_children !== null || fs.isRootFolder(file);
+}
+
+/**
+ * href：路径逐段百分号编码（中文/空格原样写进 XML 会让 Windows MrxDAV
+ * 与请求 URL 对不上号），目录以 `/` 结尾（RFC 4918）。
+ */
+function hrefFor(target: URI, isDir: boolean): string {
+  const encoded = target.path
+    .split('/')
+    .map((seg) => (seg === '' ? '' : encodeURIComponent(seg)))
+    .join('/');
+  return `${DAV_PREFIX}${encoded === '' ? '' : encoded}${isDir && !encoded.endsWith('/') ? '/' : ''}`;
+}
 
 davRoutes.on('OPTIONS', '*', (c) => {
   c.header('DAV', '1, 2');
@@ -217,16 +234,11 @@ davRoutes.on('PROPFIND', '*', async (c) => {
     return c.body(null, 404);
   }
 
-  const hrefFor = (target: URI): string => {
-    const rel = target.path === '/' ? '' : target.path;
-    return `${DAV_PREFIX}${rel}`;
-  };
-
   const responses: string[] = [];
-  const isDir = file.file_children !== null;
+  const isDir = isFolderRow(fs, file);
   responses.push(
     davResponseXml({
-      href: hrefFor(uri),
+      href: hrefFor(uri, isDir),
       displayName: file.name || '/',
       isCollection: isDir,
       size: Number(file.size ?? 0),
@@ -243,11 +255,12 @@ davRoutes.on('PROPFIND', '*', async (c) => {
     });
     for (const item of list.files) {
       const childUri = uri.child(item.name);
+      const childIsDir = item.type === FileType.Folder;
       responses.push(
         davResponseXml({
-          href: hrefFor(childUri),
+          href: hrefFor(childUri, childIsDir),
           displayName: item.name,
-          isCollection: item.type === FileType.Folder,
+          isCollection: childIsDir,
           size: Number(item.size ?? 0),
           modifiedAt: new Date(item.updated_at ?? Date.now()),
         }),
@@ -273,7 +286,7 @@ davRoutes.on(['GET', 'HEAD'], '*', async (c) => {
     return c.body(null, 404);
   }
 
-  if (file.file_children !== null) {
+  if (isFolderRow(fs, file)) {
     // 目录：返回简单 HTML 列表（浏览器直接打开时用）
     const list = await fs.list(uri, {
       page: 0,
@@ -402,7 +415,7 @@ davRoutes.on(['COPY', 'MOVE'], '*', async (c) => {
     //   dst 不存在 → dst.parent() 是落点，最后一段是新名字
     let targetParent: URI;
     let targetName = srcUri.name;
-    if (dst && dst.file_children !== null) {
+    if (dst && isFolderRow(fs, dst)) {
       targetParent = dstUri;
     } else if (dst) {
       if (!overwrite) return c.body(null, 412);
@@ -415,7 +428,7 @@ davRoutes.on(['COPY', 'MOVE'], '*', async (c) => {
 
     // 父目录必须存在且是目录（否则 409）
     const parent = await fs.resolve(targetParent);
-    if (!parent || parent.file_children === null) return c.body(null, 409);
+    if (!parent || !isFolderRow(fs, parent)) return c.body(null, 409);
 
     await fs.moveOrCopy([srcUri], targetParent, isCopy);
 
