@@ -216,6 +216,11 @@ export class AppContext {
       const hit = allowed.find((p) => p.id === Number(preferred));
       if (hit) return hit;
     }
+    // 组没绑任何存储策略（或绑定的全被删了）：必须抛明确业务错误，
+    // 否则调用方拿到 undefined 再读 policy.max_size 会 50001 内部错误。
+    if (!allowed.length) {
+      throw new AppError(40035, 'No available storage policy for your group');
+    }
     return allowed[0]!;
   }
 

@@ -55,7 +55,10 @@ const PolicySelectionInput = ({ value, onChange }: PolicySelectionInputProps) =>
       <DenseSelect
         multiple
         value={value}
-        required
+        // 注意：绝不能加 required —— MUI 会把 required 透传给隐藏的原生
+        // select，value 为空数组（组还没绑任何策略，合法状态）时
+        // GroupSettingWrapper.submit() 的 formRef.checkValidity() 恒为 false，
+        // reportValidity 对隐藏元素又弹不出提示，保存按钮就永远静默失效。
         onChange={handleChange}
         sx={{
           minHeight: 39,

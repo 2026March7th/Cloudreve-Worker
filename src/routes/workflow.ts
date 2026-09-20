@@ -44,7 +44,9 @@ function taskToResponse(codec: HashIDCodec, task: TaskRow) {
     id: codec.encodeTaskID(task.id),
     status: task.status,
     type: task.type,
-    summary: pub.summary,
+    // 上游契约里 summary 是值类型 struct（永不为 null）；缺省回退空 props，
+    // 否则前端 TaskSummaryTitle 的 `summary?.props.download` 会崩。
+    summary: pub.summary ?? { props: {} },
     error: pub.error,
     error_history: pub.error_history,
     duration: pub.executed_duration,

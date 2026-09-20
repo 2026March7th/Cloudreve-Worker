@@ -840,7 +840,11 @@ function taskToResponse(
     // 前端 TaskRow 读取的三个字段：summary 来自 public_state.summary，
     // 边缘版没有从属节点（node 恒空，前端有 `task?.node?.name` 守卫），
     // edges.user 供行内用户徽章 / 用户详情跳转使用。
-    summary: publicState.summary ?? null,
+    // summary 绝不能是 null：TaskContent 会做 `{...task.summary}` 展开，
+    // 空对象（truthy 但无 props）会让 TaskSummaryTitle 的
+    // `summary?.props.download` 在 `.props` 处崩掉（渲染失败 `:(`）。
+    // 上游 Go 是值类型 struct，序列化后永远带 props，这里对齐回退空 props。
+    summary: (publicState.summary as Record<string, unknown> | undefined) ?? { props: {} },
     node: null,
     edges: user
       ? {
