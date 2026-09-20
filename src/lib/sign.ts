@@ -51,7 +51,8 @@ export class Signer {
       throw new AppError(CodeSignExpired, 'signature expired');
     }
     const expected = await this.sign(body, expires);
-    if (expected !== sign) {
+    // 恒时比较：`!==` 提前返回的字符串比较可被逐字节计时侧信道利用
+    if (!timingSafeEqualStr(expected, sign)) {
       throw new AppError(CodeInvalidSign, 'invalid sign');
     }
   }
@@ -98,3 +99,13 @@ export async function verifyRequestSign(
 }
 
 export { base64UrlToString };
+
+/** 恒时字符串比较（长度不同立即失败不泄漏内容差异，长度相同逐位累计）。 */
+function timingSafeEqualStr(a: string, b: string): boolean {
+  const ab = new TextEncoder().encode(a);
+  const bb = new TextEncoder().encode(b);
+  if (ab.length !== bb.length) return false;
+  let diff = 0;
+  for (let i = 0; i < ab.length; i++) diff |= ab[i]! ^ bb[i]!;
+  return diff === 0;
+}

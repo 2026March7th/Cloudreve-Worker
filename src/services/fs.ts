@@ -13,6 +13,37 @@ import { SearchService } from './search';
 import { FileSystemType, URI, validateName } from './uri';
 import type { ExplorerView, FileRow, MetadataRow, StoragePolicyRow } from '../db/types';
 import { BooleanSet, EntityType, FileType, GroupPermission } from '../lib/boolset';
+
+/**
+ * 文件系统能力位。位序**严格对齐**上游 `pkg/filemanager/fs/dbfs/navigator.go`
+ * 的 iota 顺序（与前端 `api/explorer.ts` 的 NavigatorCapability 枚举一一对应）：
+ *   0 create_file, 1 rename_file, 6 upload_file, 7 download_file,
+ *   8 update_metadata, 9 list_children, 10 generate_thumb, 14 delete_file,
+ *   15 lock_file, 16 soft_delete, 17 restore, 18 share, 19 info,
+ *   20 version_control, 23 enter_folder, 24 modify_props。
+ *
+ * ⚠️ 这是独立于 GroupPermission 的另一套位表 —— 两者位号完全不同，
+ * 混用会让前端 `new Boolset(capability).enabled(NavigatorCapability.x)`
+ * 查错位（曾因此把「新建文件夹/文件/上传」整组菜单吞掉）。
+ */
+export const NavigatorCapability = {
+  CreateFile: 0,
+  RenameFile: 1,
+  UploadFile: 6,
+  DownloadFile: 7,
+  UpdateMetadata: 8,
+  ListChildren: 9,
+  GenerateThumb: 10,
+  DeleteFile: 14,
+  LockFile: 15,
+  SoftDelete: 16,
+  Restore: 17,
+  Share: 18,
+  Info: 19,
+  VersionControl: 20,
+  EnterFolder: 23,
+  ModifyProps: 24,
+} as const;
 import {
   AppError,
   CodeAnonymouseAccessDenied,
@@ -392,6 +423,12 @@ export class FileSystemService {
       res.path = userViewUri.toString();
     }
 
+    // 能力位：上游 BuildListResponse 对**每个文件和 parent** 都下发
+    // navigator 能力（service/explorer/response.go:388,401），前端「新建」菜单、
+    // 右键菜单、版本管理等全部依赖 `file.capability` 判位。按文件所属
+    // 文件系统自动推导（子文件继承父目录能力的语义等价，上游 dbfs/file.go:345）。
+    res.capability = this.navigatorCapability(userViewUri).toBase64();
+
     if (options.owned !== undefined) {
       res.owned = options.owned;
     } else {
@@ -635,20 +672,61 @@ export class FileSystemService {
     }
   }
 
-  /** 各文件系统暴露的能力位集（回收站与分享空间一律为空）。 */
+  /**
+   * 各文件系统暴露的能力位集。**静态对齐上游 `dbfs/navigator.go` 的 init()**：
+   *   - my：            全量（含 create/upload/rename/delete/soft_delete…）；
+   *   - share：         只读浏览 + 下载 + 缩略图 + 信息；
+   *   - trash：         列出 + 删除 + 还原；
+   *   - shared_with_me：列出 + 下载 + 进入。
+   * 上游不按用户组权限裁剪这份上报（组权限由前端 GroupPermission 位和
+   * 服务端操作时校验把关），这里保持一致 —— 自行裁剪会让前端菜单/按钮
+   * 与原版行为不一致。
+   */
   private navigatorCapability(uri: URI): BooleanSet {
-    if (uri.fsType !== FileSystemType.My) return new BooleanSet();
-    const perms = this.ctx.groupPermissions;
-    const out = new BooleanSet();
-    // 与原版 my navigator 上报的能力保持一致：分享 / 打包下载 / 高级删除
-    for (const bit of [
-      GroupPermission.Share,
-      GroupPermission.ArchiveDownload,
-      GroupPermission.AdvanceDelete,
-    ]) {
-      if (perms.enabled(bit)) out.set(bit, true);
+    const NC = NavigatorCapability;
+    switch (uri.fsType) {
+      case FileSystemType.My:
+        return BooleanSet.fromFlags(
+          NC.CreateFile,
+          NC.RenameFile,
+          NC.UploadFile,
+          NC.DownloadFile,
+          NC.UpdateMetadata,
+          NC.ListChildren,
+          NC.GenerateThumb,
+          NC.DeleteFile,
+          NC.LockFile,
+          NC.SoftDelete,
+          NC.Share,
+          NC.Info,
+          NC.VersionControl,
+          NC.EnterFolder,
+          NC.ModifyProps,
+        );
+      case FileSystemType.Share:
+        return BooleanSet.fromFlags(
+          NC.DownloadFile,
+          NC.ListChildren,
+          NC.GenerateThumb,
+          NC.LockFile,
+          NC.Info,
+          NC.VersionControl,
+          NC.EnterFolder,
+          NC.ModifyProps,
+        );
+      case FileSystemType.Trash:
+        return BooleanSet.fromFlags(
+          NC.ListChildren,
+          NC.DeleteFile,
+          NC.LockFile,
+          NC.Restore,
+          NC.Info,
+        );
+      case FileSystemType.SharedWithMe:
+        return BooleanSet.fromFlags(NC.ListChildren, NC.DownloadFile, NC.EnterFolder);
+      default:
+        return new BooleanSet();
     }
-    return out;
   }
 
   // -------------------------------------------------------------------------
