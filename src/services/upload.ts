@@ -574,6 +574,9 @@ export class UploadService {
   async deleteSession(sessionId: string, uriHint?: string): Promise<void> {
     const session = await this.loadSession(sessionId);
     if (session) {
+      // 会话属主校验：与 uploadChunk 同款（原版 UseUploadSession 中间件
+      // 对会话 UID 与请求者做一致性检查，防登录用户互删上传会话）
+      if (session.uid !== this.ctx.requireUser().id) throw Err.noPermission();
       await this.discardSession(session);
       return;
     }

@@ -16,7 +16,7 @@ import type { Env } from '../env';
 import { getSql, type Sql } from '../db';
 import { AppError, CodeCredentialInvalid, CodeNoPermissionErr, CodeNotFound, CodeParamErr, CodeUserNotFound } from '../lib/errors';
 import { validateScopes } from '../lib/jwt';
-import { randomString } from '../lib/crypto';
+import { randomString, timingSafeEqual } from '../lib/crypto';
 import { AppContext } from './context';
 import type { UserRow, UserWithGroup } from '../db/types';
 
@@ -215,14 +215,14 @@ export class OAuthService {
         new TextEncoder().encode(args.code_verifier ?? ''),
       );
       const expected = b64url(new Uint8Array(digest));
-      if (expected !== authCode.code_challenge) {
+      if (!timingSafeEqual(expected, authCode.code_challenge)) {
         throw new AppError(CodeCredentialInvalid, 'Invalid code verifier');
       }
     }
 
     const app = await this.clientByGUID(args.client_id);
     if (!app) throw new AppError(CodeNotFound, 'App not found');
-    if (app.secret !== args.client_secret) {
+    if (!timingSafeEqual(app.secret, args.client_secret)) {
       throw new AppError(CodeCredentialInvalid, 'Invalid client secret');
     }
     if (!validateScopes(authCode.scopes, app.scopes)) {

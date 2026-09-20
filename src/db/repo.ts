@@ -18,7 +18,7 @@ import type {
   UserWithGroup,
 } from './types';
 import type { Env } from '../env';
-import { uuidv4 } from '../lib/crypto';
+import { sha256Hex, timingSafeEqual, uuidv4 } from '../lib/crypto';
 import { MetadataExpectedCollectTime } from '../lib/sysmeta';
 
 // ---------------------------------------------------------------------------
@@ -1597,14 +1597,19 @@ export class DavAccountRepo {
     name: string,
     password: string,
   ): Promise<{ account: DavAccountRow; user: UserRow } | null> {
+    // 库里存 sha256 hash（创建时明文只回显一次）。历史明文行回退直接
+    // 比较以保持兼容；两条路径都是恒时比较。
     const rows = (await this.sql`
       SELECT * FROM dav_accounts
-      WHERE name = ${name} AND password = ${password}
-        AND deleted_at IS NULL
+      WHERE name = ${name} AND deleted_at IS NULL
       LIMIT 1
     `) as Record<string, unknown>[];
     if (!rows[0]) return null;
     const account = normalizeDavAccount(rows[0]);
+    const hashed = await sha256Hex(password);
+    const ok =
+      timingSafeEqual(account.password, hashed) || timingSafeEqual(account.password, password);
+    if (!ok) return null;
     const userRows = (await this.sql`
       SELECT * FROM users WHERE id = ${account.owner_id} AND status = 'active' LIMIT 1
     `) as Record<string, unknown>[];

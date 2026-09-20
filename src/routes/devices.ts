@@ -18,7 +18,7 @@ import { fail, ok } from '../lib/response';
 import { URI } from '../services/uri';
 import { AppError, Err } from '../lib/errors';
 import { BooleanSet, GroupPermission } from '../lib/boolset';
-import { randomString } from '../lib/crypto';
+import { randomString, sha256Hex } from '../lib/crypto';
 import type { HashIDCodec } from '../lib/hashid';
 import type { DavAccountRow } from '../db/repo';
 
@@ -108,14 +108,17 @@ devicesRoutes.put('/dav', async (c) => {
       throw new AppError(40007, 'WebDAV is not enabled for this user group');
     }
     validateDavUri(body.uri);
+    // 密码只生成一次明文回显给用户，库内存 sha256（对齐上游 bcrypt 语义，
+    // DB 泄漏不泄漏可用凭据）；认证侧 sha256 比对 + 历史明文行回退
+    const plain = randomString(32);
     const account = await ctx.davAccounts.create({
       ownerId: ctx.user.id,
       name: body.name,
       uri: body.uri,
-      password: randomString(32),
+      password: await sha256Hex(plain),
       options: davOptionsFrom(body, ctx.groupPermissions.enabled(GroupPermission.WebDAVProxy)),
     });
-    return ok(c, davAccountToResponse(ctx.codec, account));
+    return ok(c, { ...davAccountToResponse(ctx.codec, account), password: plain });
   } catch (e) {
     return fail(c, e);
   }
