@@ -87,30 +87,60 @@ const needProvision =
 if (!needProvision) {
   console.log(`  wrangler.toml 已含真实 KV ID，跳过开通。`);
 } else {
-  // 列出现有 namespace，找标题形如 <worker名>-KV 的
+  // 列出现有 namespace，找标题形如 <worker名>-KV 的；
+  // 兼容旧版本 wrangler / 手动创建留下的裸标题 "KV"。
   const list = run(NPX, npxArgs(['kv', 'namespace', 'list']));
   let nsId = null;
   if (list.code === 0) {
     const arr = extractJsonArray(list.stdout);
     const hit = Array.isArray(arr)
-      ? arr.find((n) => typeof n?.title === 'string' && n.title === `${WORKER_NAME}-KV`)
+      ? arr.find(
+          (n) =>
+            typeof n?.title === 'string' &&
+            (n.title === `${WORKER_NAME}-KV` || n.title === 'KV'),
+        )
       : null;
     if (hit?.id) nsId = hit.id;
   }
 
   if (!nsId) {
     console.log(`  未找到 ${WORKER_NAME}-KV，创建…`);
-    const created = runOrDie(
-      NPX,
-      npxArgs(['kv', 'namespace', 'create', 'KV']),
-      '创建 KV namespace',
-    );
-    const m = created.all.match(/id\s*=\s*"([0-9a-f]{32})"/i);
-    if (!m) {
-      console.error(`\n✘ 无法从 wrangler 输出中解析新 namespace 的 ID：\n${created.all}`);
-      process.exit(1);
+    const created = run(NPX, npxArgs(['kv', 'namespace', 'create', 'KV']));
+    if (created.code !== 0) {
+      // 撞名（already exists）时回落为复用列表里已有的那个
+      if (/already exists|10013/i.test(created.all)) {
+        const relist = run(NPX, npxArgs(['kv', 'namespace', 'list']));
+        const arr =
+          relist.code === 0 ? extractJsonArray(relist.stdout) : null;
+        const hit = Array.isArray(arr)
+          ? arr.find(
+              (n) =>
+                typeof n?.title === 'string' &&
+                (n.title === `${WORKER_NAME}-KV` || n.title === 'KV'),
+            )
+          : null;
+        if (!hit?.id) {
+          console.error(
+            `\n✘ 创建 KV namespace 失败且未能复用已有的：\n${created.all}`,
+          );
+          process.exit(created.code || 1);
+        }
+        console.log(`  已存在同名 namespace（${hit.id}），复用。`);
+        nsId = hit.id;
+      } else {
+        console.error(
+          `\n✘ 创建 KV namespace 失败（exit ${created.code}）：\n${created.all}`,
+        );
+        process.exit(created.code || 1);
+      }
+    } else {
+      const m = created.all.match(/id\s*=\s*"([0-9a-f]{32})"/i);
+      if (!m) {
+        console.error(`\n✘ 无法从 wrangler 输出中解析新 namespace 的 ID：\n${created.all}`);
+        process.exit(1);
+      }
+      nsId = m[1];
     }
-    nsId = m[1];
   } else {
     console.log(`  已存在（${nsId}），直接复用。`);
   }
