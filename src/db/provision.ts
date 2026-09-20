@@ -205,7 +205,8 @@ async function seedSystemData(env: Env): Promise<void> {
          dir_name_rule, file_name_rule, settings)
       VALUES
         ('R2 Default', 's3', '', '', true, 0,
-         'uploads/{uid}/{path}', '{uid}_{randomkey8}_{originname}', '{}'::jsonb)
+         'uploads/{uid}/{path}', '{uid}_{randomkey8}_{originname}',
+         '{"relay": true}'::jsonb)
       RETURNING id
     `) as Array<{ id: number | string }>;
     const policyId = Number(inserted[0]!.id);
@@ -217,6 +218,19 @@ async function seedSystemData(env: Env): Promise<void> {
   // 直接抛 undefined 导致存储策略页崩。R2 兼容 S3 API，统一归一到 's3'。
   // 幂等：无 'r2' 行时为空更新。
   await sql`UPDATE storage_policies SET type = 's3', updated_at = now() WHERE type = 'r2'`;
+
+  // 数据修复：R2 绑定策略（type=s3 且无 AK/SK，由 R2Driver 中转）必须在
+  // settings 里带 relay=true，前端上传器才会走 Local 中转流程；缺了它前端
+  // 按 S3 直传读 `session.upload_urls[0]` 崩（Cannot read properties of
+  // undefined (reading '0')）。给历史行补上该标志。幂等：已为 true 的行不命中。
+  await sql`
+    UPDATE storage_policies
+    SET settings = COALESCE(settings, '{}'::jsonb) || '{"relay": true}'::jsonb,
+        updated_at = now()
+    WHERE type = 's3'
+      AND (access_key IS NULL OR access_key = '')
+      AND COALESCE(settings->>'relay', 'false') <> 'true'
+  `;
 
   // 数据修复：组播种原本只给组 2（注册组）绑定存储策略，组 1（站长）/
   // 组 3（游客）恒为 NULL。而上游 getPreferredPolicy（dbfs.go:669 →

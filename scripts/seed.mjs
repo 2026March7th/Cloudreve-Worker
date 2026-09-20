@@ -186,7 +186,8 @@ async function main() {
          dir_name_rule, file_name_rule, settings)
       VALUES
         ('R2 Default', 's3', '', '', true, 0,
-         'uploads/{uid}/{path}', '{uid}_{randomkey8}_{originname}', '{}'::jsonb)
+         'uploads/{uid}/{path}', '{uid}_{randomkey8}_{originname}',
+         '{"relay": true}'::jsonb)
       RETURNING id
     `;
     policyId = inserted[0].id;

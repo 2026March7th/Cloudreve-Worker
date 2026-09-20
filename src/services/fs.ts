@@ -12,7 +12,7 @@ import { AppContext } from './context';
 import { SearchService } from './search';
 import { FileSystemType, URI, validateName } from './uri';
 import type { ExplorerView, FileRow, MetadataRow, StoragePolicyRow } from '../db/types';
-import { BooleanSet, EntityType, FileType, GroupPermission } from '../lib/boolset';
+import { BooleanSet, EntityType, FileType, GroupPermission, PolicyType } from '../lib/boolset';
 import { isPolicyTypeSupported } from '../storage';
 
 /**
@@ -544,7 +544,14 @@ export class FileSystemService {
       name: policy.name,
       type: policy.type,
       max_size: Number(policy.max_size ?? 0),
-      relay: policy.settings?.relay,
+      // R2 绑定策略（type=s3 且无 AK/SK）走 R2Driver 中转模式，不返回
+      // upload_urls —— 前端上传器 factory（core/index.ts:107）只有看到
+      // policy.relay 才会切到 Local 中转上传器，否则按 S3 直传流程读
+      // `session.upload_urls[0]` 直接崩。这里做动态兜底，避免旧数据
+      // settings 里没有 relay 标志时上传必炸。
+      relay:
+        policy.settings?.relay === true ||
+        (policy.type === PolicyType.S3 && !policy.access_key),
       chunk_concurrency: policy.settings?.chunk_concurrency,
       encryption: policy.settings?.encryption,
     };
