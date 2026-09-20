@@ -191,9 +191,9 @@ async function openEntityStream(
   return ctx.driverFor(policy).get(entity.source, range);
 }
 
-/** 判断行是否目录。根目录 `file_children` 为 null 但名字为空（见 fs.ts isRootFolder）。 */
+/** 判断行是否目录。必须用 type 位（file_children 指向父容器，文件/目录都非空）；根行兜底。 */
 function isFolderRow(fs: FileSystemService, file: FileRow): boolean {
-  return file.file_children !== null || fs.isRootFolder(file);
+  return file.type === FileType.Folder || fs.isRootFolder(file);
 }
 
 /**
@@ -429,6 +429,13 @@ davRoutes.on(['COPY', 'MOVE'], '*', async (c) => {
     // 父目录必须存在且是目录（否则 409）
     const parent = await fs.resolve(targetParent);
     if (!parent || !isFolderRow(fs, parent)) return c.body(null, 409);
+
+    // 同目录改名/覆盖：moveOrCopy 的同名冲突检查会把**源自己**当冲突（源就
+    // 落在该目录里），必须走 rename 直改；rename 自带同名冲突校验。
+    if (!isCopy && targetParent.path === srcUri.parent().path) {
+      await fs.rename(srcUri, targetName);
+      return c.body(null, 201);
+    }
 
     await fs.moveOrCopy([srcUri], targetParent, isCopy);
 
