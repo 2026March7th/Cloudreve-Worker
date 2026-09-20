@@ -51,10 +51,15 @@ export const DEFAULT_SETTINGS: Record<string, string> = {
   // 法律文档链接，对应 LegalDocuments
   tos_url: '',
   privacy_policy_url: '',
+  // PWA 图标（官方「站点信息」设置页会读写这三个键）
+  pwa_small_icon: '/static/img/favicon.ico',
+  pwa_medium_icon: '/static/img/logo192.png',
+  pwa_large_icon: '/static/img/logo512.png',
 
   // --- 注册与登录 ---
   register_enabled: '1',
   email_active: '0',
+  expose_user_email: '1',
   login_captcha: '0',
   reg_captcha: '0',
   forget_captcha: '0',
@@ -63,11 +68,24 @@ export const DEFAULT_SETTINGS: Record<string, string> = {
   authn_enabled: '1',
   default_group: '2',
   captcha_type: '',
+  // 内置图形验证码的渲染参数（官方「验证码」设置页读写，键名对齐上游 inventory/setting.go:539-555）
+  captcha_mode: '3',
+  captcha_ComplexOfNoiseText: '0',
+  captcha_ComplexOfNoiseDot: '0',
+  captcha_IsShowHollowLine: '0',
+  captcha_IsShowNoiseDot: '1',
+  captcha_IsShowNoiseText: '0',
+  captcha_IsShowSlimeLine: '1',
+  captcha_IsShowSineLine: '0',
+  captcha_CaptchaLen: '6',
   captcha_ReCaptchaKey: '',
+  captcha_ReCaptchaSecret: '',
+  captcha_turnstile_site_key: '',
+  captcha_turnstile_site_secret: '',
   captcha_cap_instance_url: '',
   captcha_cap_site_key: '',
-  captcha_cap_asset_server: '',
-  captcha_turnstile_site_key: '',
+  captcha_cap_secret_key: '',
+  captcha_cap_asset_server: 'jsdelivr',
 
   // --- 密钥 ---
   secret_key: '', // 首次启动生成 256 位随机串
@@ -99,6 +117,51 @@ export const DEFAULT_SETTINGS: Record<string, string> = {
   thumb_height: '300',
   thumb_encode_method: 'png',
   thumb_encode_quality: '95',
+  // 官方「媒体处理」设置页读写的完整键集（默认值逐条取自 inventory/setting.go:558-585,
+  // 631-644）。边缘版不做本地转码，但这些值会经 /site/config 与策略能力透传给前端，
+  // 且管理员需要能正常打开并保存这一页。
+  thumb_entity_suffix: '{blob_path}/{blob_name}._thumb',
+  thumb_gc_after_gen: '0',
+  thumb_builtin_enabled: '1',
+  thumb_builtin_max_size: '78643200',
+  thumb_vips_max_size: '78643200',
+  thumb_vips_enabled: '0',
+  thumb_vips_exts:
+    '3fr,ari,arw,bay,braw,crw,cr2,cr3,cap,data,dcs,dcr,dng,drf,eip,erf,fff,gpr,iiq,k25,kdc,mdc,mef,mos,mrw,nef,nrw,obm,orf,pef,ptx,pxn,r3d,raf,raw,rwl,rw2,rwz,sr2,srf,srw,tif,x3f,csv,mat,img,hdr,pbm,pgm,ppm,pfm,pnm,svg,svgz,j2k,jp2,jpt,j2c,jpc,gif,png,jpg,jpeg,jpe,webp,tif,tiff,fits,fit,fts,exr,jxl,pdf,heic,heif,avif,svs,vms,vmu,ndpi,scn,mrxs,svslide,bif,raw',
+  thumb_vips_path: 'vips',
+  thumb_ffmpeg_enabled: '0',
+  thumb_ffmpeg_path: 'ffmpeg',
+  thumb_ffmpeg_max_size: '10737418240',
+  thumb_ffmpeg_exts:
+    '3g2,3gp,asf,asx,avi,divx,flv,m2ts,m2v,m4v,mkv,mov,mp4,mpeg,mpg,mts,mxf,ogv,rm,swf,webm,wmv',
+  thumb_ffmpeg_seek: '00:00:01.00',
+  thumb_ffmpeg_extra_args: '-hwaccel auto',
+  thumb_libreoffice_path: 'soffice',
+  thumb_libreoffice_max_size: '78643200',
+  thumb_libreoffice_enabled: '0',
+  thumb_libreoffice_exts:
+    'txt,pdf,md,ods,ots,fods,uos,xlsx,xml,xls,xlt,dif,dbf,html,slk,csv,xlsm,docx,dotx,doc,dot,rtf,xlsm,xlst,xls,xlw,xlc,xlt,pptx,ppsx,potx,pomx,ppt,pps,ppm,pot,pom',
+  thumb_music_cover_enabled: '1',
+  thumb_music_cover_exts: 'mp3,m4a,ogg,flac',
+  thumb_music_cover_max_size: '1073741824',
+  thumb_libraw_enabled: '0',
+  thumb_libraw_path: 'simple_dcraw',
+  thumb_libraw_max_size: '78643200',
+  thumb_libraw_exts:
+    '3fr,ari,arw,bay,braw,crw,cr2,cr3,cap,data,dcs,dcr,dng,drf,eip,erf,fff,gpr,iiq,k25,kdc,mdc,mef,mos,mrw,nef,nrw,obm,orf,pef,ptx,pxn,r3d,raf,raw,rwl,rw2,rwz,sr2,srf,srw,tif,x3f',
+  media_meta_exif: '1',
+  media_meta_exif_size_local: '1073741824',
+  media_meta_exif_size_remote: '104857600',
+  media_meta_exif_brute_force: '1',
+  media_meta_music: '1',
+  media_meta_music_size_local: '1073741824',
+  media_exif_music_size_remote: '1073741824',
+  media_meta_ffprobe: '0',
+  media_meta_ffprobe_path: 'ffprobe',
+  media_meta_ffprobe_size_local: '0',
+  media_meta_ffprobe_size_remote: '0',
+  media_meta_geocoding: '0',
+  media_meta_geocoding_mapbox_ak: '',
 
   // --- 前端展示 ---
   explorer_icons: '[]',
@@ -165,7 +228,26 @@ export const DEFAULT_SETTINGS: Record<string, string> = {
   entity_url_default_ttl: '3600',
   entity_url_cache_margin: '600',
   archive_timeout: '600',
+  temp_path: 'temp',
+  cron_garbage_collect: '@every 30m',
 };
+
+// 官方「队列」设置页读写的 6 队列 × 6 项（键名/默认值逐条取自
+// inventory/setting.go:598-627）。边缘版无常驻 worker，队列参数不参与调度，
+// 但设置页需要能读到并保存这些键。
+const QUEUE_TYPES = ['media_meta', 'thumb', 'recycle', 'io_intense', 'remote_download'] as const;
+const QUEUE_DEFAULTS: Record<string, Record<string, string>> = {
+  media_meta: { worker_num: '30', max_execution: '3600', backoff_factor: '2', backoff_max_duration: '60', max_retry: '1', retry_delay: '0' },
+  thumb: { worker_num: '15', max_execution: '300', backoff_factor: '2', backoff_max_duration: '60', max_retry: '0', retry_delay: '0' },
+  recycle: { worker_num: '5', max_execution: '900', backoff_factor: '2', backoff_max_duration: '60', max_retry: '0', retry_delay: '0' },
+  io_intense: { worker_num: '30', max_execution: '2592000', backoff_factor: '2', backoff_max_duration: '600', max_retry: '5', retry_delay: '0' },
+  remote_download: { worker_num: '5', max_execution: '864000', backoff_factor: '2', backoff_max_duration: '600', max_retry: '5', retry_delay: '0' },
+};
+for (const t of QUEUE_TYPES) {
+  for (const [k, v] of Object.entries(QUEUE_DEFAULTS[t])) {
+    DEFAULT_SETTINGS[`queue_${t}_${k}`] = v;
+  }
+}
 
 /** 需要随机初始化、且一旦写库就不应再变的键。 */
 export const GENERATED_SETTINGS = ['siteID', 'secret_key', 'hash_id_salt'] as const;

@@ -177,7 +177,8 @@ async function countAll(sql: Sql, table: string): Promise<number> {
   return Number(rows[0]?.c ?? 0);
 }
 
-/** 读取设置 */
+/** 读取设置。对库里不存在的键回落到默认值（官方设置页请求的键集很大，
+ *  未写过的键也必须返回初始值，否则表单显示为空，保存后的 diff 也不对）。 */
 adminRoutes.post('/settings', async (c) => {
   const ctx = ctxOf(c);
   const body = (await c.req.json().catch(() => ({}))) as { keys?: string[] };
@@ -186,10 +187,17 @@ adminRoutes.post('/settings', async (c) => {
     SELECT name, value FROM settings WHERE deleted_at IS NULL ORDER BY name ASC
   `) as { name: string; value: string | null }[];
 
+  const { DEFAULT_SETTINGS } = await import('../settings/defaults');
   const out: Record<string, string> = {};
   for (const r of rows) {
     if (body.keys?.length && !body.keys.includes(r.name)) continue;
     out[r.name] = r.value ?? '';
+  }
+  // 库里没有的键补默认值（只补请求的键，避免无谓地暴露全表）
+  if (body.keys?.length) {
+    for (const k of body.keys) {
+      if (!(k in out) && k in DEFAULT_SETTINGS) out[k] = DEFAULT_SETTINGS[k] ?? '';
+    }
   }
   return ok(c, out);
 });
@@ -198,7 +206,11 @@ adminRoutes.post('/settings', async (c) => {
  *  `{ settings: { <key>: <value> } }` —— 值嵌在 `settings` 键下，不是顶层。
  *  之前直接遍历顶层键，前端 SiteUrlWarning 点「设为主要站点」发的
  *  `{settings: {siteURL: ...}}` 会被当成一个名为 "settings" 的设置存进库，
- *  siteURL 本身永远写不进去，确认弹窗因此每次刷新都重现。 */
+ *  siteURL 本身永远写不进去，确认弹窗因此每次刷新都重现。
+ *
+ *  返回值对齐上游 `SetSetting`（site.go:334）：**返回保存后的键值对本身**。
+ *  官方前端会把响应合并回表单 state（SettingWrapper.submit 的 then 分支），
+ *  如果返回别的形状（如 {updated:[...]}）会污染前端 state，表现为保存异常。 */
 adminRoutes.patch('/settings', async (c) => {
   const ctx = ctxOf(c);
   const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
@@ -207,23 +219,44 @@ adminRoutes.patch('/settings', async (c) => {
     string,
     unknown
   >;
-  if (!raw || typeof raw !== 'object' || Object.keys(raw).length === 0) {
+  if (!raw || typeof raw !== 'object') {
     return fail(c, Err.param('No settings provided'));
   }
 
+  // 生成类键不允许通过接口改写：secret_key 是 JWT 签名密钥，被改掉会导致
+  // 全部会话失效；siteID / hash_id_salt 与存量 hashid/直链绑定。上游对
+  // secret_key 的做法是强制随机重写，这里直接忽略前端传入的值。
+  const PROTECTED_KEYS = new Set(['secret_key', 'siteID', 'hash_id_salt']);
+
   const sql = (await import('../db')).getSql(ctx.env);
-  const updated: string[] = [];
+  const saved: Record<string, string> = {};
   for (const [key, value] of Object.entries(raw)) {
-    // 密钥类字段禁止通过接口读回，但仍然允许写入
+    if (PROTECTED_KEYS.has(key)) continue;
     const strValue = typeof value === 'string' ? value : JSON.stringify(value);
+
+    // siteURL 预处理对齐上游 siteUrlPreProcessor：逗号分隔 URL 列表逐个规范化
+    if (key === 'siteURL') {
+      try {
+        const urls = strValue
+          .split(',')
+          .map((u) => new URL(u.trim()).toString().replace(/\/+$/, ''))
+          .filter(Boolean);
+        if (urls.length === 0) throw new Error('empty');
+        saved[key] = urls.join(',');
+      } catch {
+        return fail(c, Err.param(`Invalid siteURL value: ${strValue}`));
+      }
+    } else {
+      saved[key] = strValue;
+    }
+
     await sql`
-      INSERT INTO settings (name, value) VALUES (${key}, ${strValue})
+      INSERT INTO settings (name, value) VALUES (${key}, ${saved[key]})
       ON CONFLICT (name) DO UPDATE SET value = EXCLUDED.value, updated_at = now()
     `;
-    updated.push(key);
   }
   await invalidateSettings(ctx.env);
-  return ok(c, { updated });
+  return ok(c, saved);
 });
 
 // ---------------------------------------------------------------------------
