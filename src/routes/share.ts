@@ -53,7 +53,9 @@ shareRoutes.post('/:id', async (c) => {
   const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
   try {
     const url = await buildService(c).edit(c.req.param('id'), {
-      uri: '',
+      // 前端编辑分享时会带上源文件路径（createOrUpdateShareLink 的 req.uri），
+      // 上游 EditShare 与创建共用校验、按 uri 重新解析源文件（operation.go:311）
+      uri: (body.uri as string) ?? '',
       is_private: body.is_private as boolean | undefined,
       password: body.password as string | undefined,
       downloads: body.downloads as number | undefined,

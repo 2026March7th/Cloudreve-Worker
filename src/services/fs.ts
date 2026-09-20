@@ -161,6 +161,8 @@ export interface ListResponse {
   props: NavigatorProps;
   mixed_type: boolean;
   recursion_limit_reached?: boolean;
+  /** 单文件分享视图（上游 ListResponse.SingleFileView，response.go:257）。 */
+  single_file_view?: boolean;
   /**
    * 当前目录的「首选」存储策略（上游 `ListResponse.StoragePolicy`，取父目录
    * 属主所在用户组绑定的策略，dbfs.go:669 getPreferredPolicy）。前端上传器
@@ -327,6 +329,15 @@ export class FileSystemService {
       }
     }
 
+    // 单文件分享的路径语义（原版 To()，share_navigator.go:194-206）：
+    // 根 URI 返回文件本身；唯一一段路径 == 文件名时也返回文件（前端拿
+    // `cloudreve://<hash>[@:pwd]@share/<文件名>` 请求文件信息/下载/预览），
+    // 其余子路径一律不存在。
+    if (root!.type === FileType.File) {
+      if (uri.elements.length === 0) return root!;
+      if (uri.elements.length === 1 && uri.elements[0] === root!.name) return root!;
+      return null;
+    }
     return this.walk(root!, uri.elements);
   }
 
@@ -614,6 +625,33 @@ export class FileSystemService {
       params.pageSize > 0 ? params.pageSize : 100,
       this.ctx.settings.maxPageSize,
     );
+
+    // 单文件分享：源是文件时，上游 `share_navigator.go:229-244` 的 Children
+    // 无论 parent 是什么都返回「[那个文件] + SingleFileView=true」，前端
+    // Explorer（Explorer.tsx:78）据此渲染单文件分享页。此前把文件行当目录
+    // 列子节点 → 恒为空列表，分享页永远显示「什么都没有找到」。
+    if (uri.fsType === FileSystemType.Share && dir?.type === FileType.File) {
+      const res = await this.buildFileResponse(dir, {
+        shared: true,
+        owned: viewer !== undefined && dir.owner_id === viewer.id,
+        uri: this.childUri(uri, dir),
+      });
+      for (const m of await this.ctx.metadata.listByFile(dir.id, true)) {
+        res.metadata[m.name] = m.value;
+      }
+      return {
+        files: [res],
+        pagination: { page: params.page, page_size: pageSize, total_items: 1 },
+        props: {
+          capability: this.navigatorCapability(uri).toBase64(),
+          max_page_size: this.ctx.settings.maxPageSize,
+          order_by_options: ORDER_BY_OPTIONS,
+          order_direction_options: ORDER_DIRECTION_OPTIONS,
+        },
+        mixed_type: true,
+        single_file_view: true,
+      };
+    }
 
     const ownerId =
       uri.fsType === FileSystemType.My || uri.fsType === FileSystemType.Trash

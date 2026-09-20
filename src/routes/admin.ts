@@ -30,7 +30,8 @@
  *   POST   /api/v4/admin/tool/mail                  测试发信
  *   DELETE /api/v4/admin/tool/entityUrlCache        清理直链缓存（边缘版无缓存，空操作）
  *
- * 仍未实现（返回「未启用」40019）：WOPI 探测、缩略图生成器测试。
+ * 仍未实现（返回「未启用」40019）：缩略图生成器测试（Worker 无法执行本机
+ * 可执行文件）；WOPI 探测已实现（/tool/wopi）。
  * 集群节点相关操作同样返回 40019 —— 边缘版是单体 Worker，没有节点可管。
  *
  * 付费/订单/兑换码相关的一切在原版社区版里就不存在，边缘版同样没有。
@@ -984,6 +985,78 @@ adminRoutes.post('/tool/mail', async (c) => {
  * （每次现算，见 `services/download.ts`），因此这里确实是无事可做 ——
  * 返回成功是如实回答，不是假装。
  */
+// ---------------------------------------------------------------------------
+// 工具端点
+// ---------------------------------------------------------------------------
+
+/**
+ * WOPI discovery 探测。对应上游 `routers/router.go` `tool.GET("wopi")`：
+ * 请求 `?endpoint=<WOPI 服务地址>`，服务端取 `{endpoint}/hosting/discovery`，
+ * 解析 XML 成 `ViewerGroup`（对齐 `pkg/wopi/discovery.go` 的
+ * `DiscoveryXmlToViewerGroup`：`embedview`/`view` → view 动作，`edit` → edit，
+ * 无 ext 的 action 跳过，无有效 action 的 app 丢弃）。前端「文件预览」设置页
+ * 保存 WOPI 配置前靠它验证服务可用。
+ */
+adminRoutes.get('/tool/wopi', async (c) => {
+  const endpoint = c.req.query('endpoint')?.trim();
+  if (!endpoint) return fail(c, Err.param('endpoint is required'));
+
+  let discoveryUrl: URL;
+  try {
+    discoveryUrl = new URL('hosting/discovery', endpoint);
+  } catch {
+    return fail(c, Err.param('Invalid WOPI endpoint URL'));
+  }
+
+  let res: Response;
+  try {
+    res = await fetch(discoveryUrl, { signal: AbortSignal.timeout(15000) });
+  } catch (e) {
+    return fail(c, Err.param(`Failed to reach WOPI discovery: ${(e as Error).message}`));
+  }
+  if (!res.ok) {
+    return fail(c, Err.param(`WOPI discovery endpoint returned HTTP ${res.status}`));
+  }
+  const xml = await res.text();
+
+  const attr = (tag: string, name: string): string =>
+    new RegExp(`${name}="([^"]*)"`).exec(tag)?.[1] ?? '';
+
+  const viewers: Record<string, unknown>[] = [];
+  const appRe = /<app\b([^>]*?)(?:\/>|>([\s\S]*?)<\/app>)/g;
+  let m: RegExpExecArray | null;
+  while ((m = appRe.exec(xml)) !== null) {
+    const appTag = m[1];
+    const inner = m[2] ?? '';
+    const actions: Record<string, Record<string, string>> = {};
+    const actionRe = /<action\b([^>]*?)\/>/g;
+    let a: RegExpExecArray | null;
+    while ((a = actionRe.exec(inner)) !== null) {
+      const ext = attr(a[1], 'ext');
+      if (!ext) continue;
+      const name = attr(a[1], 'name');
+      const urlsrc = attr(a[1], 'urlsrc');
+      if (name === 'embedview' || name === 'view') {
+        (actions[ext] ??= {}).view = urlsrc;
+      } else if (name === 'edit') {
+        (actions[ext] ??= {}).edit = urlsrc;
+      }
+    }
+    const exts = Object.keys(actions);
+    if (exts.length === 0) continue;
+    viewers.push({
+      id: crypto.randomUUID(),
+      type: 'wopi',
+      display_name: attr(appTag, 'name'),
+      exts,
+      icon: attr(appTag, 'favIconUrl'),
+      wopi_actions: actions,
+    });
+  }
+
+  return ok(c, { viewers });
+});
+
 adminRoutes.delete('/tool/entityUrlCache', async (c) => ok(c));
 
 // ---------------------------------------------------------------------------
@@ -991,7 +1064,6 @@ adminRoutes.delete('/tool/entityUrlCache', async (c) => ok(c));
 // ---------------------------------------------------------------------------
 
 const NOT_IMPLEMENTED_ADMIN: Record<string, string> = {
-  '/tool/wopi': 'WOPI discovery is not implemented in the edge build',
   '/tool/thumbExecutable': 'Thumbnail generation is not implemented in the edge build',
 };
 
