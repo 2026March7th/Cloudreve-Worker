@@ -272,7 +272,10 @@ export class S3CompatibleDriver implements StorageDriver {
     const { amzDate, dateStamp } = amzDates(now);
     const scope = `${dateStamp}/${this.region}/s3/aws4_request`;
 
+    // 预签名 URL 必须保留目标 URL 上已有的业务参数（partNumber / uploadId /
+    // response-content-disposition 等），否则签名虽对、语义已丢
     const params = new Map<string, string>([
+      ...url.searchParams.entries(),
       ['X-Amz-Algorithm', 'AWS4-HMAC-SHA256'],
       ['X-Amz-Credential', `${this.accessKey}/${scope}`],
       ['X-Amz-Date', amzDate],
@@ -361,15 +364,12 @@ export class S3CompatibleDriver implements StorageDriver {
   async token(session: UploadSession, file: UploadRequest): Promise<UploadCredential> {
     const expires = Math.floor(session.expireAt / 1000);
     const chunks = this.chunkCountOf(file.size);
-
-    // 单块：一个预签名 PUT 搞定。
-    if (chunks === 1) {
-      const putUrl = await this.presign('PUT', this.objectUrl(file.savePath), expires);
-      return { session_id: session.id, chunk_size: 0, expires, upload_urls: [putUrl] };
-    }
-
-    // 多块：服务端发起 multipart，然后逐片预签。
     const contentType = file.mimeType || 'application/octet-stream';
+
+    // 对齐上游 s3.go Token()：一律开 multipart（含单块文件），前端直传
+    // 流程固定为 upload_urls 直传 → completeURL 合并 → /callback/s3 转正。
+    // 前端 afterUpload 无条件调用 s3LikeFinishUpload(session.completeURL)，
+    // 缺了 completeURL 整个上传必失败。
     const res = await this.signedFetch('POST', this.objectUrl(file.savePath, [['uploads', '']]), {
       headers: { 'content-type': contentType },
     });
@@ -392,12 +392,21 @@ export class S3CompatibleDriver implements StorageDriver {
       );
     }
 
+    // 预签名 CompleteMultipartUpload：前端把 parts XML 直接 POST 到这里，
+    // 不经 Worker（s3LikeFinishUpload，POST + status==200）
+    const completeURL = await this.presign(
+      'POST',
+      this.objectUrl(file.savePath, [['uploadId', uploadId]]),
+      expires,
+    );
+
     return {
       session_id: session.id,
       chunk_size: this.chunkSize,
       expires,
       uploadID: uploadId,
       upload_urls: uploadUrls,
+      completeURL,
     };
   }
 
@@ -503,7 +512,10 @@ export class S3CompatibleDriver implements StorageDriver {
       const xml =
         '<Delete>' +
         batch
-          .map((k) => `<Object><Key>${k.replace(/[<>&]/g, '')}</Key></Object>`)
+          .map(
+            (k) =>
+              `<Object><Key>${k.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</Key></Object>`,
+          )
           .join('') +
         '<Quiet>true</Quiet></Delete>';
       try {

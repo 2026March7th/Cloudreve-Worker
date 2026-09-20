@@ -335,8 +335,11 @@ export class UploadService {
     if (!key || !timingSafeEqual(session.callbackSecret, key)) {
       throw new AppError(CodeCredentialInvalid, 'Invalid callback secret');
     }
-    // 原版 `middleware/auth.go:216-218`：策略类型不符报 CodePolicyNotAllowed
-    if (session.policy.type !== PolicyType.OneDrive) {
+    // 原版 `middleware/auth.go:216-218`：策略类型不符报 CodePolicyNotAllowed。
+    // S3 系直传（s3/oss/cos/obs/qiniu/ks3）与 OneDrive 一样需要客户端回调转正：
+    // 字节不经过 Worker，CompleteMultipartUpload 由前端用预签名 completeURL 完成。
+    const S3_FAMILY: string[] = [PolicyType.S3, PolicyType.Oss, PolicyType.Cos, PolicyType.Obs, PolicyType.Qiniu, PolicyType.Ks3];
+    if (session.policy.type !== PolicyType.OneDrive && !S3_FAMILY.includes(session.policy.type)) {
       throw new AppError(CodePolicyNotAllowed, 'Policy type mismatch');
     }
 
