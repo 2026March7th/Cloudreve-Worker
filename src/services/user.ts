@@ -9,6 +9,7 @@
  *   - 注销把 refresh token 的 `root_token_id` 写进 KV 吊销名单（前缀 `jwt_revoke_`）。
  */
 import { AppContext } from './context';
+import { logAudit } from './audit';
 import type { UserRow, UserWithGroup } from '../db/types';
 import { BooleanSet, GroupPermission } from '../lib/boolset';
 import {
@@ -172,10 +173,12 @@ export class UserService {
   async login(email: string, password: string): Promise<LoginOutcome> {
     const user = await this.ctx.users.byEmailWithGroup(email);
     if (!user) {
+      logAudit(this.ctx, 'user_login_failed', null, { email });
       throw new AppError(CodeInvalidPassword, 'Incorrect password or email address');
     }
     const ok = await checkPassword(user.password, password);
     if (!ok) {
+      logAudit(this.ctx, 'user_login_failed', user.id, { email });
       throw new AppError(CodeInvalidPassword, 'Incorrect password or email address');
     }
     if (user.status === 'manual_banned' || user.status === 'sys_banned') {
@@ -198,6 +201,7 @@ export class UserService {
     // 确保根目录存在
     await this.ctx.files.ensureRoot(user.id);
 
+    logAudit(this.ctx, 'user_login', user.id);
     const token = await this.issueToken(user);
     return {
       user: await this.buildUserResponse(user, true),
@@ -242,12 +246,14 @@ export class UserService {
     if (!user) throw new AppError(CodeNotFound, 'User not found');
 
     if (user.two_factor_secret && !(await validateTotp(otp, user.two_factor_secret))) {
+      logAudit(this.ctx, 'user_login_failed', uid, { reason: '2fa' });
       throw new AppError(Code2FACodeErr, 'Incorrect 2FA code');
     }
 
     await this.ctx.env.KV.delete(`user_2fa_${sessionId}`);
 
     await this.ctx.files.ensureRoot(user.id);
+    logAudit(this.ctx, 'user_login', uid);
     const token = await this.issueToken(user);
     return { user: await this.buildUserResponse(user, true), token };
   }
@@ -256,6 +262,7 @@ export class UserService {
   async setTwoFactorSecret(secret: string | null): Promise<void> {
     const user = this.ctx.requireUser();
     await this.ctx.users.setTwoFactorSecret(user.id, secret);
+    logAudit(this.ctx, secret ? 'enable_2fa' : 'disable_2fa', user.id);
   }
 
   /** 签发 token 对。 */
@@ -372,6 +379,7 @@ export class UserService {
 
     await this.ctx.files.ensureRoot(user.id);
 
+    logAudit(this.ctx, 'user_signup', user.id, { email: normalized });
     if (needActivation) {
       // 上游 `register.go:82-85`：发信失败时返回 `CodeNotSet` + 空 msg
       // （用户行已经落库了，所以再注册一次会走到上面的「重发」分支）
@@ -441,6 +449,7 @@ export class UserService {
 
     await this.ctx.users.updateStatus(uid, 'active');
     await this.ctx.files.ensureRoot(uid);
+    logAudit(this.ctx, 'user_activated', uid);
     const activeUser = await this.ctx.users.byId(uid);
     return this.buildUserResponse(activeUser ?? inactiveUser, true);
   }
@@ -503,6 +512,7 @@ export class UserService {
     if (!user || user.status !== 'active') throw new AppError(40021, 'User not found');
 
     await this.ctx.users.updatePassword(uid, await digestPassword(newPassword));
+    logAudit(this.ctx, 'change_password', uid, { via: 'reset' });
 
     const updated = await this.ctx.users.byId(uid);
     return this.buildUserResponse(updated!, true);
@@ -577,11 +587,13 @@ export class UserService {
         }
         await this.ctx.users.setTwoFactorSecret(user.id, pending);
         await this.ctx.env.KV.delete(`2fa_init_${user.id}`);
+        logAudit(this.ctx, 'enable_2fa', user.id);
       } else {
         if (!user.two_factor_secret || !(await validateTotp(code, user.two_factor_secret))) {
           throw new AppError(Code2FACodeErr, 'Incorrect 2FA code');
         }
         await this.ctx.users.setTwoFactorSecret(user.id, null);
+        logAudit(this.ctx, 'disable_2fa', user.id);
       }
     }
 
@@ -590,10 +602,12 @@ export class UserService {
       if (!ok) throw new AppError(CodeIncorrectPassword, 'Incorrect password');
       const digest = await digestPassword(patch.new_password);
       await this.ctx.users.updatePassword(user.id, digest);
+      logAudit(this.ctx, 'change_password', user.id);
     }
 
     if (patch.nick !== undefined) {
       await this.ctx.users.updateProfile(user.id, { nick: patch.nick });
+      logAudit(this.ctx, 'change_nick', user.id, { nick: patch.nick });
     }
 
     const settings = { ...(user.settings ?? {}) };
@@ -671,6 +685,7 @@ export class UserService {
     const key = `avatar/${user.id}`;
     await this.ctx.env.R2.put(key, body, { httpMetadata: { contentType } });
     await this.ctx.users.updateProfile(user.id, { avatar: `r2://${key}` });
+    logAudit(this.ctx, 'change_avatar', user.id);
   }
 
   async getAvatar(userHashId: string): Promise<{ body: ReadableStream; contentType: string } | null> {
@@ -771,6 +786,7 @@ export class UserService {
         await this.ctx.users.updateEmail(uid, normalized);
       }
     }
+    logAudit(this.ctx, 'user_changed', uid, { by: 'admin', fields: Object.keys(patch) });
   }
 
   async resetUserPassword(userHashId: string, newPassword: string): Promise<void> {

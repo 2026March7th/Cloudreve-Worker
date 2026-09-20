@@ -245,6 +245,8 @@ export const DEFAULT_SETTINGS: Record<string, string> = {
   storage_products: '[]',
   group_sell_data: '[]',
   credit_products: '[]',
+  // 审计日志事件开关（管理端「事件」页）：JSON map 事件名 → bool，缺省视为 true。
+  audit_log_events: '{}',
 };
 
 // 官方「队列」设置页读写的 6 队列 × 6 项（键名/默认值逐条取自

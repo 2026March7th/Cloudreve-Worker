@@ -13,18 +13,21 @@ import FilmstripImage from "../../Icons/FilmstripImage.tsx";
 import Globe from "../../Icons/Globe.tsx";
 import MailOutlined from "../../Icons/MailOutlined.tsx";
 import PersonPasskey from "../../Icons/PersonPasskey.tsx";
+import SendLogging from "../../Icons/SendLogging.tsx";
 import Server from "../../Icons/Server.tsx";
 import PageContainer from "../../Pages/PageContainer.tsx";
 import PageHeader, { PageTabQuery } from "../../Pages/PageHeader.tsx";
 import Appearance from "./Appearance/Appearance.tsx";
 import Captcha from "./Captcha/Captcha.tsx";
 import Email from "./Email/Email.tsx";
+import Events from "./Event/Events.tsx";
 import Media from "./Media/Media.tsx";
 import Queue from "./Queue/Queue.tsx";
 import ServerSetting from "./Server/ServerSetting.tsx";
 import SettingsWrapper from "./SettingWrapper.tsx";
 import SiteInformation from "./SiteInformation/SiteInformation.tsx";
 import UserSession from "./UserSession/UserSession.tsx";
+import VAS from "./VAS/VAS.tsx";
 
 export const StyledInputAdornment = styled(InputAdornment)(({ theme }) => ({
   fontSize: theme.typography.body2.fontSize,
@@ -105,6 +108,11 @@ const Settings = () => {
           icon: <FilmstripImage />,
         },
         {
+          label: t("vas.vas"),
+          value: SettingsPageTab.VAS,
+          icon: <Currency />,
+        },
+        {
           label: t("nav.email"),
           value: SettingsPageTab.Email,
           icon: <MailOutlined />,
@@ -118,6 +126,11 @@ const Settings = () => {
           label: t("nav.appearance"),
           value: SettingsPageTab.Appearance,
           icon: <Color />,
+        },
+        {
+          label: t("nav.events"),
+          value: SettingsPageTab.Events,
+          icon: <SendLogging />,
         },
         {
           label: t("nav.server"),
@@ -318,6 +331,12 @@ const Settings = () => {
                   ]}
                 >
                   <Appearance />
+                </SettingsWrapper>
+              )}
+              {/* 事件（审计日志）：边缘版真实现，开关 + 日志查看器 */}
+              {tab === SettingsPageTab.Events && (
+                <SettingsWrapper settings={["audit_log_events"]}>
+                  <Events />
                 </SettingsWrapper>
               )}
               {tab === SettingsPageTab.Server && (

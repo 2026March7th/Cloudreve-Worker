@@ -21,6 +21,7 @@ import { AppError, Err } from '../lib/errors';
 import { md5 } from '../lib/md5';
 import { randomString } from '../lib/crypto';
 import { MailService } from './mail';
+import { logAudit } from './audit';
 
 // ---------------------------------------------------------------------------
 // 配置（settings JSON 键）
@@ -181,6 +182,7 @@ export class PaymentService {
       amount: priceFen,
       provider: provider.id,
     });
+    logAudit(this.ctx, 'payment_created', user.id, { order_no: orderNo, name, amount: priceFen });
 
     // 易支付 submit 参数（签名按名 ASCII 升序）
     const siteUrl = this.ctx.settings.siteUrl;
@@ -238,6 +240,8 @@ export class PaymentService {
     try {
       await this.fulfill(claimed.user_id, claimed.product_type, claimed.product_snapshot ?? {});
       await this.orders.markFulfilled(claimed.id);
+      logAudit(this.ctx, 'payment_paid', claimed.user_id, { order_no: claimed.order_no });
+      logAudit(this.ctx, 'payment_fulfilled', claimed.user_id, { order_no: claimed.order_no });
       // 支付收据邮件（原版 Pro 的 mail_receipt_template）：履行成功后发送，
       // 失败不影响订单状态。走 waitUntil，不阻塞回调响应。
       this.sendReceiptMail(claimed);
@@ -245,6 +249,10 @@ export class PaymentService {
       // 履行失败：订单留在 paid 态（钱已收），错误信息入库供管理员排查
       const msg = e instanceof Error ? e.message : String(e);
       await this.orders.markFailed(claimed.id, `fulfill failed after paid: ${msg}`);
+      logAudit(this.ctx, 'payment_fulfill_failed', claimed.user_id, {
+        order_no: claimed.order_no,
+        error: msg,
+      });
       throw e;
     }
     const done = await this.orders.byOrderNo(order.order_no);
@@ -301,6 +309,7 @@ export class PaymentService {
       alive.push({ size, expire_at: duration > 0 ? new Date(now + duration * 86400000).toISOString() : null });
       settings.quota_packs = alive;
       await users.updateSettings(userId, settings as Record<string, unknown>);
+      logAudit(this.ctx, 'storage_added', userId, { size });
       return;
     }
 
@@ -320,6 +329,7 @@ export class PaymentService {
       };
       await users.updateSettings(userId, settings as Record<string, unknown>);
       await users.updateGroup(userId, groupId);
+      logAudit(this.ctx, 'group_changed', userId, { group_id: groupId });
       return;
     }
 
@@ -328,6 +338,7 @@ export class PaymentService {
     if (!credit) throw Err.param('Invalid credit amount');
     settings.credit = Number(settings.credit ?? 0) + credit;
     await users.updateSettings(userId, settings as Record<string, unknown>);
+    logAudit(this.ctx, 'points_change', userId, { credit, reason: 'purchase' });
   }
 
   // -------------------------------------------------------------------------
@@ -343,6 +354,7 @@ export class PaymentService {
     // 先原子占卡，再履行；履行失败则把卡退回（未使用），保证不吞卡
     const claimed = await this.giftCodes.redeem(clean, user.id);
     if (!claimed) throw new AppError(40056, 'Gift code not found or already used');
+    logAudit(this.ctx, 'redeem_gift_code', user.id, { code: clean, product_type: claimed.product_type });
 
     try {
       await this.fulfill(user.id, claimed.product_type, claimed.product_payload ?? {});

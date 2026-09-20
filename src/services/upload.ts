@@ -12,6 +12,7 @@
  * 最后一片到齐时**自动**完成上传（原版没有独立的 complete 端点）。
  */
 import { AppContext } from './context';
+import { logAudit } from './audit';
 import { FileSystemService } from './fs';
 import { generateSavePath } from './savepath';
 import { FileSystemType, URI, validateName } from './uri';
@@ -441,6 +442,11 @@ export class UploadService {
     // 按版本保留策略裁剪历史版本（原版 `dbfs/upload.go:305-351` 的 CapEntities）
     const target = await this.ctx.files.byId(session.fileId);
     await this.capVersionEntities(session.fileId, session.uid, target?.name ?? null);
+
+    logAudit(this.ctx, 'entity_uploaded', session.uid, {
+      name: target?.name,
+      size: session.size,
+    });
 
     if (target && this.onUploadFinished) {
       // 钩子抛错不影响上传结果（收尾已经完成，这里只是附加工作）

@@ -10,6 +10,7 @@
  */
 import type { UserRow } from '../db/types';
 import { AppContext } from './context';
+import { logAudit } from './audit';
 import {
   AppError,
   CodeFailedSendEmail,
@@ -180,6 +181,7 @@ export class MailService {
           html: body,
         },
       );
+      logAudit(this.ctx, 'email_sent', this.ctx.user?.id ?? null, { to, title });
     } catch (e) {
       const detail = e instanceof SmtpError ? e.message : e instanceof Error ? e.message : String(e);
       throw new AppError(errorCode, detail, e instanceof Error ? e.name : undefined);

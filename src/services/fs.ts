@@ -9,6 +9,7 @@
  *   - 目录内容：`file_children = 父 id`
  */
 import { AppContext } from './context';
+import { logAudit } from './audit';
 import { SearchService } from './search';
 import { FileSystemType, URI, validateName } from './uri';
 import type { ExplorerView, FileRow, MetadataRow, StoragePolicyRow } from '../db/types';
@@ -916,6 +917,10 @@ export class FileSystemService {
     }
 
     notifyFsEvent(this.ctx, file, 'create', '', file.name);
+    logAudit(this.ctx, 'file_create', user.id, {
+      name: file.name,
+      kind: file.type === FileType.Folder ? 'folder' : 'file',
+    });
     return this.buildFileResponse(file, { owned: true });
   }
 
@@ -948,6 +953,7 @@ export class FileSystemService {
       );
     }
     notifyFsEvent(this.ctx, updated ?? file, 'rename', file.name, updated?.name ?? newName);
+    logAudit(this.ctx, 'file_rename', user.id, { from: file.name, to: updated?.name ?? newName });
     return this.buildFileResponse(updated!, { owned: true });
   }
 
@@ -993,8 +999,11 @@ export class FileSystemService {
         const conflict = await this.ctx.files.childByName(dstFolder!.id, src.name);
         if (conflict) throw Err.objectExist();
         await this.copyRecursive(src, dstFolder!.id, user.id);
+        logAudit(this.ctx, 'copy_from', user.id, { name: src.name });
+        logAudit(this.ctx, 'copy_to', user.id, { name: src.name, dst: dstFolder!.name });
       } else if (dstFs === FileSystemType.Trash) {
         await this.softDeleteFile(src);
+        logAudit(this.ctx, 'move_to_trash', user.id, { name: src.name });
       } else {
         // 防止把目录移动到自己内部
         if (dstFolder && (await this.isDescendant(dstFolder.id, src.id))) {
@@ -1003,6 +1012,7 @@ export class FileSystemService {
         const conflict = await this.ctx.files.childByName(dstFolder!.id, src.name);
         if (conflict) throw Err.objectExist();
         await this.ctx.files.updateParent(src.id, dstFolder!.id);
+        logAudit(this.ctx, 'move_to', user.id, { name: src.name, dst: dstFolder!.name });
       }
     }
   }
@@ -1083,13 +1093,16 @@ export class FileSystemService {
         if (this.isInTrash(file)) {
           // 已在回收站中的再删一次 = 彻底删除
           await this.purge(file);
+          logAudit(this.ctx, 'delete_file', user.id, { name: file.name, purge: true });
           continue;
         }
 
         if (options.skipSoftDelete) {
           await this.purge(file);
+          logAudit(this.ctx, 'delete_file', user.id, { name: file.name, purge: true });
         } else {
           await this.softDeleteFile(file);
+          logAudit(this.ctx, 'move_to_trash', user.id, { name: file.name });
         }
         notifyFsEvent(this.ctx, file, 'delete', file.name, '');
       } catch (e) {

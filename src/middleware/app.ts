@@ -9,6 +9,7 @@
 import type { Context, MiddlewareHandler, Next } from 'hono';
 import type { Env } from '../env';
 import { AppContext } from '../services/context';
+import { logAudit } from '../services/audit';
 import { MailService } from '../services/mail';
 import { loadSettings } from '../settings/provider';
 import { HashIDCodec } from '../lib/hashid';
@@ -122,6 +123,7 @@ export function appContext(): MiddlewareHandler<AppBindings> {
               await kv.put(key, '1', { expirationTtl: 86_400 });
               const mail = new MailService(appCtx);
               if (mail.available) await mail.sendExceedQuotaEmail(u);
+              logAudit(appCtx, 'user_exceed_quota_notified', u.id);
             } catch {
               // 通知是尽力而为，任何失败都吞掉
             }

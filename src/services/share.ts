@@ -11,6 +11,7 @@
  * 付费分享（原版 Pro 的 `CodePurchaseRequired`）在边缘版完全没有实现。
  */
 import { AppContext } from './context';
+import { logAudit } from './audit';
 import { FileSystemService, MetadataRestoreUri } from './fs';
 import { FileSystemType, URI } from './uri';
 import { isShareExpired, isShareInvalid } from './share-rules';
@@ -137,6 +138,7 @@ export class ShareService {
       },
     });
 
+    logAudit(this.ctx, 'share', user.id, { name: file.name, is_private: params.is_private === true });
     return this.shareUrl(share.id, password);
   }
 
@@ -190,6 +192,7 @@ export class ShareService {
       },
     });
 
+    logAudit(this.ctx, 'edit_share', user.id, { share_id: shareId });
     return this.shareUrl(shareId, password);
   }
 
@@ -224,6 +227,7 @@ export class ShareService {
 
     if (options.countViews && !isOwner) {
       await this.ctx.shares.incrementViews(shareId);
+      logAudit(this.ctx, 'share_link_viewed', share.user_shares ?? null, { share_id: shareId, viewer: requester?.id ?? null });
     }
 
     // 原版 visit 路径直接传 `share.Edges.File.Name`（不回落 restore_uri），
@@ -437,6 +441,7 @@ export class ShareService {
       throw new AppError(CodeNotFound, 'share not found');
     }
     await this.ctx.shares.softDelete(shareId);
+    logAudit(this.ctx, 'delete_share', user.id, { share_id: shareId });
   }
 
   async batchDelete(shareHashIds: string[]): Promise<void> {

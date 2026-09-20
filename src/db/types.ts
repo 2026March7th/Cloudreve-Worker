@@ -326,3 +326,15 @@ export interface GiftCodeRow {
   used_by: number | null;
   used_at: Date | null;
 }
+
+// ---------------------------------------------------------------------------
+// 审计日志（edge 自建 Pro 功能，migrations/0006_audit_log.sql）
+// ---------------------------------------------------------------------------
+
+export interface AuditLogRow {
+  id: number;
+  created_at: Date;
+  user_id: number | null;
+  type: number;
+  meta: Record<string, unknown> | null;
+}

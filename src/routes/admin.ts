@@ -46,10 +46,11 @@ import { MailService } from '../services/mail';
 import { BooleanSet, GroupPermission, PolicyType } from '../lib/boolset';
 import { AppError, CodeFeatureNotEnabled, Err } from '../lib/errors';
 import { invalidateSettings } from '../settings/provider';
+import { AuditRepo } from '../db/audit';
 import { SUPPORTED_POLICY_TYPES, isPolicyTypeSupported } from '../storage';
 import { BACKEND_VERSION } from './site';
 import { adminContentRoutes } from './admin-content';
-import { numericId, unwrapBody } from './shared';
+import { numericId, paginationArgs, paginationOf, unwrapBody } from './shared';
 import { toByteaLiteral, type Sql } from '../db';
 import type { HashIDCodec } from '../lib/hashid';
 import type { GroupRow, StoragePolicyRow } from '../db/types';
@@ -67,6 +68,42 @@ adminRoutes.use('*', async (c, next) => {
 // 内容类管理端点（用户 / 文件 / 实体 / 分享 / 任务 / 节点 / OAuth 应用）。
 // 挂在同一前缀下，上面那条管理员中间件对挂载进来的路由同样生效。
 adminRoutes.route('/', adminContentRoutes);
+
+/**
+ * 审计日志列表（管理端「事件」页的查看器，边缘版自建）。
+ * 请求体 `{ page, page_size, types?, user_id? }`，page 为 1 基；
+ * 响应 `{ audit_logs, pagination }`，pagination.page 回 0 基（见 paginationArgs）。
+ */
+adminRoutes.post('/audit/log', async (c) => {
+  const ctx = ctxOf(c);
+  const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
+  const { page, pageSize, offset } = paginationArgs(body);
+
+  const rawTypes = body.types;
+  const types = Array.isArray(rawTypes)
+    ? rawTypes.map((t) => Number(t)).filter((t) => Number.isInteger(t) && t >= 0)
+    : undefined;
+  const rawUid = body.user_id;
+  const userId = rawUid === undefined || rawUid === null || rawUid === '' ? undefined : Number(rawUid);
+
+  const { rows, total } = await new AuditRepo(ctx.env).list({
+    types,
+    userId: Number.isFinite(userId) ? userId : undefined,
+    limit: pageSize,
+    offset,
+  });
+
+  return ok(c, {
+    audit_logs: rows.map((r) => ({
+      id: r.id,
+      created_at: r.created_at,
+      user_id: r.user_id,
+      type: r.type,
+      meta: r.meta ?? {},
+    })),
+    pagination: paginationOf(page, pageSize, total),
+  });
+});
 
 /**
  * 概览（管理面板首页）。对齐上游 `service/admin/site.go` 的 `SiteGetSummary`：

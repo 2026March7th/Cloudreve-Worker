@@ -14,6 +14,7 @@
 import { Hono } from 'hono';
 import type { AppBindings } from '../middleware/app';
 import { ctxOf } from '../middleware/app';
+import { logAudit } from '../services/audit';
 import { fail, ok } from '../lib/response';
 import { URI } from '../services/uri';
 import { AppError, Err } from '../lib/errors';
@@ -118,6 +119,7 @@ devicesRoutes.put('/dav', async (c) => {
       password: await sha256Hex(plain),
       options: davOptionsFrom(body, ctx.groupPermissions.enabled(GroupPermission.WebDAVProxy)),
     });
+    logAudit(ctx, 'webdav_account_create', ctx.user.id, { name: body.name });
     return ok(c, { ...davAccountToResponse(ctx.codec, account), password: plain });
   } catch (e) {
     return fail(c, e);
@@ -149,6 +151,7 @@ devicesRoutes.patch('/dav/:id', async (c) => {
       uri: body.uri,
       options: davOptionsFrom(body, ctx.groupPermissions.enabled(GroupPermission.WebDAVProxy)),
     });
+    logAudit(ctx, 'webdav_account_update', ctx.user.id, { name: body.name });
     return ok(c, davAccountToResponse(ctx.codec, account));
   } catch (e) {
     return fail(c, e);
@@ -164,6 +167,7 @@ devicesRoutes.delete('/dav/:id', async (c) => {
     const existing = await ctx.davAccounts.byIdAndUser(id, ctx.user.id);
     if (!existing) throw new AppError(40004, 'Account not exist');
     await ctx.davAccounts.remove(id);
+    logAudit(ctx, 'webdav_account_delete', ctx.user.id, { name: existing.name });
     return ok(c);
   } catch (e) {
     return fail(c, e);

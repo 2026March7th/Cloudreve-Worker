@@ -12,6 +12,7 @@
  * 「限速」在 Workers 上无法实现，`speed` 段仅作为协议占位原样透传（见 README）。
  */
 import { AppContext } from './context';
+import { logAudit } from './audit';
 import { FileSystemService, type DirectLinkInfo } from './fs';
 import { FileSystemType, URI } from './uri';
 import type { EntityRow, FileRow } from '../db/types';
@@ -119,6 +120,7 @@ export class DownloadService {
         item.stream_saver_display_name = name;
       }
       urls.push(item);
+      logAudit(this.ctx, 'entity_downloaded', this.ctx.user?.id ?? null, { name });
     }
 
     return { urls, expires: expiresAt > 0 ? new Date(expiresAt * 1000).toISOString() : null };
@@ -227,6 +229,7 @@ export class DownloadService {
       throw new AppError(CodeOwnerOnly, 'Only owner or administrator can perform this action');
     }
     const link = await this.ctx.directLinks.create(file.id, file.name, speed);
+    logAudit(this.ctx, 'get_direct_link', user.id, { name: file.name });
     const base = this.ctx.settings.siteUrl.replace(/\/+$/, '');
     const id = this.ctx.codec.encodeSourceLinkID(link.id);
     return [
@@ -250,6 +253,7 @@ export class DownloadService {
       throw new AppError(CodeOwnerOnly, 'Only owner or administrator can perform this action');
     }
     await this.ctx.directLinks.softDelete(id);
+    logAudit(this.ctx, 'delete_direct_link', user.id, { name: file.name });
   }
 
   /** 访问直链：返回远端地址（由路由层 302）。 */

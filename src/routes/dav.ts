@@ -23,6 +23,7 @@
 import { Hono } from 'hono';
 import type { AppBindings, AppRequest } from '../middleware/app';
 import { ctxOf } from '../middleware/app';
+import { logAudit } from '../services/audit';
 import { AppContext, permissionsOf } from '../services/context';
 import { URI } from '../services/uri';
 import { FileSystemService } from '../services/fs';
@@ -76,6 +77,7 @@ davRoutes.use('*', async (c, next) => {
   const ctx = ctxOf(c);
   const hit = await ctx.davAccounts.byNameAndPassword(auth.name, auth.password);
   if (!hit) {
+    logAudit(ctx, 'webdav_login_failed', null, { name: auth.name });
     // Windows WebClient 收到没有 WWW-Authenticate 的 401 不会重试凭据
     c.header('WWW-Authenticate', 'Basic realm="cloudreve"');
     return c.body(null, 401);
