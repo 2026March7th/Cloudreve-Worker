@@ -369,8 +369,25 @@ export class ShareService {
       if (includeSource && share.file_shares) {
         const file = await this.ctx.files.byId(share.file_shares);
         if (file) {
-          const path = await this.fs.pathOf(file);
-          res.source_uri = URI.my(path).toString();
+          // 对齐原版 `ShareInfoService.Get` 的 owner_extended 分支（service/share/visit.go:96-114）：
+          // source 取自「分享导航器解析结果的 owner 视图 URI」。单文件分享时分享导航器
+          // 的根是其**父目录**（share_navigator.go:143-146），前端编辑分享会用
+          // `source_uri.join(share.name)` 拼回文件本身（thunks/share.ts:220-221）；
+          // 目录分享则是目录自身。若这里返回文件自身路径，前端会拼出
+          // `cloudreve://my/a.txt/a.txt`，编辑弹窗必报「文件不存在」。
+          if (fileType === FileType.File) {
+            if (!file.file_children) {
+              // 回收站中的单文件：原版在分享导航器 Root 处直接报 File not found
+              throw new AppError(CodeNotFound, 'File not found');
+            }
+            const parent = await this.ctx.files.byId(file.file_children);
+            const parentPath =
+              parent && !this.fs.isRootFolder(parent) ? await this.fs.pathOf(parent) : '/';
+            res.source_uri = URI.my(parentPath).toString();
+          } else {
+            const path = await this.fs.pathOf(file);
+            res.source_uri = URI.my(path).toString();
+          }
         }
       }
     }
