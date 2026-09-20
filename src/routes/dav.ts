@@ -304,9 +304,21 @@ davRoutes.on(['GET', 'HEAD'], '*', async (c) => {
   if (!content) return c.body(null, 404);
 
   c.header('Content-Type', content.contentType ?? 'application/octet-stream');
-  if (content.contentRange) c.header('Content-Range', content.contentRange);
   c.header('Accept-Ranges', 'bytes');
   c.header('Last-Modified', httpDate(file.updated_at ?? new Date()));
+
+  if (content.contentRange && c.req.header('Range')) {
+    // 上游存储按 206 语义应答（content-range 已带），这里同样回 206
+    c.header('Content-Range', content.contentRange);
+    if (c.req.method === 'HEAD') return c.body(null, 206);
+    return c.body(content.body as ReadableStream, 206);
+  }
+
+  // HEAD 必须带实体长度，否则部分客户端（Explorer 映射、播放器）拿不到大小
+  const length = Number(
+    content.contentRange?.match(/\/(\d+)$/)?.[1] ?? content.size ?? file.size ?? 0,
+  );
+  if (Number.isFinite(length) && length > 0) c.header('Content-Length', String(length));
   if (c.req.method === 'HEAD') return c.body(null, 200);
   return c.body(content.body as ReadableStream, 200);
 });
