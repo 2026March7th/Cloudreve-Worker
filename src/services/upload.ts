@@ -34,7 +34,7 @@ import {
   CodeUploadSessionExpired,
   Err,
 } from '../lib/errors';
-import { randomString, timingSafeEqual } from '../lib/crypto';
+import { randomString, timingSafeEqual, uuidv4 } from '../lib/crypto';
 import { extOf } from './savepath';
 import { isRelayEnabled, type UploadedPart, type UploadSession } from '../storage/types';
 
@@ -131,7 +131,9 @@ export class UploadService {
       }
     }
 
-    const sessionId = randomString(32);
+    // 注意：sessionId 会写进 entities.upload_session_id（Postgres UUID 列），
+    // 必须是合法 UUID，不能用 randomString —— 与上游 uuid.NewV4() 语义一致
+    const sessionId = uuidv4();
     const callbackSecret = randomString(32);
 
     const savePath = generateSavePath(policy, {
