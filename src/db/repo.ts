@@ -505,6 +505,39 @@ export class GroupRepo {
     `) as Record<string, unknown>[];
     return toNum(rows[0]?.total);
   }
+
+  /**
+   * 组绑定的全部存储策略 ID（多对多，edge 自建 Pro 功能）。
+   * 关联表为空时回落到旧的单一 `storage_policy_id` 列，保证迁移前数据无缝。
+   */
+  async listPolicyIds(id: number): Promise<number[]> {
+    const rows = (await this.sql`
+      SELECT policy_id FROM group_storage_policies WHERE group_id = ${id} ORDER BY policy_id ASC
+    `) as Array<{ policy_id: number | string }>;
+    const ids = rows.map((r) => Number(r.policy_id)).filter((n) => Number.isFinite(n) && n > 0);
+    if (ids.length > 0) return ids;
+    const group = await this.byId(id);
+    return group?.storage_policy_id != null ? [Number(group.storage_policy_id)] : [];
+  }
+
+  /** 整体替换组的策略集；空数组 = 清空全部绑定。 */
+  async setPolicyIds(id: number, policyIds: number[]): Promise<void> {
+    await this.sql.transaction([
+      this.sql`DELETE FROM group_storage_policies WHERE group_id = ${id}`,
+      ...policyIds.map(
+        (pid) =>
+          this.sql`
+            INSERT INTO group_storage_policies (group_id, policy_id) VALUES (${id}, ${pid})
+            ON CONFLICT (group_id, policy_id) DO NOTHING
+          `,
+      ),
+    ]);
+    // 旧的单一绑定列保持与第一个策略同步（兼容 resolvePolicy 等旧读法）。
+    // 注意 update() 会把 undefined 存储列写成 NULL，所以单独 UPDATE。
+    await this.sql`
+      UPDATE groups SET storage_policy_id = ${policyIds[0] ?? null}, updated_at = now() WHERE id = ${id}
+    `;
+  }
 }
 
 // ---------------------------------------------------------------------------

@@ -170,6 +170,11 @@ export interface ListResponse {
    * 都不会打开。
    */
   storage_policy?: StoragePolicyInfo;
+  /**
+   * 组绑定的全部可选策略（edge 自建 Pro 功能）。多于一个时下发，
+   * 前端文件页切换器据此渲染；上游开源版无此字段。
+   */
+  storage_policies?: StoragePolicyInfo[];
 }
 
 export interface BuildFileOptions {
@@ -727,18 +732,20 @@ export class FileSystemService {
     if (policyOwnerId != null) {
       try {
         const owner = await this.ctx.users.byId(policyOwnerId);
-        const group = owner ? await this.ctx.groups.byId(owner.group_users) : null;
-        // 与 ctx.resolvePolicy 同款回退链：组绑定策略 → 第一个可用策略。
-        // 组没绑策略（历史库 / 手工建组）时也必须让上传器拿到策略，
-        // 否则前端点「上传」直接抛 No policy selected。
-        let policy =
-          group?.storage_policy_id != null
-            ? await this.ctx.policies.byId(group.storage_policy_id)
-            : null;
-        if (!policy || !isPolicyTypeSupported(policy.type)) {
-          policy = await this.ctx.policies.defaultPolicy();
+        if (owner) {
+          // edge 自建 Pro 功能：组多策略。取属主所在组的全部可用策略，
+          // 选中的（属主偏好 upload_policy_id，未选取第一个）作为
+          // storage_policy 下发给上传器；全部可选集放 storage_policies
+          // 供前端切换器渲染。只有一个策略时与上游行为完全一致。
+          const all = await this.ctx.groupPolicies(owner);
+          if (all.length > 0) {
+            const preferred = await this.ctx.preferredPolicy(owner);
+            response.storage_policy = this.buildPolicyInfo(preferred);
+            if (all.length > 1) {
+              response.storage_policies = all.map((p) => this.buildPolicyInfo(p));
+            }
+          }
         }
-        if (policy) response.storage_policy = this.buildPolicyInfo(policy);
       } catch {
         // 降级：无策略时前端上传器保持 No policy selected 行为
       }

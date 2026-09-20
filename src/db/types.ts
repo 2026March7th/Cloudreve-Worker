@@ -170,6 +170,8 @@ export interface UserSetting {
   disable_view_sync?: boolean;
   fs_view_map?: Record<string, ExplorerView>;
   share_links_in_profile?: string;
+  /** 用户在组策略集里选中的上传策略（edge 自建 Pro 功能），存数字 ID。 */
+  upload_policy_id?: number;
 }
 
 export interface GroupSetting {

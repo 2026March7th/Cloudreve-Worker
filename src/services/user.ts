@@ -557,6 +557,7 @@ export class UserService {
     new_password?: string;
     disable_view_sync?: boolean;
     share_links_in_profile?: string;
+    upload_policy_id?: number | string;
     two_fa_enabled?: boolean;
     two_fa_code?: string;
   }): Promise<UserResponse> {

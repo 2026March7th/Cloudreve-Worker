@@ -15,7 +15,7 @@ import { AppContext } from './context';
 import { FileSystemService } from './fs';
 import { generateSavePath } from './savepath';
 import { FileSystemType, URI, validateName } from './uri';
-import type { EntityRow, FileRow, StoragePolicyRow } from '../db/types';
+import type { EntityRow, FileRow, StoragePolicyRow, UserWithGroup } from '../db/types';
 import { EntityType, FileType, PolicyType } from '../lib/boolset';
 import {
   AppError,
@@ -105,13 +105,26 @@ export class UploadService {
     const nameError = validateName(name);
     if (nameError) throw new AppError(CodeIllegalObjectName, nameError);
 
-    // 策略：请求指定 > 用户组绑定 > 默认
-    let policyId: number | null = null;
+    // 策略：请求指定（必须属于用户组策略集，防越权用任意策略落盘）
+    //       > 用户选中/组绑定的默认策略。
     if (params.policyId) {
-      policyId = this.ctx.codec.decodePolicyID(params.policyId);
+      const policyId = this.ctx.codec.decodePolicyID(params.policyId);
       if (policyId === null) throw new AppError(40035, 'Storage policy not found');
+      const policy = await this.ctx.assertPolicyAllowed(policyId);
+      return this.startSession(policy, uri, name, params, user);
     }
-    const policy = await this.ctx.resolvePolicy(policyId);
+    const policy = await this.ctx.preferredPolicy();
+    return this.startSession(policy, uri, name, params, user);
+  }
+
+  /** 策略确定后的公共流程：约束校验 → 建会话。 */
+  private async startSession(
+    policy: StoragePolicyRow,
+    uri: URI,
+    name: string,
+    params: CreateUploadSessionParams,
+    user: UserWithGroup,
+  ): Promise<UploadSessionResponse> {
 
     this.assertPolicyConstraints(policy, name, params.size);
     this.ctx.assertCapacity(params.size);

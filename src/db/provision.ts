@@ -245,6 +245,25 @@ async function seedSystemData(env: Env): Promise<void> {
     WHERE id IN (1, 2, 3) AND storage_policy_id IS NULL
   `;
 
+  // 自建 Pro 功能：组 ↔ 存储策略多对多。上游闭源部分才有（前端文案
+  // group.availablePolicyDesPro「可多选，用户可在选定范围内自由切换存储
+  // 策略」），开源版组只绑单策略。建表 + 把旧的单一绑定迁入关联表。
+  // 两条语句都幂等：表 IF NOT EXISTS；INSERT ... ON CONFLICT DO NOTHING
+  // 在迁移完成后重放时恒为空插入。
+  await sql`
+    CREATE TABLE IF NOT EXISTS group_storage_policies (
+      group_id INTEGER NOT NULL,
+      policy_id INTEGER NOT NULL,
+      PRIMARY KEY (group_id, policy_id)
+    )
+  `;
+  await sql`
+    INSERT INTO group_storage_policies (group_id, policy_id)
+    SELECT id, storage_policy_id FROM groups
+    WHERE storage_policy_id IS NOT NULL
+    ON CONFLICT (group_id, policy_id) DO NOTHING
+  `;
+
   // 默认 OAuth 客户端。官方版里「Cloudreve Web / Cloudreve Desktop」两个内置
   // 应用由闭源部分播种（开源仓库的 migrator 无此步骤，已核对），边缘版按
   // 前端可用 scope 自建。guid 固定 + ON CONFLICT DO NOTHING 保证幂等；

@@ -243,7 +243,7 @@ adminRoutes.patch('/settings', async (c) => {
 function groupToResponse(
   codec: HashIDCodec,
   group: GroupRow,
-  extras: { storagePolicy?: StoragePolicyRow | null; totalUsers?: number } = {},
+  extras: { policies?: StoragePolicyRow[]; totalUsers?: number } = {},
 ) {
   const out: Record<string, unknown> = {
     id: group.id,
@@ -261,19 +261,24 @@ function groupToResponse(
     settings: group.settings ?? {},
     storage_policy_id: group.storage_policy_id ?? 0,
     edges: {
-      storage_policies: extras.storagePolicy
-        ? policyToResponse(codec, extras.storagePolicy)
-        : undefined,
+      // 组多策略（edge 自建 Pro 功能）：edges.storage_policies 为数组。
+      // 上游开源版这里是单对象 —— 前端已用补丁同步改为数组消费。
+      storage_policies: (extras.policies ?? []).map((p) => policyToResponse(codec, p)),
     },
   };
   if (extras.totalUsers !== undefined) out.total_users = extras.totalUsers;
   return out;
 }
 
-/** 组响应里附带的策略边，按 storage_policy_id 现查。 */
+/** 组响应里附带的策略边：取组绑定的全部策略（多对多）。 */
 async function groupExtras(ctx: ReturnType<typeof ctxOf>, group: GroupRow) {
-  const policy = group.storage_policy_id ? await ctx.policies.byId(group.storage_policy_id) : null;
-  return { storagePolicy: policy, totalUsers: await ctx.groups.countUsers(group.id) };
+  const ids = await ctx.groups.listPolicyIds(group.id);
+  const policies: StoragePolicyRow[] = [];
+  for (const id of ids) {
+    const p = await ctx.policies.byId(id);
+    if (p) policies.push(p);
+  }
+  return { policies, totalUsers: await ctx.groups.countUsers(group.id) };
 }
 
 adminRoutes.post('/group', async (c) => {
@@ -321,29 +326,40 @@ function parsePermission(input: unknown, fallback: BooleanSet): BooleanSet {
 }
 
 /**
- * 从组请求体里取要绑定的策略 ID。
+ * 从组请求体里取绑定的策略 ID 集（edge 自建 Pro：组多策略）。
  *
- * 前端 `GroupSettingWrapper.groupValueFilter` 一定会填
- * `edges.storage_policies.id`，没选时是 `0`；`0` 表示「不绑定任何策略」。
- * 顺手兼容顶层 `storage_policy_id`（上游 ent.Group 的字段名）。
+ * 接受 `edges.storage_policies` 为数组（`[{id}, ...]`，id 为数字或 hashid）
+ * 或单对象（上游开源版旧形态，兼容）；也兼容顶层 `storage_policy_id`。
+ * 返回 `undefined` 表示请求未提供（不改动），`[]` 表示显式清空全部绑定。
  */
-function policyIdFromGroupBody(
+function policyIdsFromGroupBody(
   body: Record<string, unknown>,
   codec: HashIDCodec,
-): number | null {
-  const edges = body.edges as { storage_policies?: { id?: unknown } } | undefined;
-  const fromEdges = edges?.storage_policies?.id;
-  if (fromEdges !== undefined && fromEdges !== null) {
-    const n = Number(fromEdges);
-    return Number.isFinite(n) && n > 0 ? n : null;
+): number[] | undefined {
+  const decodeOne = (v: unknown): number | null => {
+    if (typeof v === 'number') return v > 0 ? v : null;
+    if (typeof v === 'string' && v) return numericId(v, (h) => codec.decodePolicyID(h));
+    return null;
+  };
+
+  const edges = body.edges as { storage_policies?: unknown } | undefined;
+  const sp = edges?.storage_policies;
+  if (sp !== undefined) {
+    const items = Array.isArray(sp) ? sp : [sp];
+    const ids = items
+      .map((item) =>
+        item && typeof item === 'object' ? decodeOne((item as { id?: unknown }).id) : decodeOne(item),
+      )
+      .filter((n): n is number => n !== null);
+    return [...new Set(ids)];
   }
 
   const raw = body.storage_policy_id;
-  if (typeof raw === 'number') return raw > 0 ? raw : null;
-  if (typeof raw === 'string' && raw) {
-    return numericId(raw, (v) => codec.decodePolicyID(v));
+  if (raw !== undefined) {
+    const one = decodeOne(raw);
+    return one === null ? [] : [one];
   }
-  return null;
+  return undefined;
 }
 
 adminRoutes.put('/group', async (c) => {
@@ -361,9 +377,14 @@ adminRoutes.put('/group', async (c) => {
       speedLimit: body.speed_limit !== undefined ? Number(body.speed_limit) : null,
       permissions: perms.toBytes(),
       settings: (body.settings as Record<string, unknown>) ?? {},
-      storagePolicyId: policyIdFromGroupBody(body, ctx.codec),
+      storagePolicyId: null,
     });
-    return ok(c, groupToResponse(ctx.codec, group, await groupExtras(ctx, group)));
+    const policyIds = policyIdsFromGroupBody(body, ctx.codec);
+    if (policyIds !== undefined) {
+      await ctx.groups.setPolicyIds(group.id, policyIds);
+    }
+    const fresh = await ctx.groups.byId(group.id);
+    return ok(c, groupToResponse(ctx.codec, fresh ?? group, await groupExtras(ctx, fresh ?? group)));
   } catch (e) {
     return fail(c, e);
   }
@@ -392,12 +413,13 @@ adminRoutes.put('/group/:id', async (c) => {
     patch.permissions = parsePermission(body.permissions, new BooleanSet()).toBytes();
   }
   if (body.settings !== undefined) patch.settings = body.settings as Record<string, unknown>;
-  if (body.edges !== undefined || body.storage_policy_id !== undefined) {
-    patch.storagePolicyId = policyIdFromGroupBody(body, ctx.codec);
-  }
+  const policyIds = policyIdsFromGroupBody(body, ctx.codec);
 
   try {
     await ctx.groups.patch(id, patch);
+    if (policyIds !== undefined) {
+      await ctx.groups.setPolicyIds(id, policyIds);
+    }
     const updated = await ctx.groups.byId(id);
     return ok(c, groupToResponse(ctx.codec, updated!, await groupExtras(ctx, updated!)));
   } catch (e) {

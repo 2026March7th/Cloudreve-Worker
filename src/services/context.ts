@@ -20,7 +20,7 @@ import {
   DavAccountRepo,
   PasskeyRepo,
 } from '../db/repo';
-import type { GroupRow, StoragePolicyRow, UserWithGroup } from '../db/types';
+import type { GroupRow, StoragePolicyRow, UserRow, UserWithGroup } from '../db/types';
 import { AppError, CodeGroupNotAllowed, CodeNoPermissionErr } from '../lib/errors';
 import { BooleanSet, GroupPermission } from '../lib/boolset';
 import { getStorageDriver, isPolicyTypeSupported } from '../storage';
@@ -166,6 +166,45 @@ export class AppContext {
       throw new AppError(40006, `Storage policy type "${fallback.type}" is not supported`);
     }
     return fallback;
+  }
+
+  /**
+   * 用户组的全部可用策略（edge 自建 Pro 功能：组多策略）。
+   * 按组关联表取全量并过滤掉类型不支持的驱动；组没绑任何策略时
+   * 回落到 resolvePolicy 的默认链。user 缺省时取当前请求用户
+   * （列表下发策略跟随**目录属主**，所以要显式传属主）。
+   */
+  async groupPolicies(user?: UserRow): Promise<StoragePolicyRow[]> {
+    const u = user ?? this.requireUser();
+    const ids = await this.groups.listPolicyIds(u.group_users);
+    const policies: StoragePolicyRow[] = [];
+    for (const id of ids) {
+      const p = await this.policies.byId(id);
+      if (p && isPolicyTypeSupported(p.type)) policies.push(p);
+    }
+    if (policies.length > 0) return policies;
+    if (!user) return [await this.resolvePolicy(null)];
+    return policies;
+  }
+
+  /** 校验 policyId 属于当前用户组的策略集；不属于抛 40035。 */
+  async assertPolicyAllowed(policyId: number): Promise<StoragePolicyRow> {
+    const allowed = await this.groupPolicies();
+    const hit = allowed.find((p) => p.id === policyId);
+    if (!hit) throw new AppError(40035, 'Storage policy not allowed for this group');
+    return hit;
+  }
+
+  /** 用户在组策略集里当前选中的上传策略（未选/失效时取第一个）。 */
+  async preferredPolicy(user?: UserRow): Promise<StoragePolicyRow> {
+    const u = user ?? this.requireUser();
+    const allowed = await this.groupPolicies(u);
+    const preferred = u.settings?.upload_policy_id;
+    if (preferred != null) {
+      const hit = allowed.find((p) => p.id === Number(preferred));
+      if (hit) return hit;
+    }
+    return allowed[0]!;
   }
 
   driverFor(policy: StoragePolicyRow): StorageDriver {

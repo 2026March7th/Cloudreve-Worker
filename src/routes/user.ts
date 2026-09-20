@@ -147,6 +147,10 @@ userRoutes.get('/setting', async (c) => {
       passkeys: await new PasskeyService(ctx, c.env, ctx.codec).list(ctx.user),
       disable_view_sync: settings.disable_view_sync === true,
       share_links_in_profile: settings.share_links_in_profile ?? '',
+      upload_policy_id:
+        settings.upload_policy_id != null
+          ? ctx.codec.encodePolicyID(Number(settings.upload_policy_id))
+          : '',
       oauth_grants: [],
     });
 });
@@ -167,6 +171,7 @@ userRoutes.patch('/setting', async (c) => {
       new_password: body.new_password as string | undefined,
       disable_view_sync: body.disable_view_sync as boolean | undefined,
       share_links_in_profile: body.share_links_in_profile as string | undefined,
+      upload_policy_id: body.upload_policy_id as string | number | undefined,
       two_fa_enabled: body.two_fa_enabled as boolean | undefined,
       two_fa_code: body.two_fa_code as string | undefined,
     });
