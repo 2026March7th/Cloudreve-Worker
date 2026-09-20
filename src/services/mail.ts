@@ -29,6 +29,17 @@ interface MailTemplateEntry {
 }
 
 /**
+ * 全部邮件模板设置键。上游开源版只有激活 / 重置两个；「支付收据」与
+ * 「存储配额超出」在原版是 Pro 闭源功能 —— 边缘版已实现对应业务
+ * （支付体系 / 容量校验），所以这四个模板全部真实生效。
+ */
+export type MailTemplateKey =
+  | 'mail_activation_template'
+  | 'mail_reset_template'
+  | 'mail_receipt_template'
+  | 'mail_exceed_quota_template';
+
+/**
  * 渲染模板里的 `{{ .A.B.C }}` 占位符。
  *
  * 只支持路径取值，**不支持** Go 模板的 `if` / `range` / 函数调用 —— 上游出厂模板
@@ -178,8 +189,15 @@ export class MailService {
   /**
    * 模板里的公共变量。对应上游 `pkg/email/template.go` 的 `commonContext()`：
    * logo 若不是绝对地址，就用站点地址补全 —— 邮件客户端看不到相对路径。
+   *
+   * `User.Storage` 是用户已用容量（字节数），对应前端模板变量表里的
+   * `{{ .User.Storage }}`。`extra` 用于业务专属变量（如 `Order.*`）。
    */
-  private templateData(user: UserRow | null, url: string): Record<string, unknown> {
+  private templateData(
+    user: UserRow | null,
+    url: string,
+    extra?: Record<string, unknown>,
+  ): Record<string, unknown> {
     const siteUrl = this.ctx.settings.siteUrl.replace(/\/+$/, '');
     const resolve = (path: string): string =>
       path && !/^https?:\/\//i.test(path) ? `${siteUrl}${path.startsWith('/') ? '' : '/'}${path}` : path;
@@ -204,15 +222,17 @@ export class MailService {
         Email: user?.email ?? '',
         Nick: user?.nick ?? '',
         CreatedAt: user?.created_at ?? '',
+        Storage: user?.storage ?? 0,
       },
       Url: url,
+      ...extra,
     };
   }
 
   private render(
-    settingKey: 'mail_activation_template' | 'mail_reset_template',
+    settingKey: MailTemplateKey,
     user: UserRow,
-    url: string,
+    data: Record<string, unknown>,
     notConfigured: string,
   ): { title: string; body: string } {
     const templates = parseTemplates(this.ctx.settings.get(settingKey, ''));
@@ -223,7 +243,6 @@ export class MailService {
       throw new AppError(CodeInternalSetting, notConfigured);
     }
 
-    const data = this.templateData(user, url);
     return {
       title: renderTemplate(selected.title, data),
       body: renderTemplate(selected.body, data),
@@ -235,7 +254,7 @@ export class MailService {
     const { title, body } = this.render(
       'mail_activation_template',
       user,
-      url,
+      this.templateData(user, url),
       'Activation email template not configured',
     );
     await this.send(user.email, title, body);
@@ -246,8 +265,53 @@ export class MailService {
     const { title, body } = this.render(
       'mail_reset_template',
       user,
-      url,
+      this.templateData(user, url),
       'Reset email template not configured',
+    );
+    await this.send(user.email, title, body);
+  }
+
+  /**
+   * 支付收据邮件（原版 Pro 的 `mail_receipt_template`，边缘版真实实现：
+   * 订单履行成功后发送）。金额单位是分，模板里给的是保留两位小数的元。
+   */
+  async sendReceiptEmail(
+    user: UserRow,
+    order: {
+      orderNo: string;
+      productName: string;
+      productType: string;
+      amountFen: number;
+      tradeNo: string | null;
+      paidAt: Date | null;
+    },
+  ): Promise<void> {
+    const data = this.templateData(user, '', {
+      Order: {
+        No: order.orderNo,
+        ProductName: order.productName,
+        ProductType: order.productType,
+        Amount: (order.amountFen / 100).toFixed(2),
+        TradeNo: order.tradeNo ?? '',
+        PaidAt: order.paidAt ? order.paidAt.toISOString() : '',
+      },
+    });
+    const { title, body } = this.render(
+      'mail_receipt_template',
+      user,
+      data,
+      'Receipt email template not configured',
+    );
+    await this.send(user.email, title, body);
+  }
+
+  /** 存储配额超出邮件（原版 Pro 的 `mail_exceed_quota_template`，边缘版真实实现：容量校验失败时发送，调用方负责限频）。 */
+  async sendExceedQuotaEmail(user: UserRow): Promise<void> {
+    const { title, body } = this.render(
+      'mail_exceed_quota_template',
+      user,
+      this.templateData(user, ''),
+      'Exceed quota email template not configured',
     );
     await this.send(user.email, title, body);
   }

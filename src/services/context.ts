@@ -256,7 +256,42 @@ export class AppContext {
     const max = this.maxStorage;
     if (max === null || max <= 0) return; // 不限量
     if (this.usedStorage + additional > max) {
+      // 对应原版 Pro 的「存储配额超出」通知（mail_exceed_quota_template）：
+      // 由中间件注入 notifier，fire-and-forget 发信（限频在 notifier 内做），
+      // 绝不能阻塞或影响这次必然失败的请求。
+      try {
+        this.onQuotaExceeded?.(this.requireUser());
+      } catch {
+        /* 通知失败不影响业务错误抛出 */
+      }
       throw new AppError(40051, 'Insufficient capacity');
     }
+  }
+
+  // -------------------------------------------------------------------------
+  // 后台任务挂钩（由中间件注入，见 src/middleware/app.ts）
+  // -------------------------------------------------------------------------
+
+  private backgroundHooks?: {
+    waitUntil: (p: Promise<unknown>) => void;
+    onQuotaExceeded: (user: UserWithGroup) => void;
+  };
+
+  /** 注入 `waitUntil` 与配额超限通知。仅路由装配层调用一次。 */
+  setBackgroundHooks(hooks: {
+    waitUntil: (p: Promise<unknown>) => void;
+    onQuotaExceeded: (user: UserWithGroup) => void;
+  }): void {
+    this.backgroundHooks = hooks;
+  }
+
+  /** 把不该阻塞响应、又必须跑完的工作挂到 Workers 的生命周期上。 */
+  get waitUntil(): ((p: Promise<unknown>) => void) | undefined {
+    return this.backgroundHooks?.waitUntil;
+  }
+
+  /** 存储配额超出时的通知回调（发「配额超出」邮件，限频由实现方负责）。 */
+  get onQuotaExceeded(): ((user: UserWithGroup) => void) | undefined {
+    return this.backgroundHooks?.onQuotaExceeded;
   }
 }

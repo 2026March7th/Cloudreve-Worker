@@ -15,11 +15,12 @@
  * 后接商户密钥（无 &），取 MD5 hex 小写。
  */
 import type { AppContext } from './context';
-import type { UserSetting, VasProductType } from '../db/types';
+import type { OrderRow, UserSetting, VasProductType } from '../db/types';
 import { GiftCodeRepo, OrderRepo } from '../db/payment';
 import { AppError, Err } from '../lib/errors';
 import { md5 } from '../lib/md5';
 import { randomString } from '../lib/crypto';
+import { MailService } from './mail';
 
 // ---------------------------------------------------------------------------
 // 配置（settings JSON 键）
@@ -237,6 +238,9 @@ export class PaymentService {
     try {
       await this.fulfill(claimed.user_id, claimed.product_type, claimed.product_snapshot ?? {});
       await this.orders.markFulfilled(claimed.id);
+      // 支付收据邮件（原版 Pro 的 mail_receipt_template）：履行成功后发送，
+      // 失败不影响订单状态。走 waitUntil，不阻塞回调响应。
+      this.sendReceiptMail(claimed);
     } catch (e) {
       // 履行失败：订单留在 paid 态（钱已收），错误信息入库供管理员排查
       const msg = e instanceof Error ? e.message : String(e);
@@ -250,6 +254,29 @@ export class PaymentService {
   // -------------------------------------------------------------------------
   // 履行（订单与礼品卡共用）
   // -------------------------------------------------------------------------
+
+  /**
+   * 发送支付收据邮件（`mail_receipt_template`）。fire-and-forget：
+   * 邮件失败只记不抛 —— 钱已收、货已发，收据发不出去不该让回调报错。
+   */
+  private sendReceiptMail(order: OrderRow): void {
+    const deliver = (async () => {
+      const mail = new MailService(this.ctx);
+      if (!mail.available) return;
+      const user = await this.ctx.users.byId(order.user_id);
+      if (!user) return;
+      await mail.sendReceiptEmail(user, {
+        orderNo: order.order_no,
+        productName: String(order.product_snapshot?.name ?? order.product_type),
+        productType: order.product_type,
+        amountFen: Number(order.amount ?? 0),
+        tradeNo: order.provider_trade_no,
+        paidAt: order.paid_at,
+      });
+    })();
+    const run = deliver.catch(() => undefined);
+    if (this.ctx.waitUntil) this.ctx.waitUntil(run);
+  }
 
   /**
    * 把商品落到用户身上。全部写 users.settings JSONB，读侧惰性判过期：

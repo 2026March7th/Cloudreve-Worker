@@ -204,6 +204,10 @@ export const DEFAULT_SETTINGS: Record<string, string> = {
   // **占位符契约与上游完全一致**，管理员把上游模板原样贴回来也能正常渲染。
   mail_activation_template: JSON.stringify(DEFAULT_MAIL_TEMPLATES.activation),
   mail_reset_template: JSON.stringify(DEFAULT_MAIL_TEMPLATES.reset),
+  // 原版 Pro 的两个模板（收据/配额）。边缘版有对应真实业务，出厂即给默认值，
+  // 管理员可在「邮件 → 邮件模板」里直接改。
+  mail_receipt_template: JSON.stringify(DEFAULT_MAIL_TEMPLATES.receipt),
+  mail_exceed_quota_template: JSON.stringify(DEFAULT_MAIL_TEMPLATES.exceedQuota),
 
   // --- 全文检索 ---
   // 键名与默认值逐条取自 `inventory/setting.go:675-686`。

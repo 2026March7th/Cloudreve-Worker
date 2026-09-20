@@ -217,9 +217,81 @@ const WORDINGS: Wording[] = [
 /** 标题的包装格式取自上游：`[{{ .CommonContext.SiteBasic.Name }}] <标题>`。 */
 const TITLE_PREFIX = '[{{ .CommonContext.SiteBasic.Name }}] ';
 
+/**
+ * 通知类模板（无跳转按钮）的骨架：原版 Pro 的「支付收据」「存储配额超出」
+ * 没有开源出厂模板，这里按边缘版自己的语义给出等价的简洁默认值。
+ * 占位符：公共变量 + `{{ .Order.* }}`（收据）/ `{{ .User.Storage }}`（配额）。
+ */
+function noticeBody(opts: { lang: string; heading: string; lines: string[]; autoSend: string }): string {
+  return [
+    `<html lang="${opts.lang}">`,
+    '<body style="margin:0;padding:24px;background:#f4f5f7;font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\',Roboto,Helvetica,Arial,sans-serif;color:#1f2329;">',
+    '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:560px;margin:0 auto;background:#ffffff;border-radius:12px;">',
+    '<tr><td style="padding:32px 32px 8px 32px;">',
+    '<img src="{{ .CommonContext.Logo.Normal }}" alt="{{ .CommonContext.SiteBasic.Name }}" style="height:36px;">',
+    '</td></tr>',
+    '<tr><td style="padding:8px 32px 0 32px;">',
+    `<h1 style="margin:0 0 12px 0;font-size:20px;line-height:1.4;">${opts.heading}</h1>`,
+    opts.lines.map((l) => `<p style="margin:0 0 8px 0;font-size:14px;line-height:1.7;color:#4e5969;">${l}</p>`).join(''),
+    '</td></tr>',
+    '<tr><td style="padding:0 32px 32px 32px;border-top:1px solid #e5e6eb;">',
+    `<p style="margin:16px 0 0 0;font-size:12px;line-height:1.7;color:#86909c;">${opts.autoSend}<br>`,
+    '<a href="{{ .CommonContext.SiteUrl }}" style="color:#86909c;">{{ .CommonContext.SiteBasic.Name }}</a>',
+    '</p></td></tr>',
+    '</table>',
+    '</body></html>',
+  ].join('');
+}
+
+/** 收据 / 配额通知只需要 en-US 与 zh-CN 两种语言（第一项是兜底）。 */
+const NOTICE_WORDINGS = [
+  {
+    language: 'en-US',
+    autoSend: 'This email is sent automatically.',
+    receiptTitle: 'Payment receipt',
+    receiptHeading: 'Payment confirmed',
+    receiptLines: [
+      'Dear {{ .User.Nick }}, your payment has been confirmed.',
+      'Order: {{ .Order.No }}',
+      'Product: {{ .Order.ProductName }}',
+      'Amount: {{ .Order.Amount }}',
+      'Paid at: {{ .Order.PaidAt }}',
+      'Thank you for your support!',
+    ],
+    quotaTitle: 'Storage quota exceeded',
+    quotaHeading: 'Storage quota exceeded',
+    quotaLines: [
+      'Dear {{ .User.Nick }}, your storage usage ({{ .User.Storage }} bytes) has exceeded your plan\'s quota.',
+      'Some operations (e.g. uploading) may fail until you free up space or upgrade your storage plan.',
+    ],
+  },
+  {
+    language: 'zh-CN',
+    autoSend: '此邮件由系统自动发送。',
+    receiptTitle: '支付收据',
+    receiptHeading: '支付已确认',
+    receiptLines: [
+      '尊敬的 {{ .User.Nick }}，您的支付已确认成功。',
+      '订单号：{{ .Order.No }}',
+      '商品：{{ .Order.ProductName }}',
+      '金额：{{ .Order.Amount }}',
+      '支付时间：{{ .Order.PaidAt }}',
+      '感谢您的支持！',
+    ],
+    quotaTitle: '存储配额已超出',
+    quotaHeading: '存储配额已超出',
+    quotaLines: [
+      '尊敬的 {{ .User.Nick }}，您的已用容量（{{ .User.Storage }} 字节）已超出当前套餐的配额上限。',
+      '在清理空间或升级容量之前，部分操作（如上传）可能会失败。',
+    ],
+  },
+];
+
 export const DEFAULT_MAIL_TEMPLATES: {
   activation: MailTemplateEntry[];
   reset: MailTemplateEntry[];
+  receipt: MailTemplateEntry[];
+  exceedQuota: MailTemplateEntry[];
 } = {
   activation: WORDINGS.map((w) => ({
     language: w.language,
@@ -240,6 +312,26 @@ export const DEFAULT_MAIL_TEMPLATES: {
       heading: w.resetTitle,
       description: w.resetDes,
       button: w.resetButton,
+      autoSend: w.autoSend,
+    }),
+  })),
+  receipt: NOTICE_WORDINGS.map((w) => ({
+    language: w.language,
+    title: TITLE_PREFIX + w.receiptTitle,
+    body: noticeBody({
+      lang: w.language,
+      heading: w.receiptHeading,
+      lines: w.receiptLines,
+      autoSend: w.autoSend,
+    }),
+  })),
+  exceedQuota: NOTICE_WORDINGS.map((w) => ({
+    language: w.language,
+    title: TITLE_PREFIX + w.quotaTitle,
+    body: noticeBody({
+      lang: w.language,
+      heading: w.quotaHeading,
+      lines: w.quotaLines,
       autoSend: w.autoSend,
     }),
   })),

@@ -9,6 +9,7 @@
 import type { Context, MiddlewareHandler, Next } from 'hono';
 import type { Env } from '../env';
 import { AppContext } from '../services/context';
+import { MailService } from '../services/mail';
 import { loadSettings } from '../settings/provider';
 import { HashIDCodec } from '../lib/hashid';
 import { JWTService, TokenHeaderPrefix, TokenHeaderPrefixCr } from '../lib/jwt';
@@ -103,7 +104,32 @@ export function appContext(): MiddlewareHandler<AppBindings> {
       }
     }
 
-    c.set('ctx', new AppContext(env, settings, codec, jwt, user, scopes));
+    const appCtx = new AppContext(env, settings, codec, jwt, user, scopes);
+    // 后台任务挂钩：把「发信」这类不能阻塞响应、又不该丢的工作挂到
+    // Workers 的 waitUntil 上（对应原版的常驻队列发信）。
+    appCtx.setBackgroundHooks({
+      waitUntil: (p) => c.executionCtx.waitUntil(p),
+      onQuotaExceeded: (u) => {
+        // 原版 Pro 的 mail_exceed_quota_template：配额超出时发通知邮件。
+        // KV 限频 24h/用户，否则一次批量上传能把邮箱塞爆。
+        const kv = env.KV;
+        if (!kv) return;
+        c.executionCtx.waitUntil(
+          (async () => {
+            const key = `mail_exceed_quota_sent_${u.id}`;
+            try {
+              if (await kv.get(key)) return;
+              await kv.put(key, '1', { expirationTtl: 86_400 });
+              const mail = new MailService(appCtx);
+              if (mail.available) await mail.sendExceedQuotaEmail(u);
+            } catch {
+              // 通知是尽力而为，任何失败都吞掉
+            }
+          })(),
+        );
+      },
+    });
+    c.set('ctx', appCtx);
     c.header('X-Correlation-ID', correlationId);
 
     await next();
