@@ -13,6 +13,7 @@ import { SearchService } from './search';
 import { FileSystemType, URI, validateName } from './uri';
 import type { ExplorerView, FileRow, MetadataRow, StoragePolicyRow } from '../db/types';
 import { BooleanSet, EntityType, FileType, GroupPermission } from '../lib/boolset';
+import { isPolicyTypeSupported } from '../storage';
 
 /**
  * 文件系统能力位。位序**严格对齐**上游 `pkg/filemanager/fs/dbfs/navigator.go`
@@ -682,10 +683,16 @@ export class FileSystemService {
       try {
         const owner = await this.ctx.users.byId(policyOwnerId);
         const group = owner ? await this.ctx.groups.byId(owner.group_users) : null;
-        const policy =
+        // 与 ctx.resolvePolicy 同款回退链：组绑定策略 → 第一个可用策略。
+        // 组没绑策略（历史库 / 手工建组）时也必须让上传器拿到策略，
+        // 否则前端点「上传」直接抛 No policy selected。
+        let policy =
           group?.storage_policy_id != null
             ? await this.ctx.policies.byId(group.storage_policy_id)
             : null;
+        if (!policy || !isPolicyTypeSupported(policy.type)) {
+          policy = await this.ctx.policies.defaultPolicy();
+        }
         if (policy) response.storage_policy = this.buildPolicyInfo(policy);
       } catch {
         // 降级：无策略时前端上传器保持 No policy selected 行为
