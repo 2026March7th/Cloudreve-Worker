@@ -3,16 +3,11 @@
 把 Cloudreve v4 的后端**重写**成可跑在 Cloudflare Workers 上的 TypeScript 实现
 （不是编译、不是移植 —— Go 跑不了 Workers）。
 
-- 前端 100% 使用[官方前端](https://github.com/cloudreve/frontend)，本项目只做后端
-- 元数据存 Neon Postgres，文件本体存 R2 或 OneDrive，会话/缓存用 KV
-- 与上游 v4.14.0 的接口契约、错误码、字段名逐条对齐，官方前端不需要任何修改
-- 沿用上游的 GPL-3.0 许可，上游版权归 Cloudreve 项目及其贡献者所有
 
 ---
 
 ## 一键部署
 
-全程手机浏览器可完成，不需要本机装任何东西：
 
 1. 打开 [neon.tech](https://neon.tech) 注册（可用 GitHub 登录），新建项目，复制首页的 **Connection string**（`postgresql://...` 那串）。
 2. 点部署按钮：
