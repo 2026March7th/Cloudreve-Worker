@@ -103,7 +103,7 @@ npx wrangler r2 bucket create cloudreve-worker
    形如：
 
    ```
-   postgresql://neondb_owner:AbCdEf123@ep-cool-name-123456.ap-southeast-1.aws.neon.tech/neondb?sslmode=require
+   postgresql://neondb_owner:xxxxxxx
    ```
 
    > 用 **Pooler** 的连接串也可以，Worker 走的是 HTTP 驱动，不占连接数。
