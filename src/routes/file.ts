@@ -36,7 +36,7 @@ import { SearchService } from '../services/search';
 import { UploadService } from '../services/upload';
 import { DownloadService } from '../services/download';
 import { UserService } from '../services/user';
-import { subscribe } from '../services/events';
+import { subscribe, type FsEvent } from '../services/events';
 import { readCentralDirectory, type RangeReader } from '../lib/zipread';
 import { ZipError } from '../lib/zipread';
 import { drain, nameDecoder } from '../services/workflow';
@@ -805,24 +805,114 @@ fileRoutes.get('/events', async (c) => {
     if (folder.type !== FileType.Folder) {
       return fail(c, Err.param('Events can only be subscribed on a folder'));
     }
-
-    const encoder = new TextEncoder();
+    const ownerId = ctx.requireUser().id;
     const folderId = folder.id;
+
+    // 目录快照：DB diff 轮询用。内存事件总线只在同 isolate 内有效，
+    // 而上传请求与 SSE 请求常常落在不同 isolate，所以必须以快照对比
+    // 兜底，否则前端永远收不到事件。
+    const snapshot = new Map<string, { name: string; size: number; updatedAt: string }>();
+    const loadSnapshot = async (): Promise<void> => {
+      const { files } = await ctx.files.list({
+        parentId: folderId,
+        ownerId,
+        page: 0,
+        pageSize: 1000,
+        orderBy: 'name',
+        orderDirection: 'asc',
+      });
+      const next = new Map<string, { name: string; size: number; updatedAt: string }>();
+      for (const f of files) {
+        next.set(ctx.codec.encodeFileID(f.id), {
+          name: f.name,
+          size: f.size,
+          updatedAt: f.updated_at.toISOString(),
+        });
+      }
+      snapshot.clear();
+      for (const [k, v] of next) snapshot.set(k, v);
+    };
+    await loadSnapshot();
+
+    /** 对比快照的逻辑在 poll() 内实现；snapshot 初始即为当前目录内容。 */
+    const encoder = new TextEncoder();
+    const pending: FsEvent[] = [];
+    let closed = false;
+    let send: (event: string, data: unknown) => void = () => {};
+
+    const poll = async (): Promise<void> => {
+      try {
+        const { files } = await ctx.files.list({
+          parentId: folderId,
+          ownerId,
+          page: 0,
+          pageSize: 1000,
+          orderBy: 'name',
+          orderDirection: 'asc',
+        });
+        const next = new Map<string, { name: string; size: number; updatedAt: string }>();
+        for (const f of files) {
+          next.set(ctx.codec.encodeFileID(f.id), {
+            name: f.name,
+            size: f.size,
+            updatedAt: f.updated_at.toISOString(),
+          });
+        }
+        // 新增 / 变更
+        for (const [id, v] of next) {
+          const prev = snapshot.get(id);
+          if (!prev) {
+            pending.push({ type: 'create', file_id: id, from: '', to: v.name });
+          } else if (prev.name !== v.name) {
+            pending.push({ type: 'rename', file_id: id, from: prev.name, to: v.name });
+          } else if (prev.size !== v.size || prev.updatedAt !== v.updatedAt) {
+            pending.push({ type: 'modify', file_id: id, from: '', to: v.name });
+          }
+        }
+        // 删除
+        for (const [id, v] of snapshot) {
+          if (!next.has(id)) {
+            pending.push({ type: 'delete', file_id: id, from: v.name, to: '' });
+          }
+        }
+        snapshot.clear();
+        for (const [k, v] of next) snapshot.set(k, v);
+      } catch {
+        // 轮询失败静默，下一轮再试
+      }
+    };
+
     const stream = new ReadableStream<Uint8Array>({
-      start(controller) {
-        let closed = false;
-        const send = (event: string, data: unknown) => {
+      async start(controller) {
+        send = (event: string, data: unknown) => {
           if (closed) return;
           controller.enqueue(
             encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data ?? '')}\n\n`),
           );
         };
         send('subscribed', null);
+
+        // 即时通道：同 isolate 内的发布直接推送
         const unsubscribe = subscribe(folderId, clientId, (event) => send('event', event));
+
+        // 兜底通道：DB 快照 diff 轮询（跨 isolate 可靠）
+        const POLL_MS = 4000;
+        let timer: ReturnType<typeof setTimeout> | null = null;
+        const tick = async (): Promise<void> => {
+          if (closed) return;
+          await poll();
+          while (pending.length) {
+            send('event', pending.shift());
+          }
+          if (!closed) timer = setTimeout(tick, POLL_MS);
+        };
+        timer = setTimeout(tick, POLL_MS);
+
         const keepAlive = setInterval(() => send('keep-alive', null), 25_000);
         const cleanup = () => {
           if (closed) return;
           closed = true;
+          if (timer) clearTimeout(timer);
           clearInterval(keepAlive);
           unsubscribe();
           try {
