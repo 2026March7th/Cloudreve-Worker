@@ -115,6 +115,10 @@ export interface StoragePolicyInfo {
   relay?: boolean;
   chunk_concurrency?: number;
   encryption?: boolean;
+  allowed_suffix?: string[];
+  denied_suffix?: string[];
+  allowed_name_regexp?: string;
+  denied_name_regexp?: string;
 }
 
 export interface EntityInfo {
@@ -156,6 +160,13 @@ export interface ListResponse {
   props: NavigatorProps;
   mixed_type: boolean;
   recursion_limit_reached?: boolean;
+  /**
+   * 当前目录的「首选」存储策略（上游 `ListResponse.StoragePolicy`，取父目录
+   * 属主所在用户组绑定的策略，dbfs.go:669 getPreferredPolicy）。前端上传器
+   * 靠它初始化 —— 缺失时点「上传」直接抛 No policy selected，文件选择器
+   * 都不会打开。
+   */
+  storage_policy?: StoragePolicyInfo;
 }
 
 export interface BuildFileOptions {
@@ -527,7 +538,7 @@ export class FileSystemService {
   }
 
   buildPolicyInfo(policy: StoragePolicyRow): StoragePolicyInfo {
-    return {
+    const res: StoragePolicyInfo = {
       id: this.ctx.codec.encodePolicyID(policy.id),
       name: policy.name,
       type: policy.type,
@@ -536,6 +547,18 @@ export class FileSystemService {
       chunk_concurrency: policy.settings?.chunk_concurrency,
       encryption: policy.settings?.encryption,
     };
+    // 后缀与文件名正则约束（对齐上游 BuildStoragePolicy，response.go:508），
+    // 上传器用它设置文件选择器的 accept 属性与前端校验
+    const s = policy.settings;
+    if (s?.file_type && s.file_type.length > 0) {
+      if (s.is_file_type_deny_list) res.denied_suffix = s.file_type;
+      else res.allowed_suffix = s.file_type;
+    }
+    if (s?.file_regexp) {
+      if (s.is_name_regexp_deny_list) res.denied_name_regexp = s.file_regexp;
+      else res.allowed_name_regexp = s.file_regexp;
+    }
+    return res;
   }
 
   /** 批量读取元数据，避免逐个文件查询。 */
@@ -645,6 +668,21 @@ export class FileSystemService {
         owned: viewer !== undefined && dir.owner_id === viewer.id,
         uri,
       });
+
+      // 上游 getPreferredPolicy（dbfs.go:669-682）：取**父目录属主**所在
+      // 用户组绑定的存储策略下发给上传器。获取失败仅降级为缺字段，
+      // 不影响列表本身（上游也只 Warning 不阻断）。
+      try {
+        const owner = await this.ctx.users.byId(dir.owner_id);
+        const group = owner ? await this.ctx.groups.byId(owner.group_users) : null;
+        const policy =
+          group?.storage_policy_id != null
+            ? await this.ctx.policies.byId(group.storage_policy_id)
+            : null;
+        if (policy) response.storage_policy = this.buildPolicyInfo(policy);
+      } catch {
+        // 降级：无策略时前端上传器保持 No policy selected 行为
+      }
     }
 
     return response;
