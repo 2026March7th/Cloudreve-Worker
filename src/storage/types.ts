@@ -151,6 +151,17 @@ export interface StorageDriver {
 
   /** 生成缩略图地址，不支持时返回 null。 */
   thumb(source: string, size: string): Promise<string | null>;
+
+  /**
+   * 分页列举对象（导入任务用）。仅 S3 兼容驱动实现；其他驱动不支持。
+   */
+  list?(
+    prefix: string,
+    options?: { continuation?: string; afterKey?: string; limit?: number },
+  ): Promise<{
+    keys: { key: string; size: number; lastModified: Date }[];
+    continuation: string | null;
+  }>;
 }
 
 /** 解析策略设置里的分片大小；为 0 时用驱动默认值。 */

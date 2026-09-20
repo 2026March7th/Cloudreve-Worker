@@ -105,7 +105,13 @@ export class DownloadService {
           speed: 0,
         });
       } else {
-        url = await this.buildProxyUrl(entity.id, name, expiresAt, options.download === true);
+        url = await this.buildProxyUrl(
+          entity.id,
+          name,
+          expiresAt,
+          options.download === true,
+          await this.speedLimitFor(file),
+        );
       }
 
       const item: EntityUrl = { url };
@@ -141,15 +147,31 @@ export class DownloadService {
     name: string,
     expiresAt: number,
     download: boolean,
+    speed = 0,
   ): Promise<string> {
     const base = this.ctx.settings.siteUrl.replace(/\/+$/, '');
     const entityHash = this.ctx.codec.encodeEntityID(entityId);
-    const path = `/api/v4/file/content/${entityHash}/0/${encodeURIComponent(name)}`;
+    const path = `/api/v4/file/content/${entityHash}/${speed}/${encodeURIComponent(name)}`;
     const sign = await this.ctx.signer.sign(path, expiresAt);
     // 上游语义（pkg/cluster/routes/routes.go:15）：query 里 `download` 非空
     // 即表示强制下载；签名只覆盖 pathname，query 参数不参与签名
     const suffix = download ? '?download=true&sign=' : '?sign=';
     return `${base}${path}${suffix}${encodeURIComponent(sign)}`;
+  }
+
+  /**
+   * 文件属主的组下载限速（字节/秒，0 = 不限）。
+   * 编进代理 URL 的 `:speed` 段，由内容分发端点执行 —— 代理地址是
+   * 签名给匿名用的，执行时拿不到用户上下文，所以限速必须在铸造时带上。
+   */
+  private async speedLimitFor(file: FileRow): Promise<number> {
+    const user = this.ctx.user;
+    if (user && user.id === file.owner_id) return user.group?.speed_limit ?? 0;
+    if (!file.owner_id) return 0;
+    const owner = await this.ctx.users.byId(file.owner_id);
+    if (!owner) return 0;
+    const group = await this.ctx.groups.byId(owner.group_users);
+    return group?.speed_limit ?? 0;
   }
 
   /**
@@ -269,9 +291,9 @@ export class DownloadService {
       });
     }
 
-    // 需要代理时返回本站签名地址
+    // 需要代理时返回本站签名地址（带上属主组限速）
     const expiresAt = Math.floor(Date.now() / 1000) + this.ctx.settings.getInt('entity_url_default_ttl', 3600);
-    return this.buildProxyUrl(entity.id, file.name, expiresAt, true);
+    return this.buildProxyUrl(entity.id, file.name, expiresAt, true, await this.speedLimitFor(file));
   }
 
   /** 打包下载：边缘版不支持流式 zip，返回明确的「未启用」错误。 */

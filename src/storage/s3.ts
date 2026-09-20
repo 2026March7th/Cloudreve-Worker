@@ -565,6 +565,59 @@ export class S3CompatibleDriver implements StorageDriver {
     return { size: Number(res.headers.get('content-length') ?? 0) };
   }
 
+  /**
+   * ListObjectsV2 分页列举（导入任务用）。
+   * @param prefix 键前缀（对应导入的「外部路径」）
+   * @param continuation 上一批返回的 continuationToken
+   * @param afterKey 只返回键 > afterKey 的对象（断点续跑）
+   */
+  async list(
+    prefix: string,
+    options: { continuation?: string; afterKey?: string; limit?: number } = {},
+  ): Promise<{ keys: { key: string; size: number; lastModified: Date }[]; continuation: string | null }> {
+    const limit = Math.min(1000, Math.max(1, options.limit ?? 1000));
+    const q: Array<[string, string]> = [
+      ['list-type', '2'],
+      ['max-keys', String(limit)],
+    ];
+    if (prefix) q.push(['prefix', prefix]);
+    if (options.continuation) q.push(['continuation-token', options.continuation]);
+
+    const res = await this.signedFetch('GET', this.objectUrl('', q));
+    const text = await res.text();
+    if (!res.ok) throw new Error(`S3 ListObjectsV2 failed (${res.status}): ${text.slice(0, 300)}`);
+
+    const decodeEntities = (s: string): string =>
+      s
+        .replace(/&lt;/g, '<')
+        .replace(/&gt;/g, '>')
+        .replace(/&quot;/g, '"')
+        .replace(/&apos;/g, "'")
+        .replace(/&#(\d+);/g, (_, d: string) => String.fromCodePoint(Number(d)))
+        .replace(/&amp;/g, '&');
+
+    const pick = (block: string, tag: string): string =>
+      decodeEntities(new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`).exec(block)?.[1] ?? '');
+
+    const keys: { key: string; size: number; lastModified: Date }[] = [];
+    const contentsRe = /<Contents>([\s\S]*?)<\/Contents>/g;
+    let m: RegExpExecArray | null;
+    while ((m = contentsRe.exec(text)) !== null) {
+      const block = m[1]!;
+      const key = pick(block, 'Key');
+      const size = Number(pick(block, 'Size') || 0);
+      const lastModified = new Date(pick(block, 'LastModified') || 0);
+      if (!key) continue;
+      if (options.afterKey && key <= options.afterKey) continue;
+      keys.push({ key, size, lastModified });
+    }
+    const nextToken = /<NextContinuationToken>([\s\S]*?)<\/NextContinuationToken>/.exec(text)?.[1];
+    return {
+      keys,
+      continuation: nextToken ? decodeEntities(nextToken) : null,
+    };
+  }
+
   async source(source: string, args: GetSourceArgs): Promise<string> {
     const expires =
       args.expire && args.expire > 0

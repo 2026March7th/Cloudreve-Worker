@@ -37,6 +37,7 @@ import {
 import { randomString, timingSafeEqual, uuidv4 } from '../lib/crypto';
 import { extOf } from './savepath';
 import { isRelayEnabled, type UploadedPart, type UploadSession } from '../storage/types';
+import { publish } from './events';
 
 const SESSION_PREFIX = 'upload_session:';
 /** 原版 uploadSentinelCheckMargin = 5 分钟 */
@@ -395,6 +396,11 @@ export class UploadService {
   private async finishUpload(session: UploadSession): Promise<void> {
     const driver = this.ctx.driverFor(session.policy);
 
+    // 是否覆盖已有内容（用于事件类型判定：create vs modify）
+    const hadContent = session.fileId
+      ? (await this.ctx.files.byId(session.fileId))?.primary_entity !== null
+      : false;
+
     await driver.completeUpload(session);
 
     // 哨兵式校验：远端大小必须与声明一致（原版 CodeMetaMismatch）
@@ -442,6 +448,20 @@ export class UploadService {
         this.onUploadFinished(target);
       } catch (e) {
         console.error('onUploadFinished hook failed', e);
+      }
+    }
+
+    // 通知同 isolate 内的 SSE 订阅者（前端文件列表实时刷新）
+    if (target) {
+      try {
+        publish(target.file_children ?? 0, {
+          type: hadContent ? 'modify' : 'create',
+          file_id: this.ctx.codec.encodeFileID(target.id),
+          from: '',
+          to: target.name,
+        });
+      } catch {
+        // 事件推送失败不影响上传结果
       }
     }
   }

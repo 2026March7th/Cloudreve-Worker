@@ -138,16 +138,30 @@ workflowRoutes.post('/archive', async (c) => {
   }
 });
 
-/** 解压需要一个 ZIP **读取器**（含 inflate），边缘版没做，见 README。 */
-workflowRoutes.post('/extract', (c) =>
-  fail(
-      c,
-      new AppError(
-        CodeFeatureNotEnabled,
-        'Extracting archives is not implemented in the edge build',
-      ),
-    ),
-);
+/** 解压：ZIP 分段读取 + 原生 inflate，同步跑完（见 services/workflow.ts）。 */
+workflowRoutes.post('/extract', async (c) => {
+  const ctx = ctxOf(c);
+  const body = (await c.req.json().catch(() => ({}))) as {
+    src?: string[];
+    dst?: string;
+    encoding?: string;
+    password?: string;
+  };
+  if (!body.src?.length || !body.dst) {
+    return fail(c, Err.param('src and dst are required'));
+  }
+  try {
+    const task = await new WorkflowService(ctx, new FileSystemService(ctx)).extractArchive({
+      src: body.src,
+      dst: body.dst,
+      encoding: body.encoding,
+      password: body.password,
+    });
+    return ok(c, taskToResponse(ctx.codec, task));
+  } catch (e) {
+    return fail(c, e);
+  }
+});
 
 // ---------------------------------------------------------------------------
 // 远程下载
@@ -229,20 +243,52 @@ workflowRoutes.delete('/download/:id', async (c) => {
 // ---------------------------------------------------------------------------
 
 /**
- * 从存储策略导入已有对象。
- *
- * 这需要驱动支持「列举对象」，而边缘版各驱动的列举能力并不完整，
- * 加上导入通常是量大且耗时的活（正是 Workers 最不擅长的），所以不做。
+ * 从存储策略导入已有对象。S3 兼容家族（含 R2）走 ListObjectsV2，
+ * 只建引用不搬数据。`policy_id` 接受数字或 hashid；`user_id` 仅管理员可用。
  */
-workflowRoutes.post('/import', (c) =>
-  fail(
-      c,
-      new AppError(
-        CodeFeatureNotEnabled,
-        'Importing objects from a storage policy is not implemented in the edge build',
-      ),
-    ),
-);
+workflowRoutes.post('/import', async (c) => {
+  const ctx = ctxOf(c);
+  const body = (await c.req.json().catch(() => ({}))) as {
+    src?: string;
+    dst?: string;
+    policy_id?: string | number;
+    user_id?: string;
+    recursive?: boolean;
+    extract_media_meta?: boolean;
+  };
+  if (!body.src || !body.dst || body.policy_id === undefined) {
+    return fail(c, Err.param('src, dst and policy_id are required'));
+  }
+
+  const policyId =
+    typeof body.policy_id === 'number'
+      ? body.policy_id
+      : /^\d+$/.test(body.policy_id)
+        ? Number(body.policy_id)
+        : ctx.codec.decodePolicyID(body.policy_id);
+  if (policyId === null) return fail(c, Err.param('Invalid policy_id'));
+
+  let targetUserId: number | null = null;
+  if (body.user_id) {
+    targetUserId = /^\d+$/.test(body.user_id)
+      ? Number(body.user_id)
+      : ctx.codec.decodeUserID(body.user_id);
+    if (targetUserId === null) return fail(c, Err.param('Invalid user_id'));
+  }
+
+  try {
+    const task = await new WorkflowService(ctx, new FileSystemService(ctx)).createImport({
+      src: body.src,
+      dst: body.dst,
+      policyId,
+      targetUserId,
+      recursive: Boolean(body.recursive),
+    });
+    return ok(c, taskToResponse(ctx.codec, task));
+  } catch (e) {
+    return fail(c, e);
+  }
+});
 
 /**
  * 重建全文索引。对应上游 `pkg/filemanager/workflows/rebuild_index.go`。

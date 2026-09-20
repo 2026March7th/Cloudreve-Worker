@@ -71,6 +71,27 @@ import {
   MetadataUploadSessionID,
 } from '../lib/sysmeta';
 import { isShareInvalid } from './share-rules';
+import { publish } from './events';
+
+/** 向同 isolate 的 SSE 订阅者广播一条文件事件（失败静默，不影响主流程）。 */
+function notifyFsEvent(
+  ctx: AppContext,
+  file: FileRow,
+  type: 'create' | 'modify' | 'rename' | 'delete',
+  from: string,
+  to: string,
+): void {
+  try {
+    publish(file.file_children ?? 0, {
+      type,
+      file_id: ctx.codec.encodeFileID(file.id),
+      from,
+      to,
+    });
+  } catch {
+    // 事件推送失败不影响主流程
+  }
+}
 
 // ---------------------------------------------------------------------------
 // 响应结构。字段与 json tag 取自 `service/explorer/response.go`。
@@ -894,6 +915,7 @@ export class FileSystemService {
       }
     }
 
+    notifyFsEvent(this.ctx, file, 'create', '', file.name);
     return this.buildFileResponse(file, { owned: true });
   }
 
@@ -925,6 +947,7 @@ export class FileSystemService {
         updated.name,
       );
     }
+    notifyFsEvent(this.ctx, updated ?? file, 'rename', file.name, updated?.name ?? newName);
     return this.buildFileResponse(updated!, { owned: true });
   }
 
@@ -1068,6 +1091,7 @@ export class FileSystemService {
         } else {
           await this.softDeleteFile(file);
         }
+        notifyFsEvent(this.ctx, file, 'delete', file.name, '');
       } catch (e) {
         errors.push(uri.toString());
         if (uris.length === 1) throw e;

@@ -30,15 +30,21 @@ import { ctxOf } from '../middleware/app';
 import { fail, ok } from '../lib/response';
 import type { AppContext } from '../services/context';
 import type { FileRow } from '../db/types';
+import { AppContext as AppContextClass } from '../services/context';
 import { FileSystemService } from '../services/fs';
 import { SearchService } from '../services/search';
 import { UploadService } from '../services/upload';
 import { DownloadService } from '../services/download';
 import { UserService } from '../services/user';
+import { subscribe } from '../services/events';
+import { readCentralDirectory, type RangeReader } from '../lib/zipread';
+import { ZipError } from '../lib/zipread';
+import { drain, nameDecoder } from '../services/workflow';
 import { URI } from '../services/uri';
 import { FileType } from '../lib/boolset';
 import { AppError, CodeFeatureNotEnabled, Err } from '../lib/errors';
 import { attachmentDisposition } from '../lib/disposition';
+import { throttleStream } from '../lib/throttle';
 
 export const fileRoutes = new Hono<AppBindings>();
 
@@ -294,7 +300,10 @@ const serveContent = async (c: AppRequest) => {
     if (c.req.method === 'HEAD') {
       return new Response(null, { status: 200, headers });
     }
-    return new Response(content.body, {
+    // 限速：代理 URL 的 :speed 段（铸造时编入属主组限速，字节/秒），0 = 不限
+    const speed = Number(c.req.param('speed')) || 0;
+    const body = speed > 0 ? throttleStream(content.body, speed) : content.body;
+    return new Response(body, {
       status: content.contentRange ? 206 : 200,
       headers,
     });
@@ -728,22 +737,432 @@ fileRoutes.get('/search', async (c) => {
 });
 
 // ---------------------------------------------------------------------------
-// 未实现的端点：明确返回「未启用」，避免前端拿到 404 后误判
+// 压缩包浏览（ZIP）
 // ---------------------------------------------------------------------------
 
-const NOT_IMPLEMENTED: Record<string, string> = {
-  '/archive': 'Archive listing is not implemented in the edge build',
-  '/events': 'Server-sent events are not implemented in the edge build',
-  '/wopi': 'WOPI is not implemented in the edge build',
-  '/viewerSession': 'Viewer sessions are not implemented in the edge build',
-};
+fileRoutes.get('/archive', async (c) => {
+  const ctx = ctxOf(c);
+  if (!guard(c)) return fail(c, Err.loginRequired());
+
+  const rawUri = c.req.query('uri');
+  if (!rawUri) return fail(c, Err.param('uri is required'));
+
+  try {
+    const uri = URI.parse(rawUri);
+    const service = new FileSystemService(ctx);
+    const file = await service.mustResolve(uri);
+    if (file.type === FileType.Folder) return fail(c, Err.param('Target is a folder'));
+    if (!file.primary_entity) throw new AppError(CodeFeatureNotEnabled, 'File has no entity');
+
+    const entity = await ctx.entities.byId(file.primary_entity);
+    if (!entity) throw new AppError(CodeFeatureNotEnabled, 'Entity is missing');
+    const policy = await ctx.policies.byId(entity.storage_policy_entities);
+    if (!policy) throw Err.policyNotAllowed();
+    const driver = ctx.driverFor(policy);
+
+    const read: RangeReader = async (start, end) => {
+      const content = await driver.get(entity.source, `bytes=${start}-${end}`);
+      if (!content) throw new ZipError(`Failed to read range ${start}-${end}`);
+      return drain(content.body as ReadableStream<Uint8Array>);
+    };
+
+    const entries = await readCentralDirectory(
+      read,
+      entity.size,
+      nameDecoder(c.req.query('text_encoding') ?? undefined),
+    );
+
+    return ok(c, {
+      files: entries.map((e) => ({
+        name: e.name,
+        size: e.size,
+        updated_at: e.mtime.toISOString(),
+        is_directory: e.isDir,
+      })),
+    });
+  } catch (e) {
+    return fail(c, e);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 事件推送（SSE）
+// ---------------------------------------------------------------------------
+
+fileRoutes.get('/events', async (c) => {
+  const ctx = ctxOf(c);
+  if (!guard(c)) return fail(c, Err.loginRequired());
+
+  const rawUri = c.req.query('uri');
+  if (!rawUri) return fail(c, Err.param('uri is required'));
+  const clientId = c.req.header('X-Client-Id') ?? c.req.query('client_id') ?? '';
+  if (!clientId) return fail(c, Err.param('client id is required'));
+
+  try {
+    const uri = URI.parse(rawUri);
+    const service = new FileSystemService(ctx);
+    const folder = await service.mustResolve(uri);
+    if (folder.type !== FileType.Folder) {
+      return fail(c, Err.param('Events can only be subscribed on a folder'));
+    }
+
+    const encoder = new TextEncoder();
+    const folderId = folder.id;
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        let closed = false;
+        const send = (event: string, data: unknown) => {
+          if (closed) return;
+          controller.enqueue(
+            encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data ?? '')}\n\n`),
+          );
+        };
+        send('subscribed', null);
+        const unsubscribe = subscribe(folderId, clientId, (event) => send('event', event));
+        const keepAlive = setInterval(() => send('keep-alive', null), 25_000);
+        const cleanup = () => {
+          if (closed) return;
+          closed = true;
+          clearInterval(keepAlive);
+          unsubscribe();
+          try {
+            controller.close();
+          } catch {
+            // already closed
+          }
+        };
+        c.req.raw.signal.addEventListener('abort', cleanup);
+      },
+    });
+
+    return new Response(stream, {
+      headers: {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        Connection: 'keep-alive',
+        'X-Accel-Buffering': 'no',
+      },
+    });
+  } catch (e) {
+    return fail(c, e);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 在线查看器会话 + WOPI host
+// ---------------------------------------------------------------------------
+
+/** WOPI 会话缓存键前缀与 TTL（秒）。 */
+const WOPI_SESSION_PREFIX = 'wopi_session:';
+const WOPI_SESSION_TTL = 3600;
+
+interface WopiSessionCache {
+  uid: number;
+  fileId: number;
+  fileUri: string;
+  viewerId: string;
+  action: string;
+  token: string;
+}
+
+interface ViewerDef {
+  id: string;
+  type: string;
+  display_name?: string;
+  disabled?: boolean;
+  wopi_actions?: Record<string, Record<string, string>>;
+}
+
+function fileExt(name: string): string {
+  const idx = name.lastIndexOf('.');
+  return idx >= 0 ? name.slice(idx + 1).toLowerCase() : '';
+}
+
+/** 按 WOPI discovery 的 action URL 模板拼出最终 iframe 地址。 */
+function buildWopiSrc(template: string, fileSrc: string): string {
+  let srcReplaced = false;
+  let url: URL;
+  try {
+    url = new URL(template.replace(/[<>]/g, ''));
+  } catch {
+    return '';
+  }
+  const query = url.searchParams;
+  const replaced = new URLSearchParams();
+  for (const [k, v] of query.entries()) {
+    if (v === 'WOPI_SOURCE') {
+      replaced.set(k, fileSrc);
+      srcReplaced = true;
+    } else if (k.toLowerCase() === 'wopisrc') {
+      replaced.set(k, fileSrc);
+      srcReplaced = true;
+    } else {
+      replaced.set(k, v);
+    }
+  }
+  if (!srcReplaced) replaced.set('WOPISrc', fileSrc);
+  replaced.set('lang', 'lng');
+  url.search = replaced.toString();
+  return url.toString();
+}
+
+fileRoutes.post('/viewerSession', async (c) => {
+  const ctx = ctxOf(c);
+  if (!guard(c)) return fail(c, Err.loginRequired());
+
+  const body = (await c.req.json().catch(() => ({}))) as {
+    uri?: string;
+    viewer_id?: string;
+    preferred_action?: string;
+    version?: string;
+  };
+  if (!body.uri || !body.viewer_id || !body.preferred_action) {
+    return fail(c, Err.param('uri, viewer_id and preferred_action are required'));
+  }
+
+  try {
+    const uri = URI.parse(body.uri);
+    const service = new FileSystemService(ctx);
+    const file = await service.mustResolve(uri);
+    if (file.type === FileType.Folder) return fail(c, Err.param('Target is a folder'));
+
+    // 找 viewer（file_viewers 设置：ViewerGroup[]）
+    const groups = JSON.parse(ctx.settings.get('file_viewers', '[]')) as ViewerDef[][];
+    let viewer: ViewerDef | undefined;
+    for (const group of groups) {
+      const list = Array.isArray(group) ? group : (group as unknown as { viewers?: ViewerDef[] }).viewers ?? [];
+      viewer = list.find((v) => v.id === body.viewer_id && !v.disabled);
+      if (viewer) break;
+    }
+    if (!viewer) return fail(c, Err.param('unknown viewer id'));
+
+    let wopiSrc: string | undefined;
+    if (viewer.type === 'wopi') {
+      const actions = viewer.wopi_actions?.[fileExt(file.name)] ?? {};
+      const template = actions[body.preferred_action] ?? actions.view ?? actions.edit;
+      if (!template) {
+        return fail(
+          c,
+          new AppError(CodeFeatureNotEnabled, 'Action not supported by current wopi endpoint'),
+        );
+      }
+      const base = ctx.settings.siteUrl.replace(/\/+$/, '');
+      const fileSrc = `${base}/api/v4/file/wopi/${ctx.codec.encodeFileID(file.id)}`;
+      wopiSrc = buildWopiSrc(template, fileSrc);
+    }
+
+    const sessionId = crypto.randomUUID();
+    const token = `${sessionId}.${crypto.randomUUID()}${crypto.randomUUID()}`.replace(/-/g, '');
+    const session: WopiSessionCache = {
+      uid: ctx.requireUser().id,
+      fileId: file.id,
+      fileUri: uri.toString(),
+      viewerId: viewer.id,
+      action: body.preferred_action,
+      token,
+    };
+    await ctx.env.KV.put(WOPI_SESSION_PREFIX + sessionId, JSON.stringify(session), {
+      expirationTtl: WOPI_SESSION_TTL,
+    });
+
+    return ok(c, {
+      session: {
+        id: sessionId,
+        access_token: token,
+        expires: Date.now() + WOPI_SESSION_TTL * 1000,
+      },
+      ...(wopiSrc ? { wopi_src: wopiSrc } : {}),
+    });
+  } catch (e) {
+    return fail(c, e);
+  }
+});
+
+/** WOPI 会话校验。合法时返回会话与文件行；否则 null。 */
+async function wopiSessionOf(
+  ctx: AppContext,
+  fileIdRaw: string,
+  accessToken: string | undefined,
+): Promise<{ session: WopiSessionCache; file: FileRow } | null> {
+  if (!accessToken || !accessToken.includes('.')) return null;
+  const sessionId = accessToken.slice(0, accessToken.indexOf('.'));
+  const raw = await ctx.env.KV.get(WOPI_SESSION_PREFIX + sessionId);
+  if (!raw) return null;
+  let session: WopiSessionCache;
+  try {
+    session = JSON.parse(raw) as WopiSessionCache;
+  } catch {
+    return null;
+  }
+  if (session.token !== accessToken) return null;
+  const fileId = ctx.codec.decodeFileID(fileIdRaw);
+  if (fileId === null || fileId !== session.fileId) return null;
+  const file = await ctx.files.byId(fileId);
+  if (!file) return null;
+  return { session, file };
+}
+
+function wopiVersionHeader(ctx: AppContext, file: FileRow): Record<string, string> {
+  return file.primary_entity
+    ? { 'X-WOPI-ItemVersion': ctx.codec.encodeEntityID(file.primary_entity) }
+    : {};
+}
+
+fileRoutes.get('/wopi/:id', async (c) => {
+  const ctx = ctxOf(c);
+  const found = await wopiSessionOf(ctx, c.req.param('id') ?? '', c.req.query('access_token'));
+  if (!found) return c.text('invalid access token', 401);
+  const { session, file } = found;
+
+  const user = await ctx.users.byId(session.uid);
+  const canEdit =
+    file.owner_id === session.uid &&
+    (c.req.query('preferred_action') ?? 'view') !== 'view' &&
+    Boolean(file.primary_entity);
+
+  return c.json({
+    BaseFileName: file.name,
+    Version: ctx.codec.encodeEntityID(file.primary_entity ?? file.id),
+    Size: file.size,
+    UserId: ctx.codec.encodeUserID(session.uid),
+    UserFriendlyName: user?.nick ?? '',
+    IsAnonymousUser: false,
+    ReadOnly: !canEdit,
+    UserCanWrite: canEdit,
+    UserCanReview: canEdit,
+    UserCanNotWriteRelative: true,
+    SupportsRename: true,
+    SupportsReviewing: true,
+    SupportsLocks: true,
+    SupportsUpdate: canEdit,
+    SupportsGetLock: true,
+    FileSharingPostMessage: file.owner_id === session.uid,
+    EnableShare: file.owner_id === session.uid,
+    FileVersionPostMessage: true,
+    ClosePostMessage: true,
+    PostMessageOrigin: '*',
+    FileNameMaxLength: 255,
+    LastModifiedTime: file.updated_at.toISOString(),
+    BreadcrumbBrandName: ctx.settings.get('siteName', 'Cloudreve'),
+    BreadcrumbBrandUrl: ctx.settings.siteUrl,
+    BreadcrumbFolderName: '',
+    BreadcrumbFolderUrl: ctx.settings.siteUrl,
+  });
+});
+
+fileRoutes.get('/wopi/:id/contents', async (c) => {
+  const ctx = ctxOf(c);
+  const found = await wopiSessionOf(ctx, c.req.param('id') ?? '', c.req.query('access_token'));
+  if (!found) return c.text('invalid access token', 401);
+  const { file } = found;
+  if (!file.primary_entity) return c.text('file has no entity', 404);
+
+  const entity = await ctx.entities.byId(file.primary_entity);
+  if (!entity) return c.text('entity is missing', 404);
+  const policy = await ctx.policies.byId(entity.storage_policy_entities);
+  if (!policy) return c.text('policy not allowed', 400);
+  const driver = ctx.driverFor(policy);
+
+  const content = await driver.get(entity.source, c.req.header('Range') ?? null);
+  if (!content) return c.text('object not found', 404);
+
+  return new Response(content.body, {
+    status: content.contentRange ? 206 : 200,
+    headers: {
+      'Content-Type': 'application/octet-stream',
+      'Content-Length': String(content.size),
+      ...(content.contentRange ? { 'Content-Range': content.contentRange } : {}),
+      ...wopiVersionHeader(ctx, file),
+    },
+  });
+});
+
+fileRoutes.post('/wopi/:id/contents', async (c) => {
+  const ctx = ctxOf(c);
+  const found = await wopiSessionOf(ctx, c.req.param('id') ?? '', c.req.query('access_token'));
+  if (!found) return c.text('invalid access token', 401);
+  const { session, file } = found;
+  if (file.owner_id !== session.uid) return c.text('not allowed', 403);
+  if (!file.primary_entity) return c.text('file has no entity', 404);
+
+  const length = Number(c.req.header('Content-Length') ?? 0);
+  if (!Number.isFinite(length) || length <= 0) {
+    return c.text('content-length is required', 400);
+  }
+  if (!c.req.raw.body) return c.text('missing body', 400);
+
+  // 以会话属主身份走正规覆盖写链路（容量、实体转正与手动上传一致）
+  const owner = await ctx.users.byIdWithGroup(session.uid);
+  if (!owner) return c.text('owner not found', 404);
+  const ownerCtx = new AppContextClass(ctx.env, ctx.settings, ctx.codec, ctx.jwt, owner);
+  try {
+    await new UploadService(ownerCtx, new FileSystemService(ownerCtx)).overwriteContent(
+      URI.parse(session.fileUri),
+      c.req.raw.body,
+      length,
+      'application/octet-stream',
+      { ignoreMaxEdit: true },
+    );
+    const fresh = await ctx.files.byId(file.id);
+    return new Response(null, {
+      status: 200,
+      headers: wopiVersionHeader(ctx, fresh ?? file),
+    });
+  } catch (e) {
+    return c.text((e as Error).message || 'failed to save', 500);
+  }
+});
+
+/** LOCK / UNLOCK / REFRESH_LOCK / GET_LOCK。锁状态存 KV，30 分钟自动过期。 */
+fileRoutes.post('/wopi/:id', async (c) => {
+  const ctx = ctxOf(c);
+  const found = await wopiSessionOf(ctx, c.req.param('id') ?? '', c.req.query('access_token'));
+  if (!found) return c.text('invalid access token', 401);
+  const { file } = found;
+
+  const override = c.req.header('X-WOPI-Override') ?? '';
+  const lockToken = c.req.header('X-WOPI-Lock') ?? '';
+  const lockKey = `wopi_lock:${file.id}`;
+  const version = wopiVersionHeader(ctx, file);
+
+  const locked = await ctx.env.KV.get(lockKey);
+  switch (override) {
+    case 'GET_LOCK':
+      return new Response(null, {
+        status: 200,
+        headers: { ...(locked ? { 'X-WOPI-Lock': locked } : {}), ...version },
+      });
+    case 'LOCK':
+    case 'REFRESH_LOCK': {
+      if (locked && locked !== lockToken) {
+        return new Response(null, {
+          status: 409,
+          headers: { 'X-WOPI-Lock': locked, 'X-WOPI-LockFailureReason': 'Locked by another session' },
+        });
+      }
+      await ctx.env.KV.put(lockKey, lockToken, { expirationTtl: 1800 });
+      return new Response(null, { status: 200, headers: version });
+    }
+    case 'UNLOCK': {
+      if (locked && locked !== lockToken) {
+        return new Response(null, {
+          status: 409,
+          headers: { 'X-WOPI-Lock': locked, 'X-WOPI-LockFailureReason': 'Locked by another session' },
+        });
+      }
+      await ctx.env.KV.delete(lockKey);
+      return new Response(null, { status: 200, headers: version });
+    }
+    default:
+      return new Response(null, {
+        status: 501,
+        headers: { 'X-WOPI-LockFailureReason': `Override "${override}" is not supported` },
+      });
+  }
+});
 
 fileRoutes.all('/archive/:sessionID/archive.zip', (c) =>
   fail(c, new AppError(CodeFeatureNotEnabled, 'Archive download is not implemented')),
 );
-
-for (const [path, message] of Object.entries(NOT_IMPLEMENTED)) {
-  fileRoutes.all(path, (c) => fail(c, new AppError(CodeFeatureNotEnabled, message)));
-}
 
 export { guard };

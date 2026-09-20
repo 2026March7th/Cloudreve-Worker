@@ -200,6 +200,24 @@ export class R2Driver implements StorageDriver {
     };
   }
 
+  /**
+   * R2 绑定原生支持分页列举（导入任务用）。`continuation` 对应 R2 的 cursor。
+   */
+  async list(
+    prefix: string,
+    options: { continuation?: string; afterKey?: string; limit?: number } = {},
+  ): Promise<{ keys: { key: string; size: number; lastModified: Date }[]; continuation: string | null }> {
+    const res = await this.bucket.list({
+      prefix: prefix || undefined,
+      cursor: options.continuation || undefined,
+      limit: Math.min(1000, Math.max(1, options.limit ?? 1000)),
+    });
+    const keys = res.objects
+      .map((o) => ({ key: o.key, size: o.size, lastModified: o.uploaded }))
+      .filter((k) => !options.afterKey || k.key > options.afterKey);
+    return { keys, continuation: res.truncated ? (res.cursor ?? null) : null };
+  }
+
   async meta(source: string): Promise<{ size: number } | null> {
     const head = await this.bucket.head(source);
     return head ? { size: head.size } : null;
