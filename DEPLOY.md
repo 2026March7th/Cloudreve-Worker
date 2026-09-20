@@ -447,7 +447,36 @@ CREATE SCHEMA public;
 
 ---
 
-## 12. 安全提醒
+## 12. 官方桌面客户端接入
+
+官方 [Cloudreve Desktop](https://www.cloudreve.org)（Windows 桌面端，MSIX 安装）用
+OAuth 2.0 授权码 + PKCE 登录，client_id 编译在客户端里。边缘版从 v4.14 起支持
+**未知客户端自动注册**：桌面端第一次发起登录时，带着它内置的 client_id 打开网页
+授权页，后端发现该 client_id 不在库里会自动登记（名字形如 `Client xxxxxxxx`，
+scope 放开常用全集，回调接受任意 URI —— 包括 `cloudreve://` 自定义协议），
+无需管理员预先建应用。
+
+使用步骤：
+
+1. 桌面端填入站点地址（就是 Worker 的地址），点登录 —— 浏览器弹出官方授权页。
+2. 登录并点「授权」，浏览器把授权码交回桌面端，完成。
+3. 管理后台 → OAuth 应用，可以看到自动登记的客户端，可改名、收紧 scope、
+   或直接停用。
+
+排错：
+
+| 现象 | 原因 |
+|---|---|
+| 「应用不存在 / no such application」 | 部署的版本低于本节所述功能，更新到最新 main |
+| 授权页打开但报 redirect 错误 | 手工建的应用必须把回调 URI 精确填进「重定向 URI」（每行一个）；自动登记的客户端无此限制 |
+| 授权成功但桌面端仍提示失败 | 确认 `SITE_URL` 与桌面端填的地址完全一致（含 https），否则 cookie 域对不上 |
+
+第三方应用（自己写的脚本、App）同理：把你的 client_id 随便编成一个 UUID 形态，
+直接走 `GET /session/authorize?...&client_id=<你的UUID>` 即可自动登记。
+
+---
+
+## 13. 安全提醒
 
 - `.dev.vars` 与 `wrangler secret` 里的东西**永远不要提交**。`.gitignore` 已经挡了
   `.dev.vars`，但别把它复制成别的文件名。

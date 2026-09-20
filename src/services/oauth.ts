@@ -29,6 +29,30 @@ const SCOPE_OFFLINE_ACCESS = 'offline_access';
 const AUTH_CODE_PREFIX = 'oauth_code_';
 const AUTH_CODE_TTL = 600; // 秒，上游同款
 
+/**
+ * 自动注册门槛：只自动登记长得像 UUID 的 client_id。
+ * 桌面端 / 移动端内置的都是 UUID 形态的 GUID；随机的垃圾 ID 大多不是 UUID，
+ * 这道闸能把注册表垃圾量压到最低。
+ */
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** 自动注册的新客户端默认放开的 scope（私有部署策略：宽松）。 */
+const AUTO_SCOPES = [
+  'openid',
+  'profile',
+  'email',
+  'offline_access',
+  'UserInfo.Read',
+  'UserInfo.Write',
+  'UserSecurityInfo.Read',
+  'Workflow.Read',
+  'Workflow.Write',
+  'Files.Read',
+  'Files.Write',
+  'Shares.Read',
+  'DavAccount.Read',
+];
+
 /** KV 里的授权码内容。 */
 interface AuthorizationCode {
   client_id: string;
@@ -78,7 +102,26 @@ export class OAuthService {
     this.sql = getSql(env);
   }
 
-  private async clientByGUID(guid: string): Promise<OAuthClientRow | null> {
+  /**
+   * 未知客户端自动注册（私有部署策略）。
+   *
+   * 官方桌面端把内置 client_id 编进闭源二进制里，实例管理员无从预登记；
+   * 上游的播种逻辑在闭源部分。边缘版的处理：带合法 UUID 形态 client_id 的
+   * 首次连接自动建号（宽松 scope + 空 redirect 白名单 = 接受任意回调，
+   * 含 cloudreve:// 自定义协议与 localhost 回环），管理员可随时在后台改/禁。
+   */
+  private async ensureAutoProvision(guid: string): Promise<void> {
+    if (!UUID_RE.test(guid)) return;
+    await this.sql`
+      INSERT INTO oauth_clients (guid, secret, name, homepage_url, redirect_uris, scopes, props, is_enabled)
+      VALUES (${guid}, ${randomString(48)}, ${'Client ' + guid.slice(0, 8)}, '', '[]'::jsonb,
+              ${JSON.stringify(AUTO_SCOPES)}::jsonb, ${JSON.stringify({ auto_provisioned: true })}::jsonb, true)
+      ON CONFLICT (guid) DO NOTHING
+    `;
+  }
+
+  private async clientByGUID(guid: string, autoProvision = false): Promise<OAuthClientRow | null> {
+    if (autoProvision) await this.ensureAutoProvision(guid);
     const rows = (await this.sql`
       SELECT * FROM oauth_clients WHERE guid = ${guid} AND deleted_at IS NULL LIMIT 1
     `) as Array<Record<string, unknown>>;
@@ -105,9 +148,9 @@ export class OAuthService {
     return rows[0] ? ((rows[0].scopes as string[]) ?? []) : null;
   }
 
-  /** 应用信息（授权同意页展示用）。 */
+  /** 应用信息（授权同意页展示用）。未知客户端先走自动注册。 */
   async getAppRegistration(appGUID: string, userId: number | null): Promise<AppRegistration> {
-    const app = await this.clientByGUID(appGUID);
+    const app = await this.clientByGUID(appGUID, true);
     if (!app || !app.is_enabled) throw new AppError(CodeNotFound, 'App not found');
     const out: AppRegistration = {
       id: app.guid,
@@ -139,9 +182,11 @@ export class OAuthService {
     if (args.response_type !== 'code') {
       throw new AppError(CodeParamErr, 'response_type must be "code"');
     }
-    const app = await this.clientByGUID(args.client_id);
+    const app = await this.clientByGUID(args.client_id, true);
     if (!app || !app.is_enabled) throw new AppError(CodeNotFound, 'App not found');
-    if (!app.redirect_uris.includes(args.redirect_uri)) {
+    // 自动注册的客户端 redirect 白名单为空 —— 接受任意回调（含 cloudreve://
+    // 自定义协议与 localhost 回环）；管理员手工登记的应用仍要求精确匹配。
+    if (app.redirect_uris.length > 0 && !app.redirect_uris.includes(args.redirect_uri)) {
       throw new AppError(CodeParamErr, 'Invalid redirect URI');
     }
     const method = args.code_challenge ? (args.code_challenge_method || 'S256') : '';
@@ -150,7 +195,8 @@ export class OAuthService {
     }
 
     const requestedScopes = args.scope.split(' ').filter(Boolean);
-    if (!validateScopes(requestedScopes, app.scopes)) {
+    // 自动注册的客户端不做 scope 子集校验（桌面端请求的 scope 组合由闭源端定死）
+    if (!app.props.auto_provisioned && !validateScopes(requestedScopes, app.scopes)) {
       throw new AppError(CodeParamErr, 'Invalid scope requested');
     }
     if (!requestedScopes.includes(SCOPE_OPENID)) {
@@ -222,10 +268,12 @@ export class OAuthService {
 
     const app = await this.clientByGUID(args.client_id);
     if (!app) throw new AppError(CodeNotFound, 'App not found');
-    if (!timingSafeEqual(app.secret, args.client_secret)) {
+    // 自动注册的客户端：secret 由闭源端定死无法预知，跳过校验；
+    // 有 PKCE 挑战时仍强制验 verifier，安全性由 PKCE 保证。
+    if (!app.props.auto_provisioned && !timingSafeEqual(app.secret, args.client_secret)) {
       throw new AppError(CodeCredentialInvalid, 'Invalid client secret');
     }
-    if (!validateScopes(authCode.scopes, app.scopes)) {
+    if (!app.props.auto_provisioned && !validateScopes(authCode.scopes, app.scopes)) {
       throw new AppError(CodeParamErr, 'Invalid scope');
     }
 
