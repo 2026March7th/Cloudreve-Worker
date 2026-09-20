@@ -24,6 +24,7 @@ import { ctxOf } from '../middleware/app';
 import { fail, ok } from '../lib/response';
 import { UserService } from '../services/user';
 import { PasskeyService } from '../services/passkey';
+import { OAuthService } from '../services/oauth';
 import { ShareService } from '../services/share';
 import { FileSystemService } from '../services/fs';
 import { AppError, CodeEmailSent, CodeNotFullySuccess, Err } from '../lib/errors';
@@ -151,7 +152,7 @@ userRoutes.get('/setting', async (c) => {
         settings.upload_policy_id != null
           ? ctx.codec.encodePolicyID(Number(settings.upload_policy_id))
           : '',
-      oauth_grants: [],
+      oauth_grants: await new OAuthService(ctx, c.env).listGrants(ctx.user.id),
     });
 });
 

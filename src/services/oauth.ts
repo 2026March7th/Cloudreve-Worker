@@ -332,6 +332,35 @@ export class OAuthService {
   }
 
   /**
+   * 当前用户已授权的应用列表（GET /user/setting 的 oauth_grants）。
+   * 形状对齐上游 BuildOauthGrant（service/user/response.go:189）。
+   */
+  async listGrants(
+    userId: number,
+  ): Promise<
+    Array<{ client_id: string; client_name: string; client_logo: string; scopes: string[]; last_used_at: string | null }>
+  > {
+    const rows = (await this.sql`
+      SELECT c.guid, c.name, c.props, g.scopes, g.last_used_at
+      FROM oauth_grants g
+      JOIN oauth_clients c ON c.id = g.client_id
+      WHERE g.user_id = ${userId} AND g.deleted_at IS NULL AND c.deleted_at IS NULL
+      ORDER BY g.last_used_at DESC NULLS LAST, g.created_at DESC
+    `) as Array<Record<string, unknown>>;
+    return rows.map((r) => {
+      const props = (r.props as Record<string, unknown>) ?? {};
+      const lastUsed = r.last_used_at ?? null;
+      return {
+        client_id: String(r.guid ?? ''),
+        client_name: String(r.name ?? ''),
+        client_logo: typeof props.icon === 'string' ? props.icon : '',
+        scopes: (r.scopes as string[]) ?? [],
+        last_used_at: lastUsed instanceof Date ? lastUsed.toISOString() : (lastUsed as string | null),
+      };
+    });
+  }
+
+  /**
    * OIDC userinfo。scopes 来自 token claims（appContext 中间件已解析）；
    * 内置登录 token 无 scopes 时视为全量放行（上游同款）。
    */
