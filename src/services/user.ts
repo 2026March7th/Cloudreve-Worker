@@ -606,6 +606,25 @@ export class UserService {
     if (patch.share_links_in_profile !== undefined) {
       settings.share_links_in_profile = patch.share_links_in_profile;
     }
+    // 上传策略偏好（自建多策略功能）：hashid 字符串（前端 PolicySwitcher）或
+    // 数字均可；空串 = 清除偏好回落组默认。非法 hashid 显式报 40001（不再
+    // 静默吞掉），越权/不存在的策略由 assertPolicyAllowed 抛 40035。
+    if (patch.upload_policy_id !== undefined) {
+      const raw = patch.upload_policy_id;
+      if (raw === null || raw === '') {
+        delete settings.upload_policy_id;
+      } else {
+        const pid =
+          typeof raw === 'number' && Number.isFinite(raw)
+            ? raw
+            : this.ctx.codec.decodePolicyID(String(raw));
+        if (pid === null || !Number.isFinite(Number(pid))) {
+          throw Err.param('Invalid upload_policy_id');
+        }
+        await this.ctx.assertPolicyAllowed(Number(pid));
+        settings.upload_policy_id = Number(pid);
+      }
+    }
     await this.ctx.users.updateSettings(user.id, settings as Record<string, unknown>);
 
     const updated = await this.ctx.users.byId(user.id);
