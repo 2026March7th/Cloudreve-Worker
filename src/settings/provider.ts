@@ -14,6 +14,19 @@ import { randomString } from '../lib/crypto';
 const KV_CACHE_KEY = 'settings:all:v1';
 const KV_CACHE_TTL = 60;
 
+/**
+ * 归一化外部服务的 base URL（Meilisearch / Tika endpoint）。
+ * 管理员常直接粘贴 `ms-xxx.meilisearch.io` 这种不带协议的主机名，
+ * 直接拼路径 fetch 会得到 "Invalid URL"。这里统一补 `https://`、
+ * 去首尾空白与尾部斜杠。带协议的输入原样保留（http 也不强制升 https，
+ * 内网自建服务可能是 http）。
+ */
+function normalizeHttpBase(raw: string): string {
+  let v = raw.trim().replace(/\/+$/, '');
+  if (v && !/^[a-z][a-z0-9+.-]*:\/\//i.test(v)) v = `https://${v}`;
+  return v;
+}
+
 /** 全文检索配置。字段名与官方前端面板提交的键名一致。 */
 export interface FtsConfig {
   enabled: boolean;
@@ -144,12 +157,12 @@ export class SettingsProvider {
       enabled: this.getBool('fts_enabled', false),
       indexType: this.get('fts_index_type', 'meilisearch'),
       extractorType: this.get('fts_extractor_type', 'tika'),
-      meiliEndpoint: this.get('fts_meilisearch_endpoint', '').replace(/\/+$/, ''),
+      meiliEndpoint: normalizeHttpBase(this.get('fts_meilisearch_endpoint')),
       meiliApiKey: this.get('fts_meilisearch_api_key', ''),
       meiliPageSize: this.getInt('fts_meilisearch_page_size', 5),
       meiliEmbedEnabled: this.getBool('fts_meilisearch_embed_enabled', false),
       meiliEmbedConfig: this.get('fts_meilisearch_embed_config', '{}'),
-      tikaEndpoint: this.get('fts_tika_endpoint', '').replace(/\/+$/, ''),
+      tikaEndpoint: normalizeHttpBase(this.get('fts_tika_endpoint')),
       tikaExts: this
         .get('fts_tika_exts', '')
         .split(',')
