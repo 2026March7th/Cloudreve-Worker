@@ -24,6 +24,8 @@ import { fail, ok } from './lib/response';
 import { AppError, CodeNotFound, describeError } from './lib/errors';
 import { ensureSettings, loadSettings } from './settings/provider';
 import { provision } from './db/provision';
+import { resolveDb } from './db/shard';
+import { kvFor } from './lib/kvRouter';
 import { ensureEnvAdmin } from './services/envAdmin';
 import { HashIDCodec } from './lib/hashid';
 import { JWTService } from './lib/jwt';
@@ -104,9 +106,9 @@ app.use('*', async (c, next) => {
   // 见 `bootstrapConfirmed` 的注释。
   if (!bootstrapConfirmed) {
     try {
-      const bootstrapped = await c.env.KV.get(BOOTSTRAP_FLAG);
+      const bootstrapped = await kvFor(c.env, 'flag').get(BOOTSTRAP_FLAG);
       if (!bootstrapped) {
-        if (await c.env.KV.get(BOOTSTRAP_COOLDOWN)) {
+        if (await kvFor(c.env, 'flag').get(BOOTSTRAP_COOLDOWN)) {
           return c.json(
             { code: 50006, msg: '站点正在初始化（刚部署或数据库暂时不可用），请几秒后刷新重试' },
             503,
@@ -114,13 +116,14 @@ app.use('*', async (c, next) => {
         }
         if (!bootstrapPromise) {
           bootstrapPromise = (async () => {
-            await provision(c.env);
-            await ensureSettings(c.env);
-            await c.env.KV.put(BOOTSTRAP_FLAG, '1');
+            const db = resolveDb(c.env);
+            await provision(c.env, db);
+            await ensureSettings(c.env, db);
+            await kvFor(c.env, 'flag').put(BOOTSTRAP_FLAG, '1');
           })().catch(async (err) => {
             bootstrapPromise = null;
             try {
-              await c.env.KV.put(BOOTSTRAP_COOLDOWN, '1', { expirationTtl: 20 });
+              await kvFor(c.env, 'flag').put(BOOTSTRAP_COOLDOWN, '1', { expirationTtl: 20 });
             } catch {
               /* KV 也不可用时只能让下一个请求再试 */
             }
@@ -404,7 +407,7 @@ export default {
     // 自举没完成（刚部署、还没人访问过）时 settings 表可能还不存在，
     // 定时任务直接跳过 —— 第一次网页请求会完成自举。
     try {
-      if (!(await env.KV.get(BOOTSTRAP_FLAG))) {
+      if (!(await kvFor(env, 'flag').get(BOOTSTRAP_FLAG))) {
         console.log('trash collector: skipped (bootstrap not finished yet)');
         return;
       }

@@ -4,8 +4,40 @@
 
 export interface Env {
   // --- 机密（wrangler secret put） ---
-  /** Neon 连接串，形如 postgresql://user:pass@ep-xxx.aws.neon.tech/cloudreve?sslmode=require */
+  /**
+   * 主库连接串，形如 postgresql://user:pass@ep-xxx.aws.neon.tech/cloudreve?sslmode=require
+   *
+   * 多库模式下它仍是**唯一可写的主库**。其余连接串放 `DATABASE_URL_2..5`。
+   */
   DATABASE_URL: string;
+  /**
+   * 备库连接串（可选，你自己在 Neon 建好后填）。取值形如
+   * `postgresql://...:...@ep-yyy.aws.neon.tech/cloudreve?sslmode=require`。
+   *
+   * 语义见 `db/replicate.ts`：
+   *   - 请求**只打主库**，备库绝不承接业务流量；
+   *   - 「每次构建全量同步」= CI 里的 `npm run db:sync` 逐表
+   *     `COPY TO/FROM STDOUT`，把主库整库灌进全部备库；
+   *   - 主库不可用时（可用 `DB_FAILOVER=1` 打开）自动切到第一个能连上的备库。
+   *
+   * ⚠️ **不要**把备库配成可写并同时打开故障切换：切换期间写到备库的数据
+   * 会在下次全量同步时被主库内容覆盖掉。备库是**冷备**，不是双活。
+   */
+  DATABASE_URL_2?: string;
+  DATABASE_URL_3?: string;
+  DATABASE_URL_4?: string;
+  DATABASE_URL_5?: string;
+  /**
+   * 故障切换闸门：`1` / `true` 时，主库连不上会自动降级到第一个可用的
+   * 备库（只读语义，仍然允许写 —— 否则站点直接不可用；风险见上）。
+   * 缺省关闭：默认行为是「主库挂了就报错」，不做隐式切换。
+   */
+  DB_FAILOVER?: string;
+  /**
+   * 全量同步时是否跳过这些表（逗号分隔）。缺省用 `replicate.ts` 的内置
+   * 默认值。一般不需要配。
+   */
+  DB_SYNC_SKIP?: string;
   /**
    * JWT 签名密钥。留空时回退到数据库 settings 表里的 `secret_key`。
    * 生产环境建议显式设置，避免依赖数据库可读性。
@@ -47,8 +79,19 @@ export interface Env {
   ADMIN_PASSWORD?: string;
 
   // --- 绑定 ---
-  /** KV：会话吊销名单、上传会话状态、验证码、实体 URL 缓存、OneDrive token 缓存 */
+  /**
+   * KV：会话吊销名单、上传会话状态、验证码、实体 URL 缓存、OneDrive token 缓存。
+   *
+   * 多 KV 模式下它仍然是**兜底绑定**：`lib/kvRouter.ts` 按角色优先取
+   * `KV_1..KV_5`，拿不到就回落到这里。所以 N=1 的部署只需这一个绑定。
+   */
   KV: KVNamespace;
+  /** 分角色 KV（可选，由 wrangler.toml 的 [[kv_namespaces]] 声明，KV_COUNT 控制数量）。 */
+  KV_1?: KVNamespace;
+  KV_2?: KVNamespace;
+  KV_3?: KVNamespace;
+  KV_4?: KVNamespace;
+  KV_5?: KVNamespace;
   /** R2：内置对象存储后端 */
   R2: R2Bucket;
   /**

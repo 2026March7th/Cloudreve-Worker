@@ -34,6 +34,7 @@ import { hashUserState, RevokeTokenPrefix, type Claims } from '../lib/jwt';
 import { randomString } from '../lib/crypto';
 import { generateTotpSecret, validateTotp } from '../lib/totp';
 import { MailService } from './mail';
+import { kvFor } from '../lib/kvRouter';
 
 /**
  * 两步验证会话的有效期（秒）。
@@ -197,7 +198,7 @@ export class UserService {
     // 对应上游 `service/user/login.go:146-150`：KV `user_2fa_{uuid}` -> 用户 ID。
     if (user.two_factor_secret) {
       const sessionId = crypto.randomUUID();
-      await this.ctx.env.KV.put(`user_2fa_${sessionId}`, String(user.id), {
+      await kvFor(this.ctx.env, 'session').put(`user_2fa_${sessionId}`, String(user.id), {
         expirationTtl: TWO_FA_SESSION_TTL,
       });
       return { two_fa_session_id: sessionId };
@@ -228,7 +229,7 @@ export class UserService {
   async init2FA(): Promise<string> {
     const user = this.ctx.requireUser();
     const secret = generateTotpSecret();
-    await this.ctx.env.KV.put(`2fa_init_${user.id}`, secret, {
+    await kvFor(this.ctx.env, 'session').put(`2fa_init_${user.id}`, secret, {
       expirationTtl: TWO_FA_SESSION_TTL,
     });
     return secret;
@@ -241,7 +242,7 @@ export class UserService {
    * 验证码输错不消耗会话（会话还在，可以重试）。
    */
   async login2FA(otp: string, sessionId: string): Promise<LoginResult> {
-    const raw = await this.ctx.env.KV.get(`user_2fa_${sessionId}`);
+    const raw = await kvFor(this.ctx.env, 'session').get(`user_2fa_${sessionId}`);
     if (!raw) throw new AppError(CodeNotFound, 'Session not found');
 
     const uid = Number(raw);
@@ -255,7 +256,7 @@ export class UserService {
       throw new AppError(Code2FACodeErr, 'Incorrect 2FA code');
     }
 
-    await this.ctx.env.KV.delete(`user_2fa_${sessionId}`);
+    await kvFor(this.ctx.env, 'session').delete(`user_2fa_${sessionId}`);
 
     return this.completeLogin(user);
   }
@@ -319,7 +320,7 @@ export class UserService {
 
     // 会话被吊销
     if (!claims.root_token_id) throw new AppError(40020, 'Invalid refresh token');
-    const revoked = await this.ctx.env.KV.get(`${RevokeTokenPrefix}${claims.root_token_id}`);
+    const revoked = await kvFor(this.ctx.env, 'session').get(`${RevokeTokenPrefix}${claims.root_token_id}`);
     if (revoked) throw new AppError(40020, 'Invalid refresh token');
 
     return this.issueToken(user, claims.root_token_id);
@@ -333,7 +334,7 @@ export class UserService {
     // TTL 覆盖 refresh token 的剩余有效期即可
     const now = Math.floor(Date.now() / 1000);
     const ttl = Math.max(60, (claims.exp ?? now + 3600) - now);
-    await this.ctx.env.KV.put(`${RevokeTokenPrefix}${claims.root_token_id}`, '1', {
+    await kvFor(this.ctx.env, 'session').put(`${RevokeTokenPrefix}${claims.root_token_id}`, '1', {
       expirationTtl: ttl,
     });
   }
@@ -539,7 +540,7 @@ export class UserService {
     }
 
     const secret = randomString(32);
-    await this.ctx.env.KV.put(`${UserResetPrefix}${user.id}`, secret, {
+    await kvFor(this.ctx.env, 'session').put(`${UserResetPrefix}${user.id}`, secret, {
       expirationTtl: RESET_TTL_SECONDS,
     });
 
@@ -556,13 +557,13 @@ export class UserService {
     const uid = this.ctx.codec.decodeUserID(userHashId);
     if (uid === null) throw new AppError(CodeTempLinkExpired, 'Link is expired');
 
-    const stored = await this.ctx.env.KV.get(`${UserResetPrefix}${uid}`);
+    const stored = await kvFor(this.ctx.env, 'session').get(`${UserResetPrefix}${uid}`);
     if (!stored || stored !== secret) {
       throw new AppError(CodeTempLinkExpired, 'Link is expired');
     }
 
     // 一次性令牌：校验通过立刻销毁，重放无效
-    await this.ctx.env.KV.delete(`${UserResetPrefix}${uid}`);
+    await kvFor(this.ctx.env, 'session').delete(`${UserResetPrefix}${uid}`);
 
     // 对应上游 `GetActiveByID`：只有正常状态的账号能重置
     const user = await this.ctx.users.byId(uid);
@@ -586,7 +587,7 @@ export class UserService {
     const user = await this.ctx.users.byEmail(email.trim().toLowerCase());
     if (!user) throw Err.userNotFound();
     const secret = randomString(32);
-    await this.ctx.env.KV.put(`${UserResetPrefix}${user.id}`, secret, {
+    await kvFor(this.ctx.env, 'session').put(`${UserResetPrefix}${user.id}`, secret, {
       expirationTtl: RESET_TTL_SECONDS,
     });
     return { url: this.buildResetUrl(user, secret), expiresIn: RESET_TTL_SECONDS };
@@ -635,7 +636,7 @@ export class UserService {
     if (patch.two_fa_enabled !== undefined) {
       const code = patch.two_fa_code ?? '';
       if (patch.two_fa_enabled) {
-        const pending = await this.ctx.env.KV.get(`2fa_init_${user.id}`);
+        const pending = await kvFor(this.ctx.env, 'session').get(`2fa_init_${user.id}`);
         if (!pending) {
           throw new AppError(CodeInternalSetting, 'You have not initiated 2FA session');
         }
@@ -643,7 +644,7 @@ export class UserService {
           throw new AppError(Code2FACodeErr, 'Incorrect 2FA code');
         }
         await this.ctx.users.setTwoFactorSecret(user.id, pending);
-        await this.ctx.env.KV.delete(`2fa_init_${user.id}`);
+        await kvFor(this.ctx.env, 'session').delete(`2fa_init_${user.id}`);
         logAudit(this.ctx, 'enable_2fa', user.id);
       } else {
         if (!user.two_factor_secret || !(await validateTotp(code, user.two_factor_secret))) {

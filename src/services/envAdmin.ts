@@ -19,6 +19,8 @@
 import type { Env } from '../env';
 import { digestPassword } from '../lib/crypto';
 import { FileRepo, UserRepo } from '../db/repo';
+import { kvFor } from '../lib/kvRouter';
+import { resolveDb, type DbHandle } from '../db/shard';
 
 const MARKER_KEY = 'bootstrap:env-admin:v1';
 
@@ -30,7 +32,7 @@ function toHex(buf: ArrayBuffer): string {
 }
 
 /** 检查并应用环境变量里的管理员配置。未配置时直接返回。 */
-export async function ensureEnvAdmin(env: Env): Promise<void> {
+export async function ensureEnvAdmin(env: Env, db: DbHandle = resolveDb(env)): Promise<void> {
   const email = env.ADMIN_EMAIL?.trim().toLowerCase();
   const password = env.ADMIN_PASSWORD;
   if (!email || !password) return;
@@ -39,9 +41,9 @@ export async function ensureEnvAdmin(env: Env): Promise<void> {
   const marker = toHex(
     await crypto.subtle.digest('SHA-256', new TextEncoder().encode(`${email}:${digest}`)),
   );
-  if ((await env.KV.get(MARKER_KEY)) === marker) return;
+  if ((await kvFor(env, 'flag').get(MARKER_KEY)) === marker) return;
 
-  const users = new UserRepo(env);
+  const users = new UserRepo(db.sql);
   const existing = await users.byEmailWithGroup(email);
   if (existing) {
     await users.updatePassword(existing.id, digest);
@@ -55,7 +57,7 @@ export async function ensureEnvAdmin(env: Env): Promise<void> {
       groupId: 1,
       status: 'active',
     });
-    await new FileRepo(env).ensureRoot(user.id);
+    await new FileRepo(db.sql).ensureRoot(user.id);
   }
-  await env.KV.put(MARKER_KEY, marker);
+  await kvFor(env, 'flag').put(MARKER_KEY, marker);
 }

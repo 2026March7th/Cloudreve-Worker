@@ -29,10 +29,6 @@ fallthrough = true
 #   - 本机手工 `npx wrangler deploy`：才需要先 `wrangler kv namespace create KV`
 #     把返回的 id 换到这里。
 # ---------------------------------------------------------------------------
-[[kv_namespaces]]
-binding = "KV"
-id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
-preview_id = "REPLACE_WITH_YOUR_KV_PREVIEW_ID"
 
 [[r2_buckets]]
 binding = "R2"
@@ -60,6 +56,26 @@ bucket_name = "cloudreve-worker"
 # 想把前端单独部署到别处（Pages 等），不删 frontend/ 也行，
 # 配 FRONTEND_URL 后反代优先于 [assets]。
 # ---------------------------------------------------------------------------
+
+# >>> multi-kv:begin
+# 本区由 scripts/setup-kv.mjs 自动生成，请勿手改。
+# KV_COUNT = 1（上限 5，超过则拒绝构建）
+# 角色分工见 src/lib/kvRouter.ts：
+#   KV_1=site(站点设置缓存) KV_2=session(会话/验证码/2FA)
+#   KV_3=upload(上传/打包/WebDAV锁) KV_4=cred(外部凭据缓存)
+#   KV_5=flag(自举标记)    KV=兜底（未配置 KV_n 时所有角色回落到它）
+
+[[kv_namespaces]]
+binding = "KV_1"
+id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID_1"
+preview_id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID_PREVIEW_1"
+
+[[kv_namespaces]]
+binding = "KV"
+id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
+preview_id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID_PREVIEW"
+# <<< multi-kv:end
+
 [assets]
 directory = "./frontend"
 binding = "ASSETS"

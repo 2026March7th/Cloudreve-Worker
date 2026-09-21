@@ -5,3 +5,11 @@
 # 获取方式：https://neon.tech 注册 → 新建项目 → Dashboard 首页复制
 # "Connection string"（形如 postgresql://user:pass@ep-xxx.aws.neon.tech/neondb?sslmode=require）
 DATABASE_URL=
+
+# 可选：备库连接串，填了之后每次构建会把主库整库全量同步过来（只读冷备）。
+# 最多再加到 DATABASE_URL_5。主库连不上时可临时用 DB_FAILOVER=1 切过去。
+# DATABASE_URL_2=
+
+# 可选：KV namespace 个数，取值 1–5，默认 1。每个承担一个固定角色来分摊
+# 并发压力（站点缓存 / 会话 / 上传 / 凭据 / 自举标记）。超过 5 会拒绝构建。
+# KV_COUNT=1

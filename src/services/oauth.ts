@@ -19,6 +19,7 @@ import { validateScopes } from '../lib/jwt';
 import { randomString, timingSafeEqual } from '../lib/crypto';
 import { AppContext } from './context';
 import type { UserRow, UserWithGroup } from '../db/types';
+import { kvFor } from '../lib/kvRouter';
 
 // 上游 inventory/types 的 scope 常量
 const SCOPE_OPENID = 'openid';
@@ -226,7 +227,7 @@ export class OAuthService {
       redirect_uri: args.redirect_uri,
       code_challenge: args.code_challenge ?? '',
     };
-    await this.ctx.env.KV.put(`${AUTH_CODE_PREFIX}${code}`, JSON.stringify(authCode), {
+    await kvFor(this.ctx.env, 'session').put(`${AUTH_CODE_PREFIX}${code}`, JSON.stringify(authCode), {
       expirationTtl: AUTH_CODE_TTL,
     });
 
@@ -245,9 +246,9 @@ export class OAuthService {
       throw new AppError(CodeParamErr, 'grant_type must be authorization_code');
     }
 
-    const raw = await this.ctx.env.KV.get(`${AUTH_CODE_PREFIX}${args.code}`);
+    const raw = await kvFor(this.ctx.env, 'session').get(`${AUTH_CODE_PREFIX}${args.code}`);
     if (!raw) throw new AppError(CodeCredentialInvalid, 'Invalid or expired authorization code');
-    await this.ctx.env.KV.delete(`${AUTH_CODE_PREFIX}${args.code}`);
+    await kvFor(this.ctx.env, 'session').delete(`${AUTH_CODE_PREFIX}${args.code}`);
     const authCode = JSON.parse(raw) as AuthorizationCode;
 
     if (authCode.client_id !== args.client_id) {

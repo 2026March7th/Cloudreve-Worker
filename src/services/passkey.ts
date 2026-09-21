@@ -18,6 +18,7 @@
  *     注册时已强制 residentKey: required，与上游一致。
  */
 import type { Env } from '../env';
+import { kvFor } from '../lib/kvRouter';
 import type { HashIDCodec } from '../lib/hashid';
 import { AppError, CodeInternalSetting, CodeNotFound, CodeParamErr, CodeWebAuthnCredentialError } from '../lib/errors';
 import {
@@ -103,13 +104,13 @@ export class PasskeyService {
   }
 
   private async putSession(key: string, session: AuthnSession): Promise<void> {
-    await this.env.KV.put(key, JSON.stringify(session), { expirationTtl: SESSION_TTL });
+    await kvFor(this.env, 'session').put(key, JSON.stringify(session), { expirationTtl: SESSION_TTL });
   }
 
   private async takeSession(key: string): Promise<AuthnSession | null> {
-    const raw = await this.env.KV.get(key);
+    const raw = await kvFor(this.env, 'session').get(key);
     if (!raw) return null;
-    await this.env.KV.delete(key);
+    await kvFor(this.env, 'session').delete(key);
     return JSON.parse(raw) as AuthnSession;
   }
 

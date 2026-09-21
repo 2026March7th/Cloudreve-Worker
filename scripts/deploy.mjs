@@ -3,13 +3,15 @@
  * 一条命令完成部署（CI 友好，专为 Cloudflare Workers Builds 这类
  * 「构建命令 + 部署命令」两格配置的场景设计）：
  *
- *   1. KV namespace 不存在就自动创建，并把真实 ID 回填进 wrangler.toml
- *      （替换 REPLACE_WITH_YOUR_KV_* 占位符）。
+ *   1. 按 `KV_COUNT` 装配 KV 绑定（scripts/setup-kv.mjs）。>5 直接拒绝构建。
+ *      然后逐个 namespace「不存在就创建」，把真实 ID 回填进 wrangler.toml。
  *   2. R2 bucket 不存在就自动创建。
- *   3. `wrangler deploy` 发布；若 CI 环境变量里给了 SITE_URL / FRONTEND_URL，
+ *   3. 准备官方前端（缺了自动拉源码构建）。
+ *   4. `wrangler deploy` 发布；若 CI 环境变量里给了 SITE_URL / FRONTEND_URL，
  *      用 --var 覆盖 wrangler.toml 里的空值，无需改文件。
- *   4. 若 CI 环境变量里给了 DATABASE_URL，部署成功后自动 `wrangler secret put`
+ *   5. 若 CI 环境变量里给了 DATABASE_URL，部署成功后自动 `wrangler secret put`
  *      写进 Worker 运行时，面板里连 Secret 都不用手动加。
+ *      多库容灾的备库连接串（DATABASE_URL_2..5）同样在这里写入。
  *
  * 认证：Cloudflare Workers Builds 会自动注入 API token，本机手工跑则需要
  * 先 `npx wrangler login`。任何一步失败都会带出真实报错并以非零码退出，
@@ -25,8 +27,8 @@ const TOML_PATH = path.join(ROOT, 'wrangler.toml');
 const WORKER_NAME = 'cloudreve-worker';
 const R2_BUCKET = 'cloudreve-worker';
 
-const KV_ID_PLACEHOLDER = 'REPLACE_WITH_YOUR_KV_NAMESPACE_ID';
-const KV_PREVIEW_PLACEHOLDER = 'REPLACE_WITH_YOUR_KV_PREVIEW_ID';
+/** 占位符前缀：setup-kv.mjs 写进 wrangler.toml 的待填 ID 都含这段。 */
+const KV_PLACEHOLDER_MARK = 'REPLACE_WITH_YOUR_KV';
 
 function run(cmd, args, { input } = {}) {
   const r = spawnSync(cmd, args, {
@@ -78,87 +80,112 @@ function extractJsonArray(text) {
   return null;
 }
 
-console.log('▶ 1/4 检查 KV namespace…');
+console.log('▶ 1/5 检查 KV namespace…');
+
+// 先按 KV_COUNT 装配绑定（超过 5 直接拒绝构建，见该脚本的说明）。
+runOrDie(
+  process.execPath,
+  [path.join(ROOT, 'scripts', 'setup-kv.mjs')],
+  '装配 KV 绑定（setup-kv.mjs）',
+);
 
 let toml = readFileSync(TOML_PATH, 'utf8');
-const needProvision =
-  toml.includes(KV_ID_PLACEHOLDER) || toml.includes(KV_PREVIEW_PLACEHOLDER);
 
-if (!needProvision) {
+/**
+ * 找出 toml 里所有待填的 KV 绑定：`binding = "KV"` / `KV_1` / `KV_2` ...
+ *
+ * 每个绑定要独立创建一个 namespace（不能再像以前那样只处理一个 KV）。
+ * 用行首锚定的正则逐块匹配，拿到的顺序就是文件里的顺序。
+ */
+function kvBindingsIn(text) {
+  const out = [];
+  const re = /\[\[kv_namespaces\]\]\r?\nbinding = "(KV(?:_\d+)?)"\r?\nid = "([^"]*)"\r?\npreview_id = "([^"]*)"/g;
+  for (const m of text.matchAll(re)) {
+    out.push({ binding: m[1], id: m[2], previewId: m[3] });
+  }
+  return out;
+}
+
+const bindingsNeedingWork = kvBindingsIn(toml).filter(
+  (b) => b.id.includes('REPLACE_WITH_YOUR_KV') || b.previewId.includes('REPLACE_WITH_YOUR_KV'),
+);
+
+if (bindingsNeedingWork.length === 0) {
   console.log(`  wrangler.toml 已含真实 KV ID，跳过开通。`);
 } else {
-  // 列出现有 namespace，找标题形如 <worker名>-KV 的；
-  // 兼容旧版本 wrangler / 手动创建留下的裸标题 "KV"。
-  const list = run(NPX, npxArgs(['kv', 'namespace', 'list']));
-  let nsId = null;
-  if (list.code === 0) {
-    const arr = extractJsonArray(list.stdout);
-    const hit = Array.isArray(arr)
-      ? arr.find(
-          (n) =>
-            typeof n?.title === 'string' &&
-            (n.title === `${WORKER_NAME}-KV` || n.title === 'KV'),
-        )
-      : null;
-    if (hit?.id) nsId = hit.id;
-  }
+  console.log(`  待开通 ${bindingsNeedingWork.length} 个：${bindingsNeedingWork.map((b) => b.binding).join(', ')}`);
 
-  if (!nsId) {
-    console.log(`  未找到 ${WORKER_NAME}-KV，创建…`);
-    const created = run(NPX, npxArgs(['kv', 'namespace', 'create', 'KV']));
-    if (created.code !== 0) {
-      // 撞名（already exists）时回落为复用列表里已有的那个
-      if (/already exists|10013/i.test(created.all)) {
+  // 一次性列出全部 namespace，避免每个绑定都打一次 CLI。
+  const list = run(NPX, npxArgs(['kv', 'namespace', 'list']));
+  const existing = list.code === 0 ? extractJsonArray(list.stdout) : null;
+  const allNs = Array.isArray(existing) ? existing : [];
+
+  /** 按标题找 namespace：优先 `<worker>-<binding>`，兼容裸标题 / 无 worker 前缀。 */
+  const findByTitle = (binding) =>
+    allNs.find(
+      (n) =>
+        typeof n?.title === 'string' &&
+        (n.title === `${WORKER_NAME}-${binding}` ||
+          n.title === binding ||
+          n.title === `${WORKER_NAME}-KV-${binding.replace(/^KV_?/, '')}`),
+    );
+
+  for (const b of bindingsNeedingWork) {
+    let nsId = findByTitle(b.binding)?.id ?? null;
+
+    if (!nsId) {
+      console.log(`  未找到 ${WORKER_NAME}-${b.binding}，创建…`);
+      const created = run(NPX, npxArgs(['kv', 'namespace', 'create', b.binding]));
+      if (created.code === 0) {
+        const m = created.all.match(/id\s*=\s*"([0-9a-f]{32})"/i);
+        if (!m) {
+          console.error(`\n✘ 无法从 wrangler 输出解析 ${b.binding} 的 ID：\n${created.all}`);
+          process.exit(1);
+        }
+        nsId = m[1];
+      } else if (/already exists|10013/i.test(created.all)) {
+        // 撞名：回列表里找一遍再复用
         const relist = run(NPX, npxArgs(['kv', 'namespace', 'list']));
-        const arr =
-          relist.code === 0 ? extractJsonArray(relist.stdout) : null;
+        const arr = relist.code === 0 ? extractJsonArray(relist.stdout) : null;
         const hit = Array.isArray(arr)
           ? arr.find(
               (n) =>
                 typeof n?.title === 'string' &&
-                (n.title === `${WORKER_NAME}-KV` || n.title === 'KV'),
+                (n.title === `${WORKER_NAME}-${b.binding}` ||
+                  n.title === b.binding ||
+                  n.title === `${WORKER_NAME}-KV-${b.binding.replace(/^KV_?/, '')}`),
             )
           : null;
         if (!hit?.id) {
-          console.error(
-            `\n✘ 创建 KV namespace 失败且未能复用已有的：\n${created.all}`,
-          );
+          console.error(`\n✘ ${b.binding} 已存在但列表中找不到：\n${created.all}`);
           process.exit(created.code || 1);
         }
         console.log(`  已存在同名 namespace（${hit.id}），复用。`);
         nsId = hit.id;
       } else {
-        console.error(
-          `\n✘ 创建 KV namespace 失败（exit ${created.code}）：\n${created.all}`,
-        );
+        console.error(`\n✘ 创建 KV namespace ${b.binding} 失败（exit ${created.code}）：\n${created.all}`);
         process.exit(created.code || 1);
       }
     } else {
-      const m = created.all.match(/id\s*=\s*"([0-9a-f]{32})"/i);
-      if (!m) {
-        console.error(`\n✘ 无法从 wrangler 输出中解析新 namespace 的 ID：\n${created.all}`);
-        process.exit(1);
-      }
-      nsId = m[1];
+      console.log(`  ${b.binding} 已存在（${nsId}），直接复用。`);
     }
-  } else {
-    console.log(`  已存在（${nsId}），直接复用。`);
+
+    // 精确替换**这一个**绑定的 id / preview_id（按 binding 名定位，不用全局替换，
+    // 否则多个绑定的占位符会互相覆盖）。
+    const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    toml = toml.replace(
+      new RegExp(
+        `(\\[\\[kv_namespaces\\]\\]\\r?\\nbinding = "${esc(b.binding)}"\\r?\\nid = ")[^"]*("\\r?\\npreview_id = ")[^"]*(")`,
+      ),
+      `$1${nsId}$2${nsId}$3`,
+    );
   }
 
-  toml = toml
-    .replace(
-      new RegExp(`id\\s*=\\s*"${KV_ID_PLACEHOLDER}"`),
-      `id = "${nsId}"`,
-    )
-    .replace(
-      new RegExp(`preview_id\\s*=\\s*"${KV_PREVIEW_PLACEHOLDER}"`),
-      `preview_id = "${nsId}"`,
-    );
   writeFileSync(TOML_PATH, toml);
-  console.log(`  已把 KV ID 回填进 wrangler.toml。`);
+  console.log('  已把 KV ID 回填进 wrangler.toml。');
 }
 
-console.log('▶ 2/4 检查 R2 bucket…');
+console.log('▶ 2/5 检查 R2 bucket…');
 {
   const list = run(NPX, npxArgs(['r2', 'bucket', 'list']));
   let exists = false;
@@ -193,16 +220,34 @@ console.log('▶ 4/5 发布 Worker…');
   console.log(deployed.stdout.trimEnd());
 }
 
-if (process.env.DATABASE_URL) {
-  console.log('▶ 5/5 把 DATABASE_URL 写入 Worker Secret…');
-  // secret put 非交互时从 stdin 读值；失败不阻断（也许面板里已手动设过）
-  const r = run(NPX, npxArgs(['secret', 'put', 'DATABASE_URL']), {
-    input: `${process.env.DATABASE_URL}\n`,
-  });
-  console.log(r.code === 0 ? '  已写入。' : `  写入失败（可忽略，若面板里已设置）：\n${r.all}`);
-} else {
-  console.log('▶ 5/5 跳过 Secret（CI 环境变量里没有 DATABASE_URL）。');
-  console.log('  记得到 Cloudflare 面板 → 该 Worker → 设置 → 变量和机密，添加 DATABASE_URL。');
+{
+  // 主库 + 备库连接串。备库是可选的，有多少写多少。
+  const secrets = [
+    'DATABASE_URL',
+    'DATABASE_URL_2',
+    'DATABASE_URL_3',
+    'DATABASE_URL_4',
+    'DATABASE_URL_5',
+  ].filter((k) => process.env[k]?.trim());
+
+  if (secrets.length === 0) {
+    console.log('▶ 5/5 跳过 Secret（CI 环境变量里没有 DATABASE_URL）。');
+    console.log('  记得到 Cloudflare 面板 → 该 Worker → 设置 → 变量和机密，添加 DATABASE_URL。');
+  } else {
+    console.log(`▶ 5/5 写入 ${secrets.length} 个数据库连接 Secret…`);
+    for (const key of secrets) {
+      // secret put 非交互时从 stdin 读值；失败不阻断（也许面板里已手动设过）
+      const r = run(NPX, npxArgs(['secret', 'put', key]), {
+        input: `${process.env[key]}\n`,
+      });
+      console.log(
+        r.code === 0 ? `  ${key} 已写入。` : `  ${key} 写入失败（可忽略，若面板里已设置）：\n${r.all}`,
+      );
+    }
+    if (secrets.length > 1) {
+      console.log(`  已配置 ${secrets.length - 1} 个备库。构建日志里会看到全量同步的结果。`);
+    }
+  }
 }
 
 console.log('\n✅ 部署完成。');

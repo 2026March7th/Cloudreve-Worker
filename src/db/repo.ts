@@ -4,7 +4,7 @@
  * 所有 SQL 集中在这里，上层服务不直接写 SQL。读出的一律经 `normalize*`
  * 归一化（bigint → number、bytea → Uint8Array、jsonb → object）。
  */
-import { getSql, toByteaLiteral, toBytes, toDate, toJson, toNum, toNumOrNull, type Sql } from './index';
+import { toByteaLiteral, toBytes, toDate, toJson, toNum, toNumOrNull, type Sql } from './index';
 import type {
   EntityRow,
   FileProps,
@@ -17,9 +17,7 @@ import type {
   UserRow,
   UserWithGroup,
 } from './types';
-import type { Env } from '../env';
-import { sha256Hex, timingSafeEqual, uuidv4 } from '../lib/crypto';
-import { MetadataExpectedCollectTime } from '../lib/sysmeta';
+import { sha256Hex, timingSafeEqual, uuidv4 } from '../lib/crypto';import { MetadataExpectedCollectTime } from '../lib/sysmeta';
 
 // ---------------------------------------------------------------------------
 // 归一化
@@ -165,8 +163,16 @@ export function normalizeTask(r: Record<string, unknown>): TaskRow {
 
 export class UserRepo {
   private sql: Sql;
-  constructor(private env: Env) {
-    this.sql = getSql(env);
+  /**
+   * 绑定到一个具体的数据库客户端。
+   *
+   * **不再接收 `env`**：多库模式下「用哪个库」是请求级决策（见
+   * `db/shard.ts`），由调用方解析好再传进来。传 `Sql` 而不是 `Env`
+   * 让「一个 repo 只能打一个库」成为类型层面的约束 —— 拿不到 env
+   * 就没法偷偷开第二条连接。
+   */
+  constructor(sql: Sql) {
+    this.sql = sql;
   }
 
   async byId(id: number): Promise<UserRow | null> {
@@ -394,8 +400,9 @@ export class UserRepo {
 
 export class GroupRepo {
   private sql: Sql;
-  constructor(env: Env) {
-    this.sql = getSql(env);
+  /** 绑定到一个具体的数据库客户端；库的选择由调用方决定（见 db/shard.ts）。 */
+  constructor(sql: Sql) {
+    this.sql = sql;
   }
 
   async byId(id: number): Promise<GroupRow | null> {
@@ -547,8 +554,9 @@ export class GroupRepo {
 
 export class PolicyRepo {
   private sql: Sql;
-  constructor(env: Env) {
-    this.sql = getSql(env);
+  /** 绑定到一个具体的数据库客户端；库的选择由调用方决定（见 db/shard.ts）。 */
+  constructor(sql: Sql) {
+    this.sql = sql;
   }
 
   async byId(id: number): Promise<StoragePolicyRow | null> {
@@ -708,8 +716,9 @@ export interface ListFilesArgs {
 
 export class FileRepo {
   private sql: Sql;
-  constructor(env: Env) {
-    this.sql = getSql(env);
+  /** 绑定到一个具体的数据库客户端；库的选择由调用方决定（见 db/shard.ts）。 */
+  constructor(sql: Sql) {
+    this.sql = sql;
   }
 
   async byId(id: number): Promise<FileRow | null> {
@@ -1088,8 +1097,9 @@ export class FileRepo {
 
 export class EntityRepo {
   private sql: Sql;
-  constructor(env: Env) {
-    this.sql = getSql(env);
+  /** 绑定到一个具体的数据库客户端；库的选择由调用方决定（见 db/shard.ts）。 */
+  constructor(sql: Sql) {
+    this.sql = sql;
   }
 
   async byId(id: number): Promise<EntityRow | null> {
@@ -1198,8 +1208,9 @@ export class EntityRepo {
 
 export class ShareRepo {
   private sql: Sql;
-  constructor(env: Env) {
-    this.sql = getSql(env);
+  /** 绑定到一个具体的数据库客户端；库的选择由调用方决定（见 db/shard.ts）。 */
+  constructor(sql: Sql) {
+    this.sql = sql;
   }
 
   async byId(id: number): Promise<ShareRow | null> {
@@ -1359,8 +1370,9 @@ export class ShareRepo {
 
 export class MetadataRepo {
   private sql: Sql;
-  constructor(env: Env) {
-    this.sql = getSql(env);
+  /** 绑定到一个具体的数据库客户端；库的选择由调用方决定（见 db/shard.ts）。 */
+  constructor(sql: Sql) {
+    this.sql = sql;
   }
 
   async listByFile(fileId: number, includePrivate: boolean): Promise<MetadataRow[]> {
@@ -1411,8 +1423,9 @@ export class MetadataRepo {
 
 export class DirectLinkRepo {
   private sql: Sql;
-  constructor(env: Env) {
-    this.sql = getSql(env);
+  /** 绑定到一个具体的数据库客户端；库的选择由调用方决定（见 db/shard.ts）。 */
+  constructor(sql: Sql) {
+    this.sql = sql;
   }
 
   async listByFile(fileId: number) {
@@ -1479,8 +1492,9 @@ export class DirectLinkRepo {
 
 export class TaskRepo {
   private sql: Sql;
-  constructor(env: Env) {
-    this.sql = getSql(env);
+  /** 绑定到一个具体的数据库客户端；库的选择由调用方决定（见 db/shard.ts）。 */
+  constructor(sql: Sql) {
+    this.sql = sql;
   }
 
   async create(args: {
@@ -1633,8 +1647,9 @@ function normalizeDavAccount(r: Record<string, unknown>): DavAccountRow {
 
 export class DavAccountRepo {
   private sql: Sql;
-  constructor(env: Env) {
-    this.sql = getSql(env);
+  /** 绑定到一个具体的数据库客户端；库的选择由调用方决定（见 db/shard.ts）。 */
+  constructor(sql: Sql) {
+    this.sql = sql;
   }
 
   async create(args: {
@@ -1760,8 +1775,9 @@ function normalizePasskey(r: Record<string, unknown>): PasskeyRow {
 
 export class PasskeyRepo {
   private sql: Sql;
-  constructor(env: Env) {
-    this.sql = getSql(env);
+  /** 绑定到一个具体的数据库客户端；库的选择由调用方决定（见 db/shard.ts）。 */
+  constructor(sql: Sql) {
+    this.sql = sql;
   }
 
   async create(args: {

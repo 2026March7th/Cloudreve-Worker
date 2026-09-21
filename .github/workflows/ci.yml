@@ -7,6 +7,18 @@
 #      CLOUDFLARE_API_TOKEN + CLOUDFLARE_ACCOUNT_ID 时才真正部署一次
 #      （复用 scripts/deploy.mjs，自动复用/创建 KV 与 R2）。
 #      没配 secrets 时自动跳过，不影响 PR 检查。
+#   3. db-sync：多库容灾的全量同步（主库 → 备库）。只在配置了
+#      DATABASE_URL_2 时才跑；没配备库时该步自动跳过。
+#
+# 可选 Secrets / Variables：
+#   DATABASE_URL      主库连接串（必填，否则部署后站点连不上库）
+#   DATABASE_URL_2..5 备库连接串（可选；配了就会在部署前做一次全量同步）
+#   KV_COUNT          要创建的 KV namespace 个数，1–5，默认 1
+#   DB_FAILOVER       填 1 打开主库故障切换（慎用，见 README）
+#
+# 本地另有需要真实 PostgreSQL 的测试（不进 CI）：
+#   npm run test:copy:setup && npm run test:copy    # COPY 全量同步真机往返
+#   npm run test:multidb                            # 上面全部 + 路由测试
 # ---------------------------------------------------------------------------
 name: Cloudflare Workers Check
 
@@ -34,6 +46,19 @@ jobs:
       - name: 类型检查
         run: npm run typecheck
 
+      - name: KV 绑定装配（校验 KV_COUNT 上限）
+        run: npm run kv:setup
+        env:
+          KV_COUNT: ${{ vars.KV_COUNT || '1' }}
+
+      # 这两个是纯离线测试（esbuild 打包后在内存里跑，不连任何外部服务），
+      # 覆盖多 KV 角色路由与主备切换的路由决策。COPY 真机往返需要本机
+      # PostgreSQL，跑不了，因此不进 CI。
+      - name: 多 KV / 主备路由回归测试
+        run: |
+          npm run test:kv-router
+          npm run test:db-failover
+
       - name: 构建 + dry-run 检查（含拉取官方前端）
         run: npm run build
 
@@ -46,6 +71,12 @@ jobs:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      DATABASE_URL_2: ${{ secrets.DATABASE_URL_2 }}
+      DATABASE_URL_3: ${{ secrets.DATABASE_URL_3 }}
+      DATABASE_URL_4: ${{ secrets.DATABASE_URL_4 }}
+      DATABASE_URL_5: ${{ secrets.DATABASE_URL_5 }}
+      DB_FAILOVER: ${{ vars.DB_FAILOVER }}
+      KV_COUNT: ${{ vars.KV_COUNT || '1' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -66,6 +97,23 @@ jobs:
             echo "ok=false" >> "$GITHUB_OUTPUT"
             echo "::notice::未配置 CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID secrets，跳过真实部署检查"
           fi
+
+      # 全量同步放在部署**之前**：备库先对齐到主库当前状态，
+      # 再把新代码发布出去，避免出现「新代码 + 旧数据」的窗口。
+      # 失败不阻断部署（备库是安全网，没铺好不该拦住站点更新）。
+      - name: 检查是否配置了备库
+        id: backups
+        run: |
+          if [ -n "$DATABASE_URL" ] && [ -n "$DATABASE_URL_2" ]; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::未配置备库（DATABASE_URL_2..），跳过全量同步"
+          fi
+
+      - name: 主库 → 备库全量同步
+        if: steps.creds.outputs.ok == 'true' && steps.backups.outputs.ok == 'true'
+        run: npm run db:sync
 
       - name: 真实部署（自动复用/创建 KV、R2）
         if: steps.creds.outputs.ok == 'true'

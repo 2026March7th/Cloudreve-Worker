@@ -23,9 +23,11 @@ import m0005 from '../../migrations/0005_payment.sql';
 import m0006 from '../../migrations/0006_audit_log.sql';
 import m0007 from '../../migrations/0007_paid_share.sql';
 import m0008 from '../../migrations/0008_oidc.sql';
-import { getSql, withRetry } from './index';
+import { withRetry } from './index';
 import { randomString } from '../lib/crypto';
 import type { Env } from '../env';
+import { kvFor } from '../lib/kvRouter';
+import { resolveDb, type DbHandle } from './shard';
 
 const MIGRATIONS: ReadonlyArray<readonly [name: string, sqlText: string]> = [
   ['0001_init.sql', m0001],
@@ -75,9 +77,9 @@ function isBenignError(err: unknown): boolean {
  * 事务里语句按序执行，失败整体回滚 —— 全部语句幂等，并发冷启动时第二遍重放
  * 即可收敛。
  */
-async function applyMigrations(env: Env): Promise<void> {
-  const sql = getSql(env);
-  const done = await env.KV.get(MARKER_KEY);
+async function applyMigrations(env: Env, db: DbHandle): Promise<void> {
+  const sql = db.sql;
+  const done = await kvFor(env, 'flag').get(MARKER_KEY);
   const last = MIGRATIONS[MIGRATIONS.length - 1]![0];
   if (done === last) return;
 
@@ -92,7 +94,7 @@ async function applyMigrations(env: Env): Promise<void> {
     }
   }
   // 不设 TTL：做过的 schema 就算做过了
-  await env.KV.put(MARKER_KEY, last);
+  await kvFor(env, 'flag').put(MARKER_KEY, last);
 }
 
 /**
@@ -100,8 +102,8 @@ async function applyMigrations(env: Env): Promise<void> {
  * 上游 `application/migrator` 的 migrateAdminGroup / migrateUserGroup /
  * migrateAnonymousGroup。全部 ON CONFLICT DO NOTHING，重复执行无害。
  */
-async function seedSystemData(env: Env): Promise<void> {
-  const sql = getSql(env);
+async function seedSystemData(env: Env, db: DbHandle): Promise<void> {
+  const sql = db.sql;
 
   // 权限位号来自 inventory/types/types.go 的 GroupPermission（LSB-first）
   const PERM = {
@@ -334,12 +336,12 @@ async function seedSystemData(env: Env): Promise<void> {
 }
 
 /** 冷启动入口：建表 + 播种。可安全重复调用（幂等 + KV 标记短路）。 */
-export async function provision(env: Env): Promise<void> {
+export async function provision(env: Env, db: DbHandle = resolveDb(env)): Promise<void> {
   if (ran) return;
   ran = true;
   try {
-    await applyMigrations(env);
-    await seedSystemData(env);
+    await applyMigrations(env, db);
+    await seedSystemData(env, db);
   } catch (err) {
     // 失败要复位模块缓存，让下一个请求重试（KV 标记只在成功后写入）
     ran = false;

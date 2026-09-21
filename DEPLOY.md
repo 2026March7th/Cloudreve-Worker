@@ -71,12 +71,30 @@ npm install
 
 ## 2. 建 KV 与 R2
 
+**单 KV（默认，最简单）**——直接建一个：
+
 ```bash
 npx wrangler kv namespace create KV
 ```
 
-输出里会有一行 `id = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"`，把它填进 `wrangler.toml`
-的 `[[kv_namespaces]]`：
+**多 KV（可选，`KV_COUNT=1..5`）**——想按角色分摊并发压力时用。设置
+`KV_COUNT` 后 **不要手工建**，交给脚本：
+
+```bash
+KV_COUNT=3 npm run kv:setup     # 重写 wrangler.toml 的 KV 段
+npm run deploy                  # 缺的 namespace 会自动创建
+```
+
+`kv:setup` 只认 1–5 的整数，填 6 会直接报错退出（不构建）。它把 `KV_1..KV_n`
+加一个兜底 `KV` 写进 `wrangler.toml` 的托管区（`# >>> multi-kv:begin` 之间），
+这段不要手改——下次跑会被覆盖。角色分工与回落规则见
+[README](./README.md#多个-kv--多个数据库)。
+
+> ⚠️ 改完 `KV_COUNT` 后**不要**手动再跑 `wrangler kv namespace create KV`
+> 去补绑定：重复的 `[[kv_namespaces]]` 块会让 wrangler 报错。
+> `npm run deploy` 会按 `wrangler.toml` 里现有的绑定逐个复用或创建。
+
+拿到的 id 会被写进 `wrangler.toml` 的 `[[kv_namespaces]]`：
 
 ```toml
 [[kv_namespaces]]
@@ -103,7 +121,7 @@ npx wrangler r2 bucket create cloudreve-worker
    形如：
 
    ```
-   postgresql://neondb_owner:xxxxxxx
+   postgresql://neondb_owner:xxxxxxxx@ep-xxx-xxxx.aws.neon.tech/neondb?sslmode=require
    ```
 
    > 用 **Pooler** 的连接串也可以，Worker 走的是 HTTP 驱动，不占连接数。
@@ -125,6 +143,37 @@ npx wrangler r2 bucket create cloudreve-worker
 
    > 不设也能跑：会回退到数据库里 `settings.secret_key` 的值（首次启动自动生成）。
    > 显式设置的好处是刷新/吊销令牌时不完全依赖数据库可读性。
+
+### 3.1（可选）加备库做容灾
+
+想要「主库挂了还有一份能顶」时，**另外新建** 1–4 个 Neon 项目（不要用同一个
+项目的别的 branch，那样故障域还是同一个），把连接串依次存成
+`DATABASE_URL_2` … `DATABASE_URL_5`：
+
+```bash
+npx wrangler secret put DATABASE_URL_2
+npx wrangler secret put DATABASE_URL_3    # 要几个存几个，最多到 _5
+```
+
+然后做两件事：
+
+**① 让备库有表结构。** 备库是空库，先把 schema 推过去。最省事的做法是把主库
+连接串临时当备库跑一次初始化——即把某个备库的连接串写进 `.dev.vars` 的
+`DATABASE_URL`，跑一次 `node scripts/migrate.mjs`（或者让 Worker 对着它冷启动
+一次，会自动建表）。**不要**手工灌数据，数据交给同步脚本。
+
+**② 同步数据。** 每次构建时 CI 会自动做一次全量同步；本地也可以手动跑：
+
+```bash
+npm run db:sync:verify     # 先看备库表结构齐不齐（缺表会告诉你是哪张）
+npm run db:sync            # 主库 → 全部备库，全量覆盖
+```
+
+> **备库是只读的。** 每次同步会用主库内容整库覆盖它，所以别把备库当第二个写入
+> 目标——写进去的东西下次同步就没了。它的定位是「一份随时可用的主库快照」。
+>
+> 主库真的连不上时，可以临时把 `DB_FAILOVER` 设成 `1` 切到备库顶一会儿；
+> **主库恢复后记得删掉这个变量**，否则切换期间产生的新数据会在下次同步时被覆盖。
 
 ---
 
@@ -159,6 +208,10 @@ node scripts/migrate.mjs
 ```
 # edge/.dev.vars  —— 已被 .gitignore 排除，不会提交
 DATABASE_URL="postgresql://..."
+# 可选：备库，填了之后 db:sync 会把主库全量同步过去
+DATABASE_URL_2="postgresql://..."
+# 可选：KV 个数，1–5
+KV_COUNT=1
 ```
 
 ```bash

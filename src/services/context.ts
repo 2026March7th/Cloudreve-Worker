@@ -20,6 +20,9 @@ import {
   DavAccountRepo,
   PasskeyRepo,
 } from '../db/repo';
+import { resolveDb, type DbHandle } from '../db/shard';
+import type { Sql } from '../db/index';
+import { defaultKvBundle, type KvBundle } from '../lib/kvRouter';
 import type { GroupRow, StoragePolicyRow, UserRow, UserWithGroup } from '../db/types';
 import { AppError, CodeGroupNotAllowed, CodeNoPermissionErr } from '../lib/errors';
 import { BooleanSet, GroupPermission } from '../lib/boolset';
@@ -65,19 +68,35 @@ export class AppContext {
      * 对应上游 `auth.GetScopesFromContext`。
      */
     readonly scopes?: string[],
+    /**
+     * 本次请求绑定的数据库。缺省（单库部署 / 老调用点）自动解析主库。
+     *
+     * 显式传入的意义在于**同一个 ctx 一定只打一个库**：11 个 repo 共享
+     * 同一个 `Sql` 实例，任何一处都无法偷偷切库。多库同步、故障切换
+     * 这些需要指定库的场景也靠这个入口注入。
+     */
+    readonly db: DbHandle = resolveDb(env),
+    /** 已解析的 KV 角色（见 lib/kvRouter.ts）。缺省走主库那套。 */
+    readonly kv: KvBundle = defaultKvBundle(env),
   ) {
-    this.users = new UserRepo(env);
-    this.groups = new GroupRepo(env);
-    this.policies = new PolicyRepo(env);
-    this.files = new FileRepo(env);
-    this.entities = new EntityRepo(env);
-    this.shares = new ShareRepo(env);
-    this.metadata = new MetadataRepo(env);
-    this.directLinks = new DirectLinkRepo(env);
-    this.tasks = new TaskRepo(env);
-    this.davAccounts = new DavAccountRepo(env);
-    this.passkeys = new PasskeyRepo(env);
+    const sql = db.sql;
+    this.users = new UserRepo(sql);
+    this.groups = new GroupRepo(sql);
+    this.policies = new PolicyRepo(sql);
+    this.files = new FileRepo(sql);
+    this.entities = new EntityRepo(sql);
+    this.shares = new ShareRepo(sql);
+    this.metadata = new MetadataRepo(sql);
+    this.directLinks = new DirectLinkRepo(sql);
+    this.tasks = new TaskRepo(sql);
+    this.davAccounts = new DavAccountRepo(sql);
+    this.passkeys = new PasskeyRepo(sql);
     this.signer = new Signer(settings.secretKey);
+  }
+
+  /** 当前绑定的数据库客户端。需要写裸 SQL 的服务从这里取，不要自己 getSql(env)。 */
+  get sql(): Sql {
+    return this.db.sql;
   }
 
   /** 当前用户必须存在，否则抛 401。 */

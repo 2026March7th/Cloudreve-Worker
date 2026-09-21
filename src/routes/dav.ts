@@ -32,6 +32,7 @@ import type { FileRow } from '../db/types';
 import type { DavAccountRow } from '../db/repo';
 import { BooleanSet, GroupPermission, FileType } from '../lib/boolset';
 import { CodeObjectExist } from '../lib/errors';
+import { kvFor } from '../lib/kvRouter';
 
 export const davRoutes = new Hono<AppBindings>();
 
@@ -508,7 +509,7 @@ davRoutes.on('LOCK', '*', async (c) => {
   const ttl = Math.min(3600, m ? Number(m[1]) : LOCK_DEFAULT_TTL);
 
   const token = crypto.randomUUID();
-  await ctx.env.KV.put(
+  await kvFor(ctx.env, 'upload').put(
     lockKey(token),
     JSON.stringify({ path: uri.path, owner: ctx.user!.id, created: Date.now() }),
     { expirationTtl: Math.max(60, ttl) },
@@ -533,10 +534,10 @@ davRoutes.on('UNLOCK', '*', async (c) => {
   const tokenHeader = c.req.header('Lock-Token') ?? '';
   const token = tokenHeader.replace(/[<>\s]/g, '').replace('opaquelocktoken:', '');
   if (token) {
-    const raw = await ctx.env.KV.get(lockKey(token));
+    const raw = await kvFor(ctx.env, 'upload').get(lockKey(token));
     if (raw) {
       const info = JSON.parse(raw) as { path: string; owner: number };
-      if (info.owner === ctx.user!.id) await ctx.env.KV.delete(lockKey(token));
+      if (info.owner === ctx.user!.id) await kvFor(ctx.env, 'upload').delete(lockKey(token));
     }
   }
   return c.body(null, 204);

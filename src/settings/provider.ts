@@ -6,10 +6,12 @@
  * 跨请求的缓存交给 KV（`settings:all`，60 秒），避免每个请求都打一次数据库。
  */
 import type { Env } from '../env';
-import { getSql, toJson, withRetry } from '../db';
+import { toJson, withRetry } from '../db';
 import type { SettingRow } from '../db/types';
 import { DEFAULT_SETTINGS, GENERATED_SETTINGS } from './defaults';
 import { randomString } from '../lib/crypto';
+import { resolveDb, type DbHandle } from '../db/shard';
+import { kvFor } from '../lib/kvRouter';
 
 const KV_CACHE_KEY = 'settings:all:v1';
 const KV_CACHE_TTL = 60;
@@ -223,13 +225,15 @@ export class SettingsProvider {
  * 加载设置。优先读 KV 缓存，未命中则回源数据库。
  * `ensureSettings()` 保证表里每个默认键都有行。
  */
-export async function loadSettings(env: Env): Promise<SettingsProvider> {
+export async function loadSettings(env: Env, db: DbHandle = resolveDb(env)): Promise<SettingsProvider> {
   const now = Date.now();
   if (memoryCache && now - memoryCache.at < MEMORY_TTL_MS) {
     return new SettingsProvider(env, memoryCache.map);
   }
 
-  const cached = await env.KV.get(KV_CACHE_KEY, 'json');
+  // 站点设置是「读极多写极少」的纯缓存数据 → 独立的 site 角色 namespace，
+  // 不与自举标记/会话状态抢同一个 KV。
+  const cached = await kvFor(env, 'site').get(KV_CACHE_KEY, 'json');
   if (cached && typeof cached === 'object') {
     const map = new Map<string, string>();
     for (const [k, v] of Object.entries(cached as Record<string, unknown>)) {
@@ -241,7 +245,7 @@ export async function loadSettings(env: Env): Promise<SettingsProvider> {
     }
   }
 
-  const sql = getSql(env);
+  const sql = db.sql;
   // 空闲后（Neon 免费版会自动休眠计算节点）第一条查询偶尔会撞上瞬态错误，
   // 定时任务一小时才来一次，正好踩在这个场景上 —— 限流/网络抖动统一退避重试。
   const rows = (await withRetry(
@@ -258,7 +262,7 @@ export async function loadSettings(env: Env): Promise<SettingsProvider> {
 
   const obj: Record<string, string> = {};
   for (const [k, v] of map) obj[k] = v;
-  await env.KV.put(KV_CACHE_KEY, JSON.stringify(obj), { expirationTtl: KV_CACHE_TTL });
+  await kvFor(env, 'site').put(KV_CACHE_KEY, JSON.stringify(obj), { expirationTtl: KV_CACHE_TTL });
 
   memoryCache = { at: Date.now(), map };
   return new SettingsProvider(env, map);
@@ -272,15 +276,15 @@ export function clearSettingsMemoryCache(): void {
 /** 后台改设置后调用，让 KV 缓存失效（内存缓存一并清掉）。 */
 export async function invalidateSettings(env: Env): Promise<void> {
   memoryCache = null;
-  await env.KV.delete(KV_CACHE_KEY);
+  await kvFor(env, 'site').delete(KV_CACHE_KEY);
 }
 
 /**
  * 首次启动的自举：把缺失的设置键写入数据库，
  * 并为 siteID / secret_key / hash_id_salt 生成一次性的随机值。
  */
-export async function ensureSettings(env: Env): Promise<void> {
-  const sql = getSql(env);
+export async function ensureSettings(env: Env, db: DbHandle = resolveDb(env)): Promise<void> {
+  const sql = db.sql;
   const rows = (await sql`SELECT name FROM settings WHERE deleted_at IS NULL`) as { name: string }[];
   const existing = new Set(rows.map((r) => r.name));
 

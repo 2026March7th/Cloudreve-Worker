@@ -28,6 +28,7 @@ import type { Context } from 'hono';
 import type { AppBindings, AppRequest } from '../middleware/app';
 import { ctxOf } from '../middleware/app';
 import { fail, ok } from '../lib/response';
+import { kvFor } from '../lib/kvRouter';
 import type { AppContext } from '../services/context';
 import type { FileRow } from '../db/types';
 import { AppContext as AppContextClass } from '../services/context';
@@ -1102,7 +1103,7 @@ fileRoutes.post('/viewerSession', async (c) => {
       action: body.preferred_action,
       token,
     };
-    await ctx.env.KV.put(WOPI_SESSION_PREFIX + sessionId, JSON.stringify(session), {
+    await kvFor(ctx.env, 'upload').put(WOPI_SESSION_PREFIX + sessionId, JSON.stringify(session), {
       expirationTtl: WOPI_SESSION_TTL,
     });
 
@@ -1127,7 +1128,7 @@ async function wopiSessionOf(
 ): Promise<{ session: WopiSessionCache; file: FileRow } | null> {
   if (!accessToken || !accessToken.includes('.')) return null;
   const sessionId = accessToken.slice(0, accessToken.indexOf('.'));
-  const raw = await ctx.env.KV.get(WOPI_SESSION_PREFIX + sessionId);
+  const raw = await kvFor(ctx.env, 'upload').get(WOPI_SESSION_PREFIX + sessionId);
   if (!raw) return null;
   let session: WopiSessionCache;
   try {
@@ -1266,7 +1267,7 @@ fileRoutes.post('/wopi/:id', async (c) => {
   const lockKey = `wopi_lock:${file.id}`;
   const version = wopiVersionHeader(ctx, file);
 
-  const locked = await ctx.env.KV.get(lockKey);
+  const locked = await kvFor(ctx.env, 'upload').get(lockKey);
   switch (override) {
     case 'GET_LOCK':
       return new Response(null, {
@@ -1281,7 +1282,7 @@ fileRoutes.post('/wopi/:id', async (c) => {
           headers: { 'X-WOPI-Lock': locked, 'X-WOPI-LockFailureReason': 'Locked by another session' },
         });
       }
-      await ctx.env.KV.put(lockKey, lockToken, { expirationTtl: 1800 });
+      await kvFor(ctx.env, 'upload').put(lockKey, lockToken, { expirationTtl: 1800 });
       return new Response(null, { status: 200, headers: version });
     }
     case 'UNLOCK': {
@@ -1291,7 +1292,7 @@ fileRoutes.post('/wopi/:id', async (c) => {
           headers: { 'X-WOPI-Lock': locked, 'X-WOPI-LockFailureReason': 'Locked by another session' },
         });
       }
-      await ctx.env.KV.delete(lockKey);
+      await kvFor(ctx.env, 'upload').delete(lockKey);
       return new Response(null, { status: 200, headers: version });
     }
     default:
@@ -1336,7 +1337,7 @@ fileRoutes.get('/archive/:sessionID/archive.zip', async (c) => {
 
   try {
     const sessionID = c.req.param('sessionID') ?? '';
-    const raw = await ctx.env.KV.get(`archive_${sessionID}`);
+    const raw = await kvFor(ctx.env, 'upload').get(`archive_${sessionID}`);
     if (!raw) {
       return fail(c, new AppError(CodeNotFound, 'Archive session not exist'));
     }

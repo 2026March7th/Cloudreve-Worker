@@ -24,6 +24,7 @@ import { randomString, timingSafeEqual } from '../lib/crypto';
 import { logAudit } from './audit';
 import { AppContext } from './context';
 import type { UserRow } from '../db/types';
+import { kvFor } from '../lib/kvRouter';
 
 /** KV 中一次登录会话（state → 上下文）的 TTL（秒）。 */
 const LOGIN_STATE_TTL = 600;
@@ -85,7 +86,7 @@ export async function buildAuthorizeUrl(ctx: AppContext, returnTo: string): Prom
   const challenge = await pkceChallenge(codeVerifier);
 
   const loginState: LoginState = { nonce, code_verifier: codeVerifier, redirect_uri: redirectUri, return_to: returnTo };
-  await ctx.env.KV.put(`${STATE_PREFIX}${state}`, JSON.stringify(loginState), {
+  await kvFor(ctx.env, 'session').put(`${STATE_PREFIX}${state}`, JSON.stringify(loginState), {
     expirationTtl: LOGIN_STATE_TTL,
   });
 
@@ -115,9 +116,9 @@ export async function handleCallback(
   const cfg = readOidcConfig(ctx);
   if (!cfg.enabled) throw new AppError(CodeParamErr, 'OIDC login is not enabled');
 
-  const raw = await ctx.env.KV.get(`${STATE_PREFIX}${state}`);
+  const raw = await kvFor(ctx.env, 'session').get(`${STATE_PREFIX}${state}`);
   if (!raw) throw new AppError(CodeParamErr, 'Invalid or expired OIDC state');
-  await ctx.env.KV.delete(`${STATE_PREFIX}${state}`); // 一次性
+  await kvFor(ctx.env, 'session').delete(`${STATE_PREFIX}${state}`); // 一次性
   const loginState = JSON.parse(raw) as LoginState;
 
   const discovery = await loadDiscovery(ctx, cfg.issuer);
@@ -254,7 +255,7 @@ async function loadDiscovery(ctx: AppContext, issuer: string): Promise<OidcDisco
     : `${issuer}/.well-known/openid-configuration`;
 
   const cacheKey = `oidc_discovery_${await sha256Hex(wellKnown)}`;
-  const cached = await ctx.env.KV.get(cacheKey);
+  const cached = await kvFor(ctx.env, 'cred').get(cacheKey);
   if (cached) {
     try {
       return JSON.parse(cached) as OidcDiscovery;
@@ -269,7 +270,7 @@ async function loadDiscovery(ctx: AppContext, issuer: string): Promise<OidcDisco
   if (!doc.authorization_endpoint || !doc.token_endpoint) {
     throw new AppError(CodeParamErr, 'OIDC discovery document is incomplete');
   }
-  await ctx.env.KV.put(cacheKey, JSON.stringify(doc), { expirationTtl: DISCOVERY_CACHE_TTL });
+  await kvFor(ctx.env, 'cred').put(cacheKey, JSON.stringify(doc), { expirationTtl: DISCOVERY_CACHE_TTL });
   return doc;
 }
 

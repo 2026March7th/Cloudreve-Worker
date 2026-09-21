@@ -42,8 +42,47 @@ Workers & Pages → Create → 选仓库，只填两格：
 | `JWT_SECRET` | 可选 | 令牌签名密钥（32 位以上随机串）。不设会自动生成并入库 |
 | `FRONTEND_URL` | 可选 | 官方前端默认已随 Worker 一起发布；只有把前端单独部署到别处（如 Pages）时才填，填了反代优先于内置资源 |
 | `ADMIN_EMAIL` + `ADMIN_PASSWORD` | 可选 | 兜底管理员：两者都配置后，Worker 保证该邮箱存在、密码一致、属于管理员组。用于找回管理员权限（手机部署没有本机 CLI）。建议存成 **Secret**；网页里改过密码后只要不动这对变量就不会被覆盖，删掉变量则完全不再干预 |
+| `DATABASE_URL_2` … `DATABASE_URL_5` | 可选 | 备库连接串（自己另外建的 Neon 项目）。配了之后**每次构建会自动把主库整库全量同步过去**，作为容灾备份。最多 4 个备库（含主库合计 5 个） |
+| `KV_COUNT` | 可选 | 建几个 KV namespace，取值 **1–5**，默认 1。超过 5 直接拒绝构建。见下方「多个 KV / 多个数据库」 |
+| `DB_FAILOVER` | 可选 | 填 `1` 打开主库故障切换：主库连不上时自动降级到第一个备库。⚠️ 切换期间写到备库的数据会在下次构建全量同步时被覆盖，仅作临时应急 |
 
 邮件、全文检索（Meilisearch + Tika）、存储策略等全部在**管理后台**配置，不占环境变量。详见 [DEPLOY.md](./DEPLOY.md)。
+
+## 多个 KV / 多个数据库
+
+单 KV / 单库在并发高时会撞上两类瓶颈：**KV 的写入限速**（同一 namespace 每秒写次数有限）和**单个 Neon 计算实例的连接/CPU 上限**。两者都能靠加实例摊薄，但机制完全不同，别混为一谈。
+
+### KV：加数量 = 按角色分工（`KV_COUNT=1..5`）
+
+KV **只做缓存**，不存业务数据。加多个不是做哈希分片，而是**按用途分开**——这样调大 `KV_COUNT` 只是让原本挤在一个 namespace 里的几类流量各走各的，**不会让已有缓存失效**：
+
+| 角色 | 绑定 | 存什么 |
+|---|---|---|
+| `site` | `KV_1` | 站点设置缓存 |
+| `session` | `KV_2` | 登录会话、验证码、2FA 挑战、OAuth/OIDC 临时态 |
+| `upload` | `KV_3` | 上传会话、分片上传、打包下载会话、WebDAV 锁 |
+| `cred` | `KV_4` | 外部服务凭据缓存（OneDrive token、OIDC discovery） |
+| `flag` | `KV_5` | 自举 / 迁移标记 |
+
+`KV_COUNT=1` 时只有一个 namespace，五个角色共用它，键名自动加 `角色:` 前缀避免互相覆盖。调大 `KV_COUNT` 后重新构建，`scripts/setup-kv.mjs` 会把 `KV_1..KV_n` 写进 `wrangler.toml`；某个角色找不到自己的绑定就逐级回落到裸 `KV`，所以**任何时刻都不会因为少配绑定而报错**。
+
+> Cloudflare 的 KV 绑定是编译期静态配置，不能在运行时新建。所以 `KV_COUNT` 是**构建/部署期**生效的：改完重新部署一次即可。`npm run deploy` 会自动创建缺的 namespace，不需要手工去面板点。
+
+### Neon：加数量 = 主备容灾（`DATABASE_URL_2..5`）
+
+**只有一个库可写**（`DATABASE_URL`，主库）。备库是**冷备**：平时不接流量，每次构建时从主库**全量覆盖**一次，主库真挂了可以临时用 `DB_FAILOVER=1` 切过去顶上。
+
+这里有个必须讲清的取舍：**「备库接流量」和「构建时全量覆盖」不能同时成立**——只要备库接受过写入，下一次全量同步就会把这些写入抹掉。所以本项目选择前者让位后者：备库只读，换来「备份内容永远等于主库快照」这个确定性。真要双活写入，得做主从复制（Neon 上属于付费能力），不是这套机制能提供的。
+
+全量同步走 `COPY ... TO STDOUT / FROM STDIN`（每张表 1 个 HTTP 子请求，按 500 行分批），比逐行 INSERT 省下大量 Workers 子请求配额。表清单见 `src/db/replicate.ts` 的 `TABLES`。
+
+```bash
+npm run db:sync            # 主库 → 全部备库，全量同步
+npm run db:sync:verify     # 只校验备库表结构是否与主库一致
+DB_SYNC_SKIP=audit_logs npm run db:sync   # 跳过指定表
+```
+
+CI 里这三步的顺序是「**先同步、后部署**」，避免出现「新代码 + 旧数据」的窗口。同步失败默认不阻断部署（备库是安全网，没铺好不该拦着站点更新）。
 
 ## 架构
 
@@ -53,18 +92,25 @@ Workers & Pages → Create → 选仓库，只填两格：
                     │  Hono 路由 → 服务层 → 仓储层               │
                     └───┬──────────┬──────────┬────────────────┘
                         │          │          │
-              Neon (HTTP)│    KV    │    R2 绑定│   Microsoft Graph
+              Neon (HTTP)│   KV×N   │    R2 绑定│   Microsoft Graph
                         ▼          ▼          ▼
                   ┌─────────┐ ┌────────┐ ┌─────────┐ ┌──────────┐
-                  │ 元数据   │ │ 会话   │ │ 文件本体 │ │ OneDrive │
-                  │ 10 张表  │ │ 上传态 │ │         │ │  直传    │
-                  └─────────┘ │ 设缓存 │ └─────────┘ └──────────┘
-                              └────────┘
+                  │ 主库     │ │ 5 类角色│ │ 文件本体 │ │ OneDrive │
+                  │ 唯一可写 │ │ 各自缓存│ │         │ │  直传    │
+                  └────┬────┘ └────────┘ └─────────┘ └──────────┘
+                       │ 构建期全量 COPY 同步（只读，冷备）
+                       ▼
+                  ┌─────────────────────────────┐
+                  │ 备库 ×1..4（DATABASE_URL_2..5）│
+                  │ 主库挂了可临时接管（DB_FAILOVER）│
+                  └─────────────────────────────┘
 ```
 
 关键设计取舍：
 
 - **HTTP 驱动的 Postgres，没有事务。** 用 `@neondatabase/serverless`，每条查询一个 HTTP 请求。上游用事务包裹的多步操作，这里改成「先做不可逆的、后做可逆的」，失败靠幂等重试兜底。
+- **主库单写、备库只读。** 备库每次构建被全量覆盖，因此不接常规流量；要真实双活得用 Neon 自身的复制能力，不在本项目的机制范围内（详见上方「多个 KV / 多个数据库」）。
+- **KV 按角色分工而非哈希分片。** 调大 `KV_COUNT` 不会让已有缓存失效，同一份键始终落在同一个 namespace。
 - **位集用 `bytea`。** 权限位集与上游 `boolset.BooleanSet` 的 base64 序列化完全一致（含 LSB-first 位序），否则权限会整片错位。
 - **回收站语义照抄上游。** 删除 = 文件行改名随机 UUID + 真实路径写进元数据；每小时 Cron 清理到期项。
 - **HashID / JWT / 错误码与上游同算法**，前端零适配。
@@ -257,16 +303,35 @@ npm run typecheck     # tsc --noEmit
 npm run build         # 拉前端 + wrangler dry-run 打包（产物 dist/，不发布）
 npm run dev           # 本地 wrangler dev
 npm run deploy        # 真实部署（自动 KV/R2/Secret）
+npm run kv:setup      # 只重写 wrangler.toml 的 KV 段（按 KV_COUNT）
+npm run db:sync       # 主库 → 备库全量同步
 ```
 
-本地调试把机密写进 `.dev.vars`（已被 `.gitignore` 排除），参考 `.dev.vars.example`。
+测试（`npm run test:multidb` 会依次跑全部四项）：
+
+```bash
+npm run test:kv-router     # 多 KV 角色路由（离线）
+npm run test:db-failover   # 主备切换路由决策（离线）
+npm run test:copy:setup    # 建 COPY 测试用的本机库（需本机 PostgreSQL）
+npm run test:copy          # COPY 全量同步真机往返（需本机 PostgreSQL）
+```
+
+`test:copy` 连本机 PostgreSQL 真跑一遍 `COPY TO STDOUT → FROM STDIN`，逐列对拍两库内容。这一项**不能省**：它曾抓出「假设 COPY 输出表头 → 每张表静默丢掉第一行」的真实事故，靠 mock 永远发现不了。前两项是纯离线的，已接入 CI。
+
+本地调试把机密写进 `.dev.vars`（已被 `.gitignore` 排除），参考 `.dev.vars.example`。多库/多 KV 的本地配置也写在这里：
+
+```bash
+DATABASE_URL="postgresql://..."
+DATABASE_URL_2="postgresql://..."   # 可选备库
+KV_COUNT=3                           # 可选，1–5
+```
 
 ## CI 检查
 
 仓库自带 GitHub Actions（`.github/workflows/ci.yml`），两级检查：
 
-1. **构建 + dry-run**（每次 push / PR 自动跑）：类型检查 + `wrangler deploy --dry-run`，代码或 `wrangler.toml` 配置有错会直接标红。
-2. **真实部署检查**（可选）：在仓库 Settings → Secrets and variables → Actions 配置 `CLOUDFLARE_API_TOKEN` 和 `CLOUDFLARE_ACCOUNT_ID`（可选再配 `DATABASE_URL`），push 到 main 时会真实部署一次（同样自动复用/创建 KV、R2），部署出错在 Actions 日志里第一时间看到。不配 secrets 则自动跳过，不影响检查通过。
+1. **构建 + dry-run**（每次 push / PR 自动跑）：类型检查 → KV 装配（校验 `KV_COUNT` 上限）→ 多 KV / 主备路由回归测试 → `wrangler deploy --dry-run`，代码或 `wrangler.toml` 配置有错会直接标红。
+2. **真实部署检查**（可选）：在仓库 Settings → Secrets and variables → Actions 配置 `CLOUDFLARE_API_TOKEN` 和 `CLOUDFLARE_ACCOUNT_ID`（可选再配 `DATABASE_URL`、`DATABASE_URL_2..5`、`KV_COUNT`、`DB_FAILOVER`），push 到 main 时会**先做一次主库→备库全量同步，再**真实部署（同样自动复用/创建 KV、R2）。不配 secrets 则自动跳过，不影响检查通过。
 
 ## 许可
 

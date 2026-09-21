@@ -17,6 +17,7 @@
  * 分片由客户端 PUT 给微软，不经过 Worker。
  */
 import type { Env } from '../env';
+import { kvFor } from '../lib/kvRouter';
 import type { StoragePolicyRow } from '../db/types';
 import { bytesToBase64, base64ToBytes } from '../lib/crypto';
 import {
@@ -120,7 +121,7 @@ export class OneDriveDriver implements StorageDriver {
    * 命中 KV 缓存且未接近过期就直接用；否则用 refresh_token 换新的。
    */
   private async accessToken(): Promise<string> {
-    const cached = (await this.env.KV.get(this.credentialKey, 'json')) as OAuthCredential | null;
+    const cached = (await kvFor(this.env, 'cred').get(this.credentialKey, 'json')) as OAuthCredential | null;
     const now = Math.floor(Date.now() / 1000);
     if (cached?.access_token && cached.expires_in - TOKEN_EXPIRY_MARGIN > now) {
       return cached.access_token;
@@ -166,7 +167,7 @@ export class OneDriveDriver implements StorageDriver {
 
     // 缓存到 KV；TTL 取「距过期还有 margin 秒」的下限 60 秒
     const ttl = Math.max(60, credential.expires_in - TOKEN_EXPIRY_MARGIN - Math.floor(Date.now() / 1000));
-    await this.env.KV.put(this.credentialKey, JSON.stringify(credential), { expirationTtl: ttl });
+    await kvFor(this.env, 'cred').put(this.credentialKey, JSON.stringify(credential), { expirationTtl: ttl });
 
     return credential;
   }
@@ -212,7 +213,7 @@ export class OneDriveDriver implements StorageDriver {
       refreshed_at: Math.floor(Date.now() / 1000),
     };
     const ttl = Math.max(60, credential.expires_in - TOKEN_EXPIRY_MARGIN - Math.floor(Date.now() / 1000));
-    await this.env.KV.put(this.credentialKey, JSON.stringify(credential), { expirationTtl: ttl });
+    await kvFor(this.env, 'cred').put(this.credentialKey, JSON.stringify(credential), { expirationTtl: ttl });
     return credential;
   }
 
@@ -224,7 +225,7 @@ export class OneDriveDriver implements StorageDriver {
    */
   async credentialStatus(): Promise<{ valid: boolean; last_refresh_time: string | null }> {
     if (!this.policy.access_key) return { valid: false, last_refresh_time: null };
-    const cached = (await this.env.KV.get(this.credentialKey, 'json')) as OAuthCredential | null;
+    const cached = (await kvFor(this.env, 'cred').get(this.credentialKey, 'json')) as OAuthCredential | null;
     if (!cached?.refreshed_at) return { valid: false, last_refresh_time: null };
     return { valid: true, last_refresh_time: new Date(cached.refreshed_at * 1000).toISOString() };
   }

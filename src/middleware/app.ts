@@ -16,6 +16,8 @@ import { HashIDCodec } from '../lib/hashid';
 import { JWTService, TokenHeaderPrefix, TokenHeaderPrefixCr } from '../lib/jwt';
 import type { UserWithGroup } from '../db/types';
 import { UserRepo } from '../db/repo';
+import { resolveDb, type DbHandle } from '../db/shard';
+import { kvFor } from '../lib/kvRouter';
 
 export interface AppBindings {
   Bindings: Env;
@@ -43,6 +45,7 @@ async function resolveUser(
   env: Env,
   header: string | null,
   settings: SettingsProvider,
+  db: DbHandle,
 ): Promise<{ user: UserWithGroup; claims: import('../lib/jwt').Claims | null } | undefined> {
   if (!header) return undefined;
   // HMAC 签名请求不是 JWT，跳过
@@ -60,7 +63,7 @@ async function resolveUser(
   const uid = codec.decodeUserID(claims.sub);
   if (uid === null) return undefined;
 
-  const user = await new UserRepo(env).byIdWithGroup(uid);
+  const user = await new UserRepo(db.sql).byIdWithGroup(uid);
   if (!user) return undefined;
 
   // 把 claims 一并带出去 —— 调用方需要 client_id / scopes，
@@ -75,13 +78,18 @@ export function appContext(): MiddlewareHandler<AppBindings> {
     const correlationId = c.req.header('X-Correlation-ID') ?? crypto.randomUUID();
     c.set('correlationId', correlationId);
 
-    const settings = await loadSettings(env);
+    // 数据库句柄：本请求**唯一**的库引用。整个请求生命周期内不再重解析，
+    // 保证 11 个 repo 与所有裸 SQL 都落在同一个库上（多库模型的硬约束，
+    // 见 db/shard.ts）。
+    const db = resolveDb(env);
+
+    const settings = await loadSettings(env, db);
     const codec = new HashIDCodec(settings.hashIdSalt);
     const jwt = new JWTService(settings.secretKey);
 
     let scopes: string[] | undefined;
     const header = c.req.header('Authorization') ?? null;
-    const resolved = await resolveUser(env, header, settings);
+    const resolved = await resolveUser(env, header, settings, db);
     const user = resolved?.user;
 
     // 只有 OAuth 客户端签发的 token 才带 scope，内置登录不受 scope 限制。
@@ -98,7 +106,7 @@ export function appContext(): MiddlewareHandler<AppBindings> {
       const expired = pack.expire_at && new Date(pack.expire_at).getTime() <= Date.now();
       if (expired) {
         try {
-          const repo = new UserRepo(env);
+          const repo = new UserRepo(db.sql);
           const settings = { ...user.settings, group_pack: null };
           await repo.updateGroup(user.id, pack.prev_group_id);
           await repo.updateSettings(user.id, settings);
@@ -114,7 +122,7 @@ export function appContext(): MiddlewareHandler<AppBindings> {
       }
     }
 
-    const appCtx = new AppContext(env, settings, codec, jwt, user, scopes);
+    const appCtx = new AppContext(env, settings, codec, jwt, user, scopes, db);
     // 后台任务挂钩：把「发信」这类不能阻塞响应、又不该丢的工作挂到
     // Workers 的 waitUntil 上（对应原版的常驻队列发信）。
     appCtx.setBackgroundHooks({
@@ -122,7 +130,7 @@ export function appContext(): MiddlewareHandler<AppBindings> {
       onQuotaExceeded: (u) => {
         // 原版 Pro 的 mail_exceed_quota_template：配额超出时发通知邮件。
         // KV 限频 24h/用户，否则一次批量上传能把邮箱塞爆。
-        const kv = env.KV;
+        const kv = kvFor(env, 'session');
         if (!kv) return;
         c.executionCtx.waitUntil(
           (async () => {

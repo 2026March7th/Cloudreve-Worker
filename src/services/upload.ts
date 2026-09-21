@@ -39,6 +39,7 @@ import { randomString, timingSafeEqual, uuidv4 } from '../lib/crypto';
 import { extOf } from './savepath';
 import { isRelayEnabled, type UploadedPart, type UploadSession } from '../storage/types';
 import { publish } from './events';
+import { kvFor } from '../lib/kvRouter';
 
 const SESSION_PREFIX = 'upload_session:';
 /** 原版 uploadSentinelCheckMargin = 5 分钟 */
@@ -659,10 +660,10 @@ export class UploadService {
 
   /** 当前用户的上传会话数量（用于后台/调试）。 */
   async listOwnSessionIds(userId: number): Promise<string[]> {
-    const list = await this.ctx.env.KV.list({ prefix: SESSION_PREFIX, limit: 1000 });
+    const list = await kvFor(this.ctx.env, 'upload').list({ prefix: SESSION_PREFIX, limit: 1000 });
     const out: string[] = [];
     for (const key of list.keys) {
-      const session = (await this.ctx.env.KV.get(key.name, 'json')) as UploadSession | null;
+      const session = (await kvFor(this.ctx.env, 'upload').get(key.name, 'json')) as UploadSession | null;
       if (session?.uid === userId) out.push(session.id);
     }
     return out;
@@ -674,18 +675,18 @@ export class UploadService {
 
   private async saveSession(session: UploadSession): Promise<void> {
     const ttl = Math.max(60, Math.floor((session.expireAt - Date.now()) / 1000) + SENTINEL_MARGIN_MS / 1000);
-    await this.ctx.env.KV.put(`${SESSION_PREFIX}${session.id}`, JSON.stringify(session), {
+    await kvFor(this.ctx.env, 'upload').put(`${SESSION_PREFIX}${session.id}`, JSON.stringify(session), {
       expirationTtl: ttl,
     });
   }
 
   private async loadSession(sessionId: string): Promise<UploadSession | null> {
-    const raw = await this.ctx.env.KV.get(`${SESSION_PREFIX}${sessionId}`, 'json');
+    const raw = await kvFor(this.ctx.env, 'upload').get(`${SESSION_PREFIX}${sessionId}`, 'json');
     return (raw as UploadSession | null) ?? null;
   }
 
   private async deleteSessionRecord(sessionId: string): Promise<void> {
-    await this.ctx.env.KV.delete(`${SESSION_PREFIX}${sessionId}`);
+    await kvFor(this.ctx.env, 'upload').delete(`${SESSION_PREFIX}${sessionId}`);
   }
 }
 

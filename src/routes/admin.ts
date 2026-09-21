@@ -41,6 +41,7 @@ import type { AppBindings } from '../middleware/app';
 import { ctxOf } from '../middleware/app';
 import { permissionsOf } from '../services/context';
 import { fail, ok } from '../lib/response';
+import { kvFor } from '../lib/kvRouter';
 import { UserService } from '../services/user';
 import { MailService } from '../services/mail';
 import { BooleanSet, GroupPermission, PolicyType } from '../lib/boolset';
@@ -825,7 +826,7 @@ adminRoutes.put('/policy/:id', async (c) => {
       },
     );
     // 策略改动后，指向该策略的 OneDrive 凭证缓存需要失效
-    await ctx.env.KV.delete(`cred_od_${id}`);
+    await kvFor(ctx.env, 'cred').delete(`cred_od_${id}`);
 
     // 上游 Update 之后紧接着调 Get，这里照做：返回带 edges 的详情
     const updated = await ctx.policies.byId(id);
@@ -974,7 +975,7 @@ adminRoutes.post('/policy/oauth/signin', async (c) => {
       { settings, bucket_name: String(body.app_id ?? '') },
       { secretKey: String(body.secret ?? '') },
     );
-    await ctx.env.KV.delete(`cred_od_${id}`);
+    await kvFor(ctx.env, 'cred').delete(`cred_od_${id}`);
 
     const updated = await ctx.policies.byId(id);
     const { OneDriveDriver } = await import('../storage/onedrive');

@@ -29,6 +29,7 @@ import {
 } from '../lib/errors';
 import { GroupPermission } from '../lib/boolset';
 import type { ObjectContent } from '../storage/types';
+import { kvFor } from '../lib/kvRouter';
 
 export interface EntityUrl {
   url: string;
@@ -353,7 +354,7 @@ export class DownloadService {
     const now = Math.floor(Date.now() / 1000);
     const expiresAt = now + ttl;
 
-    await this.ctx.env.KV.put(
+    await kvFor(this.ctx.env, 'upload').put(
       `archive_${sessionId}`,
       JSON.stringify({ uris: uris.map((u) => u.toString()), requester_id: user.id }),
       { expirationTtl: ttl },

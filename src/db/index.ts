@@ -12,12 +12,84 @@
 import { neon, neonConfig, type NeonQueryFunction } from '@neondatabase/serverless';
 import type { Env } from '../env';
 
+/**
+ * Neon 查询函数。
+ *
+ * 多库模式下这个对象本身就是「数据库句柄」：`db/repo.ts` 不再接收 `env`
+ * 而是接收它，`assertSameSql()` 靠引用相等拒绝跨库混用。
+ */
 export type Sql = NeonQueryFunction<false, false>;
 
-const clients = new WeakMap<object, Sql>();
+/** 连接串秘密名 → 部署页展示用。下标 1 是主库。 */
+const DB_SECRET_NAMES = [
+  'DATABASE_URL',
+  'DATABASE_URL_2',
+  'DATABASE_URL_3',
+  'DATABASE_URL_4',
+  'DATABASE_URL_5',
+] as const;
+
+/** 单次请求内允许访问的最大库数（硬上限定为 5，与构建期校验一致）。 */
+export const MAX_DATABASES = 5;
 
 /**
- * 取（并缓存）当前 env 对应的 SQL 客户端。
+ * 每个连接串的客户端缓存。
+ *
+ * **以连接串为键而不是以 env 为键**：同一个 Worker 进程内会同时持有主库
+ * 与备库两个客户端（同步任务），以 env 为键会让它们互相顶掉。
+ * `neon()` 每次调用都新建一个查询函数，缓存是为了避免每个请求都重建。
+ */
+const clients = new Map<string, Sql>();
+
+/** 取指定连接串的客户端（带缓存）。不做任何可用性判断。 */
+export function sqlForUrl(url: string): Sql {
+  const cached = clients.get(url);
+  if (cached) return cached;
+  if (!url) throw new Error('数据库连接串为空');
+  installRetryingFetch();
+  const sql = neon(url);
+  clients.set(url, sql);
+  return sql;
+}
+
+/**
+ * 收集 env 上全部已配置的连接串，主库在前。
+ *
+ * 主库（`DATABASE_URL`）为必需；备库按 _2.._5 顺序收集，空字符串与
+ * 重复项会被剔除（同一连接串配两遍没有意义，还会让同步任务自己覆盖自己）。
+ */
+export function databaseUrls(env: Env): string[] {
+  const raw = env as unknown as Record<string, string | undefined>;
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const name of DB_SECRET_NAMES) {
+    const v = raw[name]?.trim();
+    if (!v || seen.has(v)) continue;
+    seen.add(v);
+    out.push(v);
+  }
+  return out;
+}
+
+export function primaryDatabaseUrl(env: Env): string | undefined {
+  return databaseUrls(env)[0];
+}
+
+/** 冷备连接串（不含主库）。用于全量同步的写入端与故障切换的候选。 */
+export function backupDatabaseUrls(env: Env): string[] {
+  return databaseUrls(env).slice(1);
+}
+
+/**
+ * 故障切换是否开启。`DB_FAILOVER=1` / `true` / `yes` 视为开启。
+ * 缺省关闭 —— 主库挂了直接报错，比「静默写到备库、下次同步被覆盖」安全。
+ */
+export function failoverEnabled(env: Env): boolean {
+  return /^(1|true|yes)$/i.test(env.DB_FAILOVER?.trim() ?? '');
+}
+
+/**
+ * 取当前 env 对应的 SQL 客户端（主库）。
  *
  * 免费档 Neon 在并发突发时会回 5xx（实测并发 6 路 x 24 请求有 14 个失败，
  * 状态码 520 / 522 / 525 混杂，最长一次耗了 122 秒），用户侧表现为
@@ -31,19 +103,26 @@ const clients = new WeakMap<object, Sql>();
  *     必须走 `neonConfig` 这个全局入口；
  *   - 装在这一层对驱动完全透明：单条查询、`sql('...', params)`、
  *     `sql.transaction([...])` 全部自动覆盖，不需要逐个改调用点；
- *   - 早于驱动 `throw`，所以不会出现「驱动已把响应 body 读完、重试却要重放查询」
+ *   - 早于驱动 `throw`，所以不会出现「驱动已把响应体读完、重试却要重放查询」
  *     的错位，也不依赖 `NeonQueryPromise` 的惰性求值语义。
+ *
+ * **多库**：重试装在配置层，所以对**全部**库（主库 + 备库）统一生效，
+ * 不需要按库分别安装。
  */
 export function getSql(env: Env): Sql {
-  const cached = clients.get(env);
-  if (cached) return cached;
-  if (!env.DATABASE_URL) {
-    throw new Error('DATABASE_URL is not configured');
-  }
-  installRetryingFetch();
-  const sql = neon(env.DATABASE_URL);
-  clients.set(env, sql);
-  return sql;
+  const url = primaryDatabaseUrl(env);
+  if (!url) throw new Error('DATABASE_URL is not configured');
+  return sqlForUrl(url);
+}
+
+/**
+ * 声明一个 Sql 的来源连接串。
+ *
+ * 给 repo 用：repo 的构造函数可能收到「已解析好的客户端」（多库同步场景），
+ * 也可能只收到 env（主库），两种情况都要能回答「我绑在哪个库上」。
+ */
+export function assertSameSql(a: Sql, b: Sql): boolean {
+  return (a as unknown) === (b as unknown);
 }
 
 // ---------------------------------------------------------------------------

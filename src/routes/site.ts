@@ -17,6 +17,7 @@ import { randomString } from '../lib/crypto';
 import { UserService } from '../services/user';
 import { publicOidcInfo } from '../services/oidc';
 import type { AppContext } from '../services/context';
+import { kvFor } from '../lib/kvRouter';
 
 const CAPTCHA_PREFIX = 'captcha:';
 const CAPTCHA_TTL = 1800; // 与原版 CaptchaTTL 一致（30 分钟）
@@ -168,7 +169,7 @@ async function collectThumbExts(ctx: ReturnType<typeof ctxOf>): Promise<string[]
 siteRoutes.get('/captcha', async (c) => {
   const code = randomString(5).toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 4).padEnd(4, 'A');
   const ticket = randomString(32);
-  await c.env.KV.put(`${CAPTCHA_PREFIX}${ticket}`, code, { expirationTtl: CAPTCHA_TTL });
+  await kvFor(c.env, 'session').put(`${CAPTCHA_PREFIX}${ticket}`, code, { expirationTtl: CAPTCHA_TTL });
 
   const noise = Array.from({ length: 6 }, () => {
     const x1 = Math.floor(Math.random() * 140);
@@ -288,8 +289,8 @@ async function verifyCaptchaInner(
 
   // normal / tcaptcha：内置 SVG 验证码
   if (!ticket || !value) return false;
-  const expected = await ctx.env.KV.get(`${CAPTCHA_PREFIX}${ticket}`);
+  const expected = await kvFor(ctx.env, 'session').get(`${CAPTCHA_PREFIX}${ticket}`);
   if (!expected) return false;
-  await ctx.env.KV.delete(`${CAPTCHA_PREFIX}${ticket}`); // 一次性
+  await kvFor(ctx.env, 'session').delete(`${CAPTCHA_PREFIX}${ticket}`); // 一次性
   return expected.toUpperCase() === value.toUpperCase();
 }

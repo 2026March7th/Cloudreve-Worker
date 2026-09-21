@@ -1,0 +1,152 @@
+/**
+ * 请求级数据库解析（"分片"，但只有一个可写主库）。
+ *
+ * ## 模型
+ *
+ * 这是**单写多读**结构，不是分库：
+ *
+ *   - **主库**（`DATABASE_URL`）：唯一可写。所有业务读写都打它。
+ *   - **备库**（`DATABASE_URL_2..5`）：冷备。请求**永远不打**，只在
+ *     「构建期全量同步」（`scripts/db-sync.mjs` → `db/replicate.ts`）
+ *     时作为复制目标，以及主库彻底不可用且 `DB_FAILOVER=1` 时被提升。
+ *
+ * 为什么不做真正的分库（按 user.id 取模把数据切开）：那会立刻引入
+ * 跨库事务不存在、`users.email` 全局唯一性失效、管理后台只能看到一片
+ * 用户等语义问题。而它的收益（分摊单库压力）在**单写主库**下根本拿不到
+ * —— 分库的写压力是分摊的，不是冗余的。你要的是冗余，所以这里只做冗余。
+ *
+ * ## 为什么「请求只打主库」这条要在代码里显式表达
+ *
+ * 因为「备库接流量」和「构建期从主库全量覆盖」是**互斥**的：
+ * 一旦请求能写备库，那些写入会在下次全量同步时被主库内容冲掉，
+ * 静默丢数据。把这个约束写成一个小模块，比散落在 60 个调用点里
+ * 靠自觉遵守要可靠得多。
+ */
+import type { Env } from '../env';
+import {
+  backupDatabaseUrls,
+  failoverEnabled,
+  getSql,
+  primaryDatabaseUrl,
+  sqlForUrl,
+  type Sql,
+} from './index';
+
+/** 解析结果：客户端 + 本次请求实际绑定到哪个库。 */
+export interface DbHandle {
+  sql: Sql;
+  /**
+   * 库索引：`0` = 主库，`1+` = 备库（`DATABASE_URL_{index+1}`）。
+   * 会写进日志和响应头，方便排查「这次请求到底落在哪」。
+   */
+  index: number;
+  /** 从哪个 env 变量来的（`DATABASE_URL` / `DATABASE_URL_2` ...），仅用于诊断。 */
+  source: string;
+  /** 是否已降级到备库（主库不可用且开了 DB_FAILOVER）。 */
+  degraded: boolean;
+}
+
+const SOURCE_NAMES = [
+  'DATABASE_URL',
+  'DATABASE_URL_2',
+  'DATABASE_URL_3',
+  'DATABASE_URL_4',
+  'DATABASE_URL_5',
+] as const;
+
+/**
+ * 主库健康状态的 isolate 级缓存。
+ *
+ * 存在的意义：`resolveDb()` 是**每个请求**都要走的热路径。如果每次都先
+ * 探一次主库可用性，等于给所有请求加一次额外的 DB 往返（~300ms）。
+ * 所以这里只在**主库已经失败过**的情况下才记住状态，并带一个短 TTL：
+ *
+ *   - 正常情况下 `healthy = true`，零额外开销（不探测，直接用）。
+ *   - 主库失败后记 `downUntil`，TTL 内直接走备库，不再白等主库超时
+ *     （主库超时实测最长 122 秒，逐请求重试会让站点整体卡死）。
+ *   - TTL 到了再放一次请求去试主库，成功即恢复。
+ *
+ * 一个 isolate 的内存状态，不跨 isolate 共享 —— 这是刻意的：不同 isolate
+ * 各自探测，能最快收敛到真实状态，而共享状态（比如写 KV）反而会引入
+ * 「一个 isolate 误判、全体降级」的风险。
+ */
+const HEALTH_TTL_MS = 30_000;
+let primaryDownUntil = 0;
+
+/** 测试 / 手动恢复用：清掉主库降级状态。 */
+export function resetPrimaryHealth(): void {
+  primaryDownUntil = 0;
+}
+
+/**
+ * 解析出本次请求使用的数据库客户端。
+ *
+ * 正常路径（主库健康）：一次 `primaryDatabaseUrl()` + Map 查缓存，无 IO。
+ * 降级路径（主库刚失败过）：TTL 内直接返回备库，不做探测。
+ */
+export function resolveDb(env: Env): DbHandle {
+  const primary = primaryDatabaseUrl(env);
+  if (!primary) throw new Error('DATABASE_URL is not configured');
+
+  const backups = backupDatabaseUrls(env);
+  const now = Date.now();
+
+  // 主库健康，或没有备库可切 → 直接用主库
+  if (!backups.length || now >= primaryDownUntil) {
+    return { sql: getSql(env), index: 0, source: SOURCE_NAMES[0], degraded: false };
+  }
+
+  // 已在降级窗口内
+  if (!failoverEnabled(env)) {
+    // 没开故障切换：仍然用主库。让真实错误抛出去（错误文案已在
+    // lib/response.ts 里转成可读提示），而不是静默写到备库。
+    return { sql: getSql(env), index: 0, source: SOURCE_NAMES[0], degraded: false };
+  }
+
+  const backupIndex = 0; // 备库按配置顺序取第一个
+  return {
+    sql: sqlForUrl(backups[backupIndex]!),
+    index: backupIndex + 1,
+    source: SOURCE_NAMES[backupIndex + 1]!,
+    degraded: true,
+  };
+}
+
+/**
+ * 记录一次数据库失败。
+ *
+ * 只有**主库**的失败才触发降级窗口；备库失败不影响（备库本来就只在
+ * 降级期间使用，它再失败就让请求按原样报错）。
+ */
+export function noteDbFailure(index: number): void {
+  if (index !== 0) return;
+  primaryDownUntil = Date.now() + HEALTH_TTL_MS;
+}
+
+/** 记录一次数据库成功：主库恢复 → 立刻取消降级窗口。 */
+export function noteDbSuccess(index: number): void {
+  if (index !== 0) return;
+  primaryDownUntil = 0;
+}
+
+/** 当前是否处于降级状态（诊断 / 健康检查端点用）。 */
+export function isDegraded(): boolean {
+  return Date.now() < primaryDownUntil;
+}
+
+/**
+ * 在指定数据库上执行一段操作，并在成功 / 失败时更新健康状态。
+ *
+ * 调用方（`AppContext`）用它包一层，这样任何一次业务查询的成败都会
+ * 自动反馈到 `primaryDownUntil`，无需业务代码关心。
+ */
+export async function runWithHealth<T>(handle: DbHandle, fn: () => Promise<T>): Promise<T> {
+  try {
+    const out = await fn();
+    noteDbSuccess(handle.index);
+    return out;
+  } catch (err) {
+    noteDbFailure(handle.index);
+    throw err;
+  }
+}
