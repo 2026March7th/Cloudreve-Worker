@@ -52,8 +52,9 @@ import { isSocialMediaBot, renderSharePreview } from './services/share-preview';
  * 半播种的存量库（groups 缺行导致注册报外键错误）自愈。
  * v4：seedSystemData 新增 group_storage_policies 建表 + 旧单绑定迁入
  * （cf12733 漏 bump 导致存量部署查表报 relation does not exist）。
+ * v5：新增付费分享迁移 0007（shares.score + share_purchases 表）。
  */
-const BOOTSTRAP_FLAG = 'bootstrap:done:v4';
+const BOOTSTRAP_FLAG = 'bootstrap:done:v5';
 /** 自举失败后的冷却键（20 秒 TTL）：期间请求直接快速失败，不再重放自举。 */
 const BOOTSTRAP_COOLDOWN = 'bootstrap:cooldown:v1';
 /** 同一 isolate 内的并发请求共享一次自举。 */

@@ -38,6 +38,7 @@ shareRoutes.put('/', async (c) => {
       expire: body.expire as number | undefined,
       share_view: body.share_view as boolean | undefined,
       show_readme: body.show_readme as boolean | undefined,
+      score: body.score as number | undefined,
     });
     // 原版创建分享的 data 是字符串
     return ok(c, url);
@@ -62,6 +63,7 @@ shareRoutes.post('/:id', async (c) => {
       expire: body.expire as number | undefined,
       share_view: body.share_view as boolean | undefined,
       show_readme: body.show_readme as boolean | undefined,
+      score: body.score as number | undefined,
     });
     return ok(c, url);
   } catch (e) {
@@ -78,6 +80,18 @@ shareRoutes.get('/info/:id', async (c) => {
       ownerExtended: c.req.query('owner_extended') === 'true',
     });
     return ok(c, res);
+  } catch (e) {
+    return fail(c, e);
+  }
+});
+
+/** 购买付费分享（登录）。 */
+shareRoutes.post('/purchase/:id', async (c) => {
+  const ctx = ctxOf(c);
+  if (!ctx.user) return fail(c, Err.loginRequired());
+  try {
+    await buildService(c).purchase(c.req.param('id'));
+    return ok(c);
   } catch (e) {
     return fail(c, e);
   }

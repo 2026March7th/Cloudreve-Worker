@@ -21,6 +21,7 @@ import m0003 from '../../migrations/0003_dav_passkey.sql';
 import m0004 from '../../migrations/0004_node_settings.sql';
 import m0005 from '../../migrations/0005_payment.sql';
 import m0006 from '../../migrations/0006_audit_log.sql';
+import m0007 from '../../migrations/0007_paid_share.sql';
 import { getSql, withRetry } from './index';
 import { randomString } from '../lib/crypto';
 import type { Env } from '../env';
@@ -32,6 +33,7 @@ const MIGRATIONS: ReadonlyArray<readonly [name: string, sqlText: string]> = [
   ['0004_node_settings.sql', m0004],
   ['0005_payment.sql', m0005],
   ['0006_audit_log.sql', m0006],
+  ['0007_paid_share.sql', m0007],
 ];
 
 /** KV 标记：值是最后一个已应用的迁移文件名，文件名不变就跳过。 */

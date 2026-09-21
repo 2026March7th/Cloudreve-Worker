@@ -20,6 +20,7 @@ import { FileType, GroupPermission } from '../lib/boolset';
 import {
   AppError,
   CodeIncorrectPassword,
+  CodeInsufficientCredit,
   CodeNoPermissionErr,
   CodeNotFound,
   CodeSaveOwnShare,
@@ -36,6 +37,8 @@ export interface ShareCreateParams {
   expire?: number;
   share_view?: boolean;
   show_readme?: boolean;
+  /** 付费分享价格（积分）。省略或 <=0 表示免费分享。 */
+  score?: number;
 }
 
 export interface ShareResponse {
@@ -64,6 +67,10 @@ export interface ShareResponse {
   password?: string;
   share_view?: boolean;
   source_uri?: string;
+  /** 付费分享价格（积分）。0 表示免费。 */
+  score?: number;
+  /** 当前登录用户是否已购买该分享（仅登录时返回）。 */
+  purchased?: boolean;
 }
 
 export interface ShareInfoOptions {
@@ -126,12 +133,18 @@ export class ShareService {
     const remainDownloads =
       params.downloads && params.downloads > 0 ? Number(params.downloads) : null;
 
+    const score = params.score !== undefined ? Math.max(0, Math.floor(Number(params.score))) : 0;
+    if (Number.isNaN(score)) throw Err.param('Invalid score');
+    // 上限防御：避免有人填极大值把下载者积分一次性扣爆
+    if (score > 1_000_000_000) throw Err.param('Score is too large');
+
     const share = await this.ctx.shares.create({
       fileId: file.id,
       userId: user.id,
       password,
       expires,
       remainDownloads,
+      score,
       props: {
         share_view: params.share_view === true,
         show_read_me: params.show_readme === true,
@@ -182,10 +195,15 @@ export class ShareService {
     const remainDownloads =
       params.downloads && params.downloads > 0 ? Number(params.downloads) : null;
 
+    const score = params.score !== undefined ? Math.max(0, Math.floor(Number(params.score))) : 0;
+    if (Number.isNaN(score)) throw Err.param('Invalid score');
+    if (score > 1_000_000_000) throw Err.param('Score is too large');
+
     await this.ctx.shares.update(shareId, {
       password,
       expires,
       remainDownloads,
+      score,
       props: {
         share_view: params.share_view === true,
         show_read_me: params.show_readme === true,
@@ -221,6 +239,17 @@ export class ShareService {
     const requester = this.ctx.user;
     const isOwner = requester?.id === share.user_shares;
 
+    // 付费分享状态：免费分享不返回 purchased；付费分享下，属主视为已购买（无需付费），
+    // 其余登录用户按购买记录判定，未登录视为未购买。
+    let purchased: boolean | undefined = share.score > 0 ? false : undefined;
+    if (share.score > 0) {
+      purchased = isOwner
+        ? true
+        : requester
+          ? await this.ctx.shares.hasPurchased(share.id, requester.id)
+          : false;
+    }
+
     // 密码校验：所有者不受限；其余人必须密码正确
     const unlocked =
       !share.password || isOwner || (options.password ?? '') === share.password;
@@ -242,7 +271,56 @@ export class ShareService {
       false,
       true,
       share.user_shares,
+      purchased,
     );
+  }
+
+  /**
+   * 购买付费分享：把 `score` 积分从购买者转到分享者，并记录购买（后续下载不受限）。
+   *
+   * 幂等：同一用户重复调用不会重复扣费——`share_purchases` 用 (share_id,user_id)
+   * 唯一约束，第二次插入直接被忽略（`addPurchase` 返回 false 即放行不转账）。
+   * 前置校验在插入之前做（先查余额再落购买记录），避免「钱不够却标记已购」的脏状态。
+   */
+  async purchase(shareHashId: string): Promise<void> {
+    const user = this.ctx.requireUser();
+    const shareId = this.ctx.codec.decodeShareID(shareHashId);
+    if (shareId === null) throw Err.shareNotFound();
+    const share = await this.ctx.shares.byId(shareId);
+    if (!share) throw Err.shareNotFound();
+
+    const score = share.score;
+    if (score <= 0) return; // 免费分享无需购买
+    if (share.user_shares === user.id) return; // 属主自己无需购买
+    // 已经买过直接放行（防御并发下的重复入口）
+    if (await this.ctx.shares.hasPurchased(shareId, user.id)) return;
+
+    const buyer = await this.ctx.users.byId(user.id);
+    if (!buyer) throw Err.userNotFound();
+    const buyerCredit = Number(buyer.settings?.credit ?? 0);
+    if (buyerCredit < score) {
+      throw new AppError(CodeInsufficientCredit, 'Insufficient credit to purchase this share');
+    }
+
+    // 原子记录购买（唯一约束保证只插入一次）
+    const inserted = await this.ctx.shares.addPurchase(shareId, user.id, score);
+    if (!inserted) return; // 并发下已被同用户插入，不再转账
+
+    // 积分转移：扣购买者、加分享者
+    const buyerSettings = { ...(buyer.settings ?? {}) };
+    buyerSettings.credit = buyerCredit - score;
+    await this.ctx.users.updateSettings(buyer.id, buyerSettings as Record<string, unknown>);
+
+    if (share.user_shares) {
+      const seller = await this.ctx.users.byId(share.user_shares);
+      if (seller) {
+        const sellerSettings = { ...(seller.settings ?? {}) };
+        sellerSettings.credit = Number(sellerSettings.credit ?? 0) + score;
+        await this.ctx.users.updateSettings(seller.id, sellerSettings as Record<string, unknown>);
+      }
+    }
+
+    logAudit(this.ctx, 'points_change', user.id, { kind: 'share_purchase', share_id: shareId, amount: score });
   }
 
   /**
@@ -292,6 +370,8 @@ export class ShareService {
           invalid,
           false,
           share.user_shares,
+          // 自己的分享列表里一律视为已购买，避免误显购买按钮
+          params.asOwner ? true : undefined,
         ),
       );
     }
@@ -333,6 +413,7 @@ export class ShareService {
     expired: boolean,
     includeSource: boolean,
     ownerId: number | null,
+    purchased?: boolean,
   ): Promise<ShareResponse> {
     const owner = ownerId ? await this.ctx.users.byId(ownerId) : null;
 
@@ -347,6 +428,8 @@ export class ShareService {
       created_at: share.created_at.toISOString(),
       source_type: fileType,
       size: 0,
+      score: share.score,
+      purchased,
     };
 
     if (ownerId) res.owner.id = this.ctx.codec.encodeUserID(ownerId);

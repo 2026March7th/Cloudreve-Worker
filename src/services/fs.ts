@@ -60,6 +60,7 @@ import {
   CodeOwnerOnly,
   CodeParentNotExist,
   CodePolicyNotAllowed,
+  CodePurchaseRequired,
   CodeRootProtected,
   CodeSaveOwnShare,
   Err,
@@ -352,6 +353,22 @@ export class FileSystemService {
         throw new AppError(
           CodeNoPermissionErr,
           "You don't have permission to access share links",
+        );
+      }
+    }
+
+    // 付费分享下载闸门：owner 免购；匿名必须先登录再购买；已登录但未购买则拒绝。
+    // 注意 share.ts:info() 走独立路径（不被此处拦截），以便分享页正常展示价格与购买按钮。
+    // 匿名与未购都返回 40083（而非 401），避免前端全局 401 处理把访客强制登出/跳转。
+    if (share.score > 0 && !isOwner) {
+      if (this.ctx.isAnonymous || !this.ctx.user) {
+        throw new AppError(CodePurchaseRequired, 'Login required to purchase this share');
+      }
+      const purchased = await this.ctx.shares.hasPurchased(share.id, this.ctx.user.id);
+      if (!purchased) {
+        throw new AppError(
+          CodePurchaseRequired,
+          'Purchase required to access this share',
         );
       }
     }

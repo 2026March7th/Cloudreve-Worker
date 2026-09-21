@@ -127,6 +127,7 @@ export function normalizeShare(r: Record<string, unknown>): ShareRow {
     props: toJson(r.props, {}),
     file_shares: toNumOrNull(r.file_shares),
     user_shares: toNumOrNull(r.user_shares),
+    score: toNum(r.score),
   };
 }
 
@@ -1169,12 +1170,13 @@ export class ShareRepo {
     password: string | null;
     expires: Date | null;
     remainDownloads: number | null;
+    score: number;
     props: Record<string, unknown>;
   }): Promise<ShareRow> {
     const rows = (await this.sql`
-      INSERT INTO shares (password, views, downloads, expires, remain_downloads, props,
+      INSERT INTO shares (password, views, downloads, expires, remain_downloads, score, props,
                           file_shares, user_shares)
-      VALUES (${args.password}, 0, 0, ${args.expires}, ${args.remainDownloads},
+      VALUES (${args.password}, 0, 0, ${args.expires}, ${args.remainDownloads}, ${args.score},
               ${JSON.stringify(args.props)}::jsonb, ${args.fileId}, ${args.userId})
       RETURNING *
     `) as Record<string, unknown>[];
@@ -1187,6 +1189,7 @@ export class ShareRepo {
       password?: string | null;
       expires?: Date | null;
       remainDownloads?: number | null;
+      score?: number;
       props?: Record<string, unknown>;
     },
   ): Promise<void> {
@@ -1201,11 +1204,36 @@ export class ShareRepo {
         UPDATE shares SET remain_downloads = ${args.remainDownloads}, updated_at = now() WHERE id = ${id}
       `;
     }
+    if (args.score !== undefined) {
+      await this.sql`UPDATE shares SET score = ${args.score}, updated_at = now() WHERE id = ${id}`;
+    }
     if (args.props !== undefined) {
       await this.sql`
         UPDATE shares SET props = ${JSON.stringify(args.props)}::jsonb, updated_at = now() WHERE id = ${id}
       `;
     }
+  }
+
+  /** 用户是否已购买过该分享（用于下载闸门与 UI 展示）。 */
+  async hasPurchased(shareId: number, userId: number): Promise<boolean> {
+    const rows = (await this.sql`
+      SELECT 1 FROM share_purchases WHERE share_id = ${shareId} AND user_id = ${userId} LIMIT 1
+    `) as Record<string, unknown>[];
+    return rows.length > 0;
+  }
+
+  /**
+   * 记录一次购买。返回是否真的插入了新行（(share_id,user_id) 唯一约束下，
+   * 重复调用返回 false，保证积分只转移一次）。
+   */
+  async addPurchase(shareId: number, userId: number, amount: number): Promise<boolean> {
+    const rows = (await this.sql`
+      INSERT INTO share_purchases (share_id, user_id, amount)
+      VALUES (${shareId}, ${userId}, ${amount})
+      ON CONFLICT (share_id, user_id) DO NOTHING
+      RETURNING id
+    `) as Record<string, unknown>[];
+    return rows.length > 0;
   }
 
   async incrementViews(id: number): Promise<void> {

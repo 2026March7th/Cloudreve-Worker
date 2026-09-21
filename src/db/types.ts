@@ -109,6 +109,8 @@ export interface ShareRow {
   props: ShareProps | null;
   file_shares: number | null;
   user_shares: number | null;
+  /** 付费分享价格（积分）。0 表示免费分享。 */
+  score: number;
 }
 
 export interface MetadataRow {
