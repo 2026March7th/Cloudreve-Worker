@@ -323,7 +323,6 @@ userRoutes.get('/search', async (c) => {
           nickname: u.nick,
           avatar: service.buildAvatarUrl(u),
           created_at: u.created_at.toISOString(),
-          email: u.email,
         })),
       );
   } catch (e) {

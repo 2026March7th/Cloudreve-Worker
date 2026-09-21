@@ -122,7 +122,14 @@ function targetUri(c: AppRequest): URI | null {
     /\/{2,}/g,
     '/',
   );
-  return base.withPath(joined === '' ? '/' : joined);
+  const target = base.withPath(joined === '' ? '/' : joined);
+  // 路径穿越防护：URI 已归一化（会解析 `..`），因此解析后的路径必须仍位于
+  // WebDAV 账号根（base.path）之内，否则可越权访问账号限定目录之外的文件
+  // （与 CVE-2026-54563 同类）。账号根即 `my://` 时已在最顶层，无需限制。
+  if (base.path !== '/' && target.path !== base.path && !target.path.startsWith(base.path + '/')) {
+    return null;
+  }
+  return target;
 }
 
 // ---------------------------------------------------------------------------
@@ -414,6 +421,10 @@ davRoutes.on(['COPY', 'MOVE'], '*', async (c) => {
   const dstUri = base.withPath(
     (base.path.replace(/\/+$/, '') + '/' + rel.replace(/^\/+/, '')).replace(/\/{2,}/g, '/'),
   );
+  // 同样校验目标仍在账号根内，防止通过 Destination 头做路径穿越。
+  if (base.path !== '/' && dstUri.path !== base.path && !dstUri.path.startsWith(base.path + '/')) {
+    return c.body(null, 403);
+  }
 
   const fs = new FileSystemService(ctx);
   const isCopy = c.req.method === 'COPY';

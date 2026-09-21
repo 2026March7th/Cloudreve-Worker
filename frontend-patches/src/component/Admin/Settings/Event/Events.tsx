@@ -3,7 +3,7 @@
  *
  * 官方开源前端的 Events.tsx 是个 Pro 壳：所有复选框 `checked={false}`、
  * 点击弹 ProDialog。边缘版把审计日志做成了真功能（后端 services/audit.ts
- * + GET /api/v4/admin/audit/log），本组件保持官方版式，但把开关接通：
+ * + POST /api/v4/admin/audit/log），本组件保持官方版式，但把开关接通：
  *   - 事件开关持久化在设置键 `audit_log_events`（JSON map 事件名 → bool，
  *     缺省视为开启）；「全部勾选/取消」写整个 map；
  *   - 下方附一个审计日志查看器（官方 Pro 的查看器在别处，开源前端没有）。
