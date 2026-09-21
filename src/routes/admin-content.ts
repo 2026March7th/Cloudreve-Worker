@@ -29,6 +29,7 @@ import { fail, ok } from '../lib/response';
 import { AppError, CodeFeatureNotEnabled, CodeInvalidActionOnSystemNode, CodeNodeUsedByStoragePolicy, Err } from '../lib/errors';
 import { BACKEND_VERSION } from './site';
 import { digestPassword, randomString } from '../lib/crypto';
+import { logAudit } from '../services/audit';
 import { getSql, type Sql } from '../db';
 import type { HashIDCodec } from '../lib/hashid';
 import { numericId, paginationArgs, paginationOf, unwrapBody } from './shared';
@@ -126,6 +127,10 @@ function userToResponse(
   policy: { id: number; name: string; type: string } | null,
 ) {
   const id = num(user.id);
+  const settings = (user.settings as Record<string, unknown> | undefined) ?? {};
+  const pack = settings.group_pack as
+    | { group_id?: unknown; prev_group_id?: unknown; expire_at?: unknown }
+    | undefined;
   return {
     id,
     hash_id: codec.encodeUserID(id),
@@ -138,9 +143,16 @@ function userToResponse(
     storage: num(user.storage),
     avatar: (user.avatar as string) ?? '',
     group_users: num(user.group_users),
-    settings: user.settings ?? {},
+    settings,
     // 前端 `UserRow` 靠它决定是否显示「已开启两步验证」角标
     two_fa_enabled: Boolean(user.two_factor_secret),
+    // 积分（edge 自建 Pro 功能）：前端用户编辑弹窗的「积分」字段读它。
+    // 官方开源版这里是写死 value={0} 的装饰位，edge 改为展示真实值。
+    credit: num(settings.credit),
+    // 用户组套餐（edge 自建，payment.ts 写在 settings.group_pack）：
+    //   { group_id, prev_group_id, expire_at }。官方开源版此字段是 Pro 装饰位。
+    group_expires: pack ? iso(pack.expire_at) : null,
+    previous_group: pack ? num(pack.prev_group_id) : 0,
     edges: {
       group: group
         ? {
@@ -304,6 +316,14 @@ async function upsertUser(c: Context<AppBindings>, id: number | null) {
   if (password) {
     if (password.length < 6) throw Err.param('Password is too short');
     await ctx.users.updatePassword(id, await digestPassword(password));
+  }
+  // 积分调整（edge 自建）：管理员在用户编辑弹窗里直接改积分余额。
+  if (body.credit !== undefined) {
+    const credit = num(body.credit);
+    if (credit < 0) throw Err.param('Credit cannot be negative');
+    const current = (rows[0].settings as Record<string, unknown> | undefined) ?? {};
+    await ctx.users.updateSettings(id, { ...current, credit });
+    logAudit(ctx, 'points_change', id, { credit, reason: 'admin_adjust' });
   }
   if (raw.two_fa === 'clear') {
     await ctx.users.setTwoFactorSecret(id, null);
