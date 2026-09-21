@@ -9,8 +9,10 @@
  * 连接串读取顺序：环境变量 DATABASE_URL → 当前目录的 .dev.vars 文件。
  *
  * 实现说明：Neon 的 HTTP 端点一次只接受一条语句，所以这里先把 SQL 文件
- * 拆成独立语句再逐条执行。本项目的 DDL 不含存储过程 / dollar-quoted 字符串，
- * 按分号切分是安全的；遇到新的复杂语句时请改成用 psql 执行。
+ * 拆成独立语句再逐条执行。切分用的是 src/lib/sql-split.mjs 的词法状态机
+ * （识别 $$ dollar-quote / 引号 / 注释）—— 旧版朴素 split(';') 曾把 0010
+ * 的 PL/pgSQL 函数体拦腰截断（2026-09-21 生产事故），别再改回去。
+ * 新增含 dollar-quote 的迁移时无需改这里，跑 test:db-schema 回归即可。
  *
  * 注意：`neon()` 返回的是**可调用对象**，**没有** `.query()` 方法
  * （@neondatabase/serverless 0.10.x 实测 typeof sql.query === 'undefined'）。
@@ -20,6 +22,7 @@ import { readFileSync, readdirSync, existsSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { neon } from '@neondatabase/serverless';
+import { splitStatements } from '../src/lib/sql-split.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const root = resolve(__dirname, '..');
@@ -50,23 +53,6 @@ function loadDatabaseUrl() {
   return null;
 }
 
-/** 去掉 `--` 行注释与块注释，再按分号切分。 */
-function splitStatements(sql) {
-  const withoutBlockComments = sql.replace(/\/\*[\s\S]*?\*\//g, '');
-  const withoutLineComments = withoutBlockComments
-    .split('\n')
-    .map((line) => {
-      // 只去掉整行注释与行尾注释；DDL 里没有字符串内出现 -- 的情况
-      const idx = line.indexOf('--');
-      return idx === -1 ? line : line.slice(0, idx);
-    })
-    .join('\n');
-
-  return withoutLineComments
-    .split(';')
-    .map((s) => s.trim())
-    .filter((s) => s.length > 0);
-}
 
 async function main() {
   const databaseUrl = loadDatabaseUrl();

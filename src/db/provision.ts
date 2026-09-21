@@ -27,6 +27,7 @@ import m0009 from '../../migrations/0009_group_storage_policies.sql';
 import m0010 from '../../migrations/0010_archive.sql';
 import { withRetry } from './index';
 import { randomString } from '../lib/crypto';
+import { splitStatements } from '../lib/sql-split.mjs';
 import type { Env } from '../env';
 import { kvFor } from '../lib/kvRouter';
 import { resolveDb, type DbHandle } from './shard';
@@ -50,21 +51,16 @@ const MARKER_KEY = 'provision:schema';
 /** 模块级缓存：每个 isolate 只跑一次完整检查（一次 KV get）。 */
 let ran = false;
 
-/** 去掉注释后按分号切分。与 scripts/migrate.mjs 的 splitStatements 同源。 */
-function splitStatements(sqlText: string): string[] {
-  const noBlock = sqlText.replace(/\/\*[\s\S]*?\*\//g, '');
-  const noLine = noBlock
-    .split('\n')
-    .map((line) => {
-      const idx = line.indexOf('--');
-      return idx === -1 ? line : line.slice(0, idx);
-    })
-    .join('\n');
-  return noLine
-    .split(';')
-    .map((s) => s.trim())
-    .filter((s) => s.length > 0);
-}
+/**
+ * 去注释后按分号切分 —— 实现在 src/lib/sql-split.mjs（全仓库唯一一份）。
+ *
+ * ⚠️ 这里曾经放过一份「单引号都不跟踪、直接 split(';')」的朴素实现：
+ * 0010_archive.sql 的 $$ PL/pgSQL 函数体内含分号，被拦腰截断，
+ * Postgres 报 unterminated dollar-quoted string，自举失败、全站 503
+ * （2026-09-21 生产事故）。现在共用词法状态机版本，且
+ * scripts/test-db-schema-sync.mjs 在真实 PostgreSQL 上用**这同一份**
+ * 切分器逐条应用全部迁移做回归。
+ */
 
 /** 并发冷启动时两条相同 DDL 相撞是正常现象，不算失败。 */
 function isBenignError(err: unknown): boolean {

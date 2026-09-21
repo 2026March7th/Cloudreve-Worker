@@ -28,6 +28,7 @@
 import { readFileSync, existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
+import { splitStatements } from '../src/lib/sql-split.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -160,7 +161,7 @@ async function ensureSchema(sql, label) {
   let applied = 0;
   for (const file of MIGRATION_FILES) {
     const text = readFileSync(path.join(ROOT, 'migrations', file), 'utf8');
-    const statements = splitSqlStatements(text);
+    const statements = splitStatements(text);
     try {
       // 一个文件一次事务：与 Worker 自举同策略，避免逐条打爆请求预算。
       await sql.transaction(statements.map((s) => sql(s)));
@@ -201,21 +202,9 @@ const MIGRATION_FILES = [
   '0010_archive.sql',
 ];
 
-/** 去注释后按分号切分。与 src/db/provision.ts 的 splitStatements 同源。 */
-function splitSqlStatements(sqlText) {
-  const noBlock = sqlText.replace(/\/\*[\s\S]*?\*\//g, '');
-  const noLine = noBlock
-    .split('\n')
-    .map((line) => {
-      const idx = line.indexOf('--');
-      return idx === -1 ? line : line.slice(0, idx);
-    })
-    .join('\n');
-  return noLine
-    .split(';')
-    .map((s) => s.trim())
-    .filter((s) => s.length > 0);
-}
+// 切分器使用 src/lib/sql-split.mjs（全仓库唯一实现，顶部已导入）。
+// 曾经这里有份本地朴素版（split(';')），把 0010 的 $$ 函数体拦腰截断 ——
+// 该事故同时炸了 Worker 自举与本脚本的备库建表，所以必须同源。
 
 /** 从驱动返回值里抠出 COPY 的文本输出（字段名跨版本会变，不绑死）。 */
 function firstString(v) {
