@@ -22,6 +22,7 @@ import {
   CodeNotFound,
   CodeNotFullySuccess,
   CodeNotSet,
+  CodeParamErr,
   CodeTempLinkExpired,
   CodeUserBaned,
   CodeUserCannotActivate,
@@ -256,8 +257,19 @@ export class UserService {
 
     await this.ctx.env.KV.delete(`user_2fa_${sessionId}`);
 
+    return this.completeLogin(user);
+  }
+
+  /**
+   * 完成登录：确保根目录存在、写审计、签发 token 并构造用户响应。
+   *
+   * 供 2FA 与 OIDC 登录复用。注意：OIDC 路径已在 `services/oidc.ts` 里写过
+   * 一次 user_login 审计，这里的重复写入会造成两条记录，因此由调用方按需
+   * 传 `logAudit: false`（OIDC 路径如此处理）。
+   */
+  async completeLogin(user: UserRow, logAuditEvent = true): Promise<LoginResult> {
     await this.ctx.files.ensureRoot(user.id);
-    logAudit(this.ctx, 'user_login', uid);
+    if (logAuditEvent) logAudit(this.ctx, 'user_login', user.id);
     const token = await this.issueToken(user);
     return { user: await this.buildUserResponse(user, true), token };
   }
@@ -336,6 +348,41 @@ export class UserService {
   }
 
   /**
+   * 注册邮箱策略校验（官方 Pro 功能，边缘版补齐）。
+   *
+   * - `disable_sub_address_email`：开启后拒绝含 `+` 的子地址邮箱，
+   *   避免 `a@x.com` 与 `a+1@x.com` 被当成两个账号刷注册。
+   * - `filter_email_provider`：0=不启用；1=白名单（仅允许列表内域名）；
+   *   2=黑名单（拒绝列表内域名）。规则为逗号分隔的域名，忽略大小写。
+   */
+  private assertEmailPolicy(email: string): void {
+    const s = this.ctx.settings;
+    if (s.getBool('disable_sub_address_email', false)) {
+      const local = email.split('@')[0] ?? '';
+      if (local.includes('+')) {
+        throw new AppError(CodeParamErr, 'Sub-address email is not allowed');
+      }
+    }
+
+    const mode = s.getInt('filter_email_provider', 0);
+    if (mode !== 1 && mode !== 2) return;
+    const domains = s
+      .get('filter_email_provider_rule', '')
+      .split(',')
+      .map((d) => d.trim().toLowerCase().replace(/^@/, ''))
+      .filter(Boolean);
+    if (domains.length === 0) return;
+    const domain = (email.split('@')[1] ?? '').toLowerCase();
+    const matched = domains.some((d) => domain === d || domain.endsWith('.' + d));
+    if (mode === 1 && !matched) {
+      throw new AppError(CodeParamErr, 'Email provider is not allowed');
+    }
+    if (mode === 2 && matched) {
+      throw new AppError(CodeParamErr, 'Email provider is not allowed');
+    }
+  }
+
+  /**
    * 注册。对应上游 `service/user/register.go:33 Register`。
    *
    * 上游把「邮箱已存在」拆成两种情况（`inventory/user.go:367-374`）：
@@ -351,6 +398,12 @@ export class UserService {
 
     // 上游 `register.go:39` 把邮箱统一转小写后再落库
     const normalized = email.trim().toLowerCase();
+
+    // 注册邮箱策略（官方 Pro 功能，边缘版补齐）：
+    //   1) 禁用子地址邮箱：拒绝 `user+tag@example.com` 形态，防同一邮箱无限注册。
+    //   2) 邮箱域过滤：按白名单 / 黑名单校验域名。
+    this.assertEmailPolicy(normalized);
+
     const needActivation = this.ctx.settings.emailActive;
 
     const existing = await this.ctx.users.byEmail(normalized);

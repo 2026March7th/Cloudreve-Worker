@@ -54,7 +54,7 @@ import { isSocialMediaBot, renderSharePreview } from './services/share-preview';
  * （cf12733 漏 bump 导致存量部署查表报 relation does not exist）。
  * v5：新增付费分享迁移 0007（shares.score + share_purchases 表）。
  */
-const BOOTSTRAP_FLAG = 'bootstrap:done:v5';
+const BOOTSTRAP_FLAG = 'bootstrap:done:v6';
 /** 自举失败后的冷却键（20 秒 TTL）：期间请求直接快速失败，不再重放自举。 */
 const BOOTSTRAP_COOLDOWN = 'bootstrap:cooldown:v1';
 /** 同一 isolate 内的并发请求共享一次自举。 */

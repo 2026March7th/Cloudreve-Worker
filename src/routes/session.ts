@@ -16,6 +16,7 @@ import { fail, ok, okWithCode } from '../lib/response';
 import { UserService } from '../services/user';
 import { PasskeyService } from '../services/passkey';
 import { OAuthService } from '../services/oauth';
+import { buildAuthorizeUrl, handleCallback, publicOidcInfo } from '../services/oidc';
 import { AppError, CodeNotFullySuccess, CodeNotFound, Err } from '../lib/errors';
 import { verifyCaptcha } from './site';
 
@@ -105,6 +106,67 @@ sessionRoutes.get('/prepare', async (c) => {
       webauthn_enabled: (await ctx.passkeys.listByUser(user.id)).length > 0,
       password_enabled: Boolean(user.password),
     });
+});
+
+// ---------------------------------------------------------------------------
+// 第三方登录（OIDC）。边缘版自建实现，服务编排见 `services/oidc.ts`。
+// 与上面的 OAuth 提供方路径（Cloudreve 让别的 App 登录）方向相反 ——
+// 这里是 Cloudreve 作为 RP 登录到外部 IdP。
+// ---------------------------------------------------------------------------
+
+/** OIDC 登录：生成 state/PKCE 后 302 跳转到 IdP。 */
+sessionRoutes.get('/oidc/login', async (c) => {
+  const ctx = ctxOf(c);
+  const returnTo = c.req.query('redirect') ?? '/home';
+  try {
+    const url = await buildAuthorizeUrl(ctx, returnTo);
+    return c.redirect(url, 302);
+  } catch (e) {
+    return fail(c, e);
+  }
+});
+
+/** OIDC 回调（IdP → 本站）。JSON 形态：前端拿到 code/state 后调这里换 token。 */
+sessionRoutes.post('/oidc/callback', async (c) => {
+  const ctx = ctxOf(c);
+  const body = (await c.req.json().catch(() => ({}))) as { code?: string; state?: string };
+  if (!body.code || !body.state) {
+    return fail(c, Err.param('code and state are required'));
+  }
+  try {
+    const { user } = await handleCallback(ctx, body.code, body.state);
+    // 与密码登录一致的返回形状：{ user, token }。审计已在 oidc.ts 写过，这里不重复。
+    const result = await new UserService(ctx).completeLogin(user, false);
+    return ok(c, result);
+  } catch (e) {
+    return fail(c, e);
+  }
+});
+
+/**
+ * IdP 直接回调到后端时（若管理员把 redirect_uri 配成后端地址），
+ * 302 到前端回调页，由前端页面带着 code/state 调上面的 JSON 端点。
+ */
+sessionRoutes.get('/oidc/callback', async (c) => {
+  const ctx = ctxOf(c);
+  const code = c.req.query('code') ?? '';
+  const state = c.req.query('state') ?? '';
+  const err = c.req.query('error') ?? '';
+  const base = ctx.settings.siteUrl.replace(/\/+$/, '');
+  const target = new URL(`${base}/session/oidc/callback`);
+  if (err) {
+    target.searchParams.set('error', err);
+  } else {
+    target.searchParams.set('code', code);
+    target.searchParams.set('state', state);
+  }
+  return c.redirect(target.toString(), 302);
+});
+
+/** 当前站点 OIDC 是否可用（登录页据此决定是否显示第三方登录按钮）。 */
+sessionRoutes.get('/oidc/info', (c) => {
+  const ctx = ctxOf(c);
+  return ok(c, publicOidcInfo(ctx));
 });
 
 /**

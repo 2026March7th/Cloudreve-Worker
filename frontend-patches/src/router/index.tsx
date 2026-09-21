@@ -9,6 +9,7 @@ import Reset from "../component/Pages/Login/Reset.tsx";
 import SessionIntro from "../component/Pages/Login/SessionIntro.tsx";
 import DesktopCallback from "../component/Pages/Login/Signin/DesktopCallback.tsx";
 import MobileCallback from "../component/Pages/Login/Signin/MobileCallback.tsx";
+import OidcCallback from "../component/Pages/Login/Signin/OidcCallback.tsx";
 import SignIn from "../component/Pages/Login/Signin/SignIn.tsx";
 import SignUp from "../component/Pages/Login/Signup.tsx";
 import NoMatch from "../component/Pages/NoMatch.tsx";
@@ -49,6 +50,12 @@ export const router = createBrowserRouter([
                 element: <Authorize />,
               },
             ],
+          },
+          {
+            // 第三方登录（OIDC，edge 自建）回调页：IdP 认证后跳回这里，
+            // 页面带 code/state 调 /api/v4/session/oidc/callback 换本站 token。
+            path: "/session/oidc/callback",
+            element: <OidcCallback />,
           },
           {
             path: "*",

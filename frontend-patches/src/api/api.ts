@@ -207,6 +207,28 @@ export function send2FALogin(req: TwoFALoginRequest): ThunkResponse<LoginRespons
   };
 }
 
+/**
+ * 第三方登录（OIDC，edge 自建）：用 IdP 回调带回的 code + state 换本站 token。
+ * 与密码登录返回同形状的 LoginResponse。
+ */
+export function sendOidcCallback(req: { code: string; state: string }): ThunkResponse<LoginResponse> {
+  return async (dispatch, _getState) => {
+    return await dispatch(
+      send(
+        "/session/oidc/callback",
+        {
+          data: req,
+          method: "POST",
+        },
+        {
+          ...defaultOpts,
+          noCredential: true,
+        },
+      ),
+    );
+  };
+}
+
 export function getUserMe(): ThunkResponse<User> {
   return async (dispatch, _getState) => {
     return await dispatch(

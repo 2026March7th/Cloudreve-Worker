@@ -187,10 +187,20 @@ const Settings = () => {
                     "default_group",
                     "authn_enabled",
                     "expose_user_email",
+                    "filter_email_provider",
+                    "filter_email_provider_rule",
+                    "disable_sub_address_email",
                     "avatar_path",
                     "avatar_size",
                     "avatar_size_l",
                     "gravatar_server",
+                    "oidc_enabled",
+                    "oidc_name",
+                    "oidc_issuer",
+                    "oidc_client_id",
+                    "oidc_client_secret",
+                    "oidc_scopes",
+                    "oidc_auto_register",
                   ]}
                 >
                   <UserSession />

@@ -67,6 +67,21 @@ export const DEFAULT_SETTINGS: Record<string, string> = {
   // 登录方式，因此默认关掉（管理员可在后台打开，但依然会返回「未启用」）。
   authn_enabled: '1',
   default_group: '2',
+  // 注册邮箱限制（官方开源版为 Pro 装饰位，边缘版补齐为真实功能）：
+  //   filter_email_provider: 0=不启用 1=白名单 2=黑名单
+  //   filter_email_provider_rule: 逗号分隔的域名列表
+  //   disable_sub_address_email: 1 时禁止含 `+` 的子地址邮箱注册
+  filter_email_provider: '0',
+  filter_email_provider_rule: '',
+  disable_sub_address_email: '0',
+  // 第三方登录（OIDC）。通用实现，QQ 互联 / Logto / Keycloak 等标准 OIDC 均可接入。
+  oidc_enabled: '0',
+  oidc_name: '',
+  oidc_issuer: '',
+  oidc_client_id: '',
+  oidc_client_secret: '',
+  oidc_scopes: 'openid profile email',
+  oidc_auto_register: '1',
   captcha_type: '',
   // 内置图形验证码的渲染参数（官方「验证码」设置页读写，键名对齐上游 inventory/setting.go:539-555）
   captcha_mode: '3',

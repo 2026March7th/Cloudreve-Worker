@@ -15,6 +15,7 @@ import { ctxOf } from '../middleware/app';
 import { ok } from '../lib/response';
 import { randomString } from '../lib/crypto';
 import { UserService } from '../services/user';
+import { publicOidcInfo } from '../services/oidc';
 import type { AppContext } from '../services/context';
 
 const CAPTCHA_PREFIX = 'captcha:';
@@ -63,7 +64,8 @@ siteRoutes.get('/config/:section', async (c) => {
       };
 
   switch (section) {
-    case 'login':
+    case 'login': {
+      const oidc = publicOidcInfo(ctx);
       return ok(c, {
         login_captcha: s.loginCaptcha,
         reg_captcha: s.regCaptcha,
@@ -72,7 +74,11 @@ siteRoutes.get('/config/:section', async (c) => {
         register_enabled: s.registerEnabled,
         tos_url: s.get('tos_url', ''),
         privacy_policy_url: s.get('privacy_policy_url', ''),
+        // 第三方登录（OIDC）：登录页据此显示「使用 XX 登录」按钮
+        oidc_enabled: oidc.enabled,
+        oidc_name: oidc.name,
       }) as never;
+    }
 
     case 'explorer':
       // JSON 型字段（file_viewers / default_viewer_mapping / custom_props）
