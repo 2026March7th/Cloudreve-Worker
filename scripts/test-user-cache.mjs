@@ -9,11 +9,11 @@
  * 用 stub 顶掉 KV 与 Sql：不需要真库、不需要网络。
  */
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import * as esbuild from 'esbuild';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const tmp = mkdtempSync(path.join(tmpdir(), 'ucache-'));
@@ -28,20 +28,18 @@ export * from ${JSON.stringify(path.join(ROOT, 'src/db/repo.ts'))};
 );
 
 const out = path.join(tmp, 'bundle.mjs');
-execFileSync(
-  process.execPath,
-  [
-    path.join(ROOT, 'node_modules/esbuild/bin/esbuild'),
-    entry,
-    '--bundle',
-    '--format=esm',
-    '--platform=node',
-    '--external:cloudflare:sockets',
-    `--outfile=${out}`,
-    '--log-level=error',
-  ],
-  { cwd: ROOT, stdio: ['ignore', 'inherit', 'inherit'] },
-);
+// 用 esbuild 的 **JS API**，不要 `node node_modules/esbuild/bin/esbuild` ——
+// 那个 bin 在 Windows 是 JS 包装脚本（所以本地能跑），在 Linux 是原生 ELF
+// 二进制，`node <ELF>` 直接 "SyntaxError: Invalid or unexpected token"。
+await esbuild.build({
+  entryPoints: [entry],
+  outfile: out,
+  bundle: true,
+  format: 'esm',
+  platform: 'node',
+  external: ['cloudflare:sockets'],
+  logLevel: 'error',
+});
 
 const mod = await import('file://' + out.replace(/\\/g, '/'));
 const { getCachedUser, evictUserCache, clearUserCacheMemory, rememberEnv, userCacheSize, UserRepo } = mod;
