@@ -858,8 +858,10 @@ adminRoutes.put('/policy/:id', async (c) => {
           : {}),
       },
     );
-    // 策略改动后，指向该策略的 OneDrive 凭证缓存需要失效
+    // 策略改动后，指向该策略的 OneDrive 凭证缓存需要失效（KV + isolate 内存两级）
     await kvFor(ctx.env, 'cred').delete(`cred_od_${id}`);
+    const { invalidateOdCredentialCache } = await import('../storage/onedrive');
+    invalidateOdCredentialCache(id);
 
     // 上游 Update 之后紧接着调 Get，这里照做：返回带 edges 的详情
     const updated = await ctx.policies.byId(id);
@@ -1009,6 +1011,8 @@ adminRoutes.post('/policy/oauth/signin', async (c) => {
       { secretKey: String(body.secret ?? '') },
     );
     await kvFor(ctx.env, 'cred').delete(`cred_od_${id}`);
+    const { invalidateOdCredentialCache } = await import('../storage/onedrive');
+    invalidateOdCredentialCache(id);
 
     const updated = await ctx.policies.byId(id);
     const { OneDriveDriver } = await import('../storage/onedrive');

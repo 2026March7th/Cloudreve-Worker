@@ -233,6 +233,8 @@ export interface PolicySetting {
   qiniu_upload_cdn?: boolean;
   chunk_concurrency?: number;
   encryption?: boolean;
+  /** 边缘版专属：中转下载与缩略图缓存到 Cloudflare 边缘 CDN（Cache API） */
+  edge_cache?: boolean;
 }
 
 export interface ExplorerView {

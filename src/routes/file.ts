@@ -29,6 +29,7 @@ import type { AppBindings, AppRequest } from '../middleware/app';
 import { ctxOf } from '../middleware/app';
 import { fail, ok } from '../lib/response';
 import { kvFor } from '../lib/kvRouter';
+import { edgeCacheMatch, edgeCachePut } from '../lib/edgeCache';
 import type { AppContext } from '../services/context';
 import type { FileRow } from '../db/types';
 import { AppContext as AppContextClass } from '../services/context';
@@ -274,6 +275,13 @@ fileRoutes.get('/thumbimg', async (c) => {
     return fail(c, Err.noPermission());
   }
 
+  // 缩略图边缘缓存：列表页一次拉几十张，全部走 Worker 实时缩放是最重的
+  // 回源热点。键规范化为「去 sign 后的稳定 URL」，签名轮换不影响命中。
+  const u = new URL(c.req.url);
+  const cacheKey = `/__edge_cache__/thumbimg?src=${encodeURIComponent(src)}&w=${w}&h=${h}`;
+  const hit = await edgeCacheMatch(u.origin, cacheKey);
+  if (hit) return hit;
+
   const opts: RequestInit & { cf?: { image?: Record<string, unknown> } } = { method: 'GET' };
   if (w > 0 && h > 0) opts.cf = { image: { width: w, height: h, fit: 'cover' } };
 
@@ -292,6 +300,14 @@ fileRoutes.get('/thumbimg', async (c) => {
   headers.set('cache-control', 'public, max-age=86400');
   const disposition = res.headers.get('content-disposition');
   if (disposition) headers.set('content-disposition', disposition);
+  // 先 clone 再拆流：res.body 一旦交给 out 就被锁定，届时再 clone 会抛错
+  edgeCachePut(
+    ctx.waitUntil,
+    u.origin,
+    cacheKey,
+    new Response(res.clone().body, { status: 200, headers }),
+    86400,
+  );
   return new Response(res.body, { status: 200, headers });
 });
 
@@ -328,7 +344,18 @@ const serveContent = async (c: AppRequest) => {
   try {
     const service = new FileSystemService(ctx);
     const download = new DownloadService(ctx, service);
-    const content = await download.serveEntity(entityHash, name, c.req.header('Range') ?? null);
+    // 边缘 CDN 缓存：策略开关在 serveEntity 内判定（policy.settings.edge_cache）；
+    // HEAD 请求无响应体，不参与缓存。
+    const edgeCache =
+      c.req.method === 'HEAD'
+        ? undefined
+        : { origin: url.origin, waitUntil: ctx.waitUntil };
+    const content = await download.serveEntity(
+      entityHash,
+      name,
+      c.req.header('Range') ?? null,
+      edgeCache,
+    );
 
     const headers = new Headers();
     headers.set('Content-Type', content.contentType ?? 'application/octet-stream');

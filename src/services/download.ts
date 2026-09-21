@@ -30,6 +30,12 @@ import {
 import { GroupPermission } from '../lib/boolset';
 import type { ObjectContent } from '../storage/types';
 import { kvFor } from '../lib/kvRouter';
+import {
+  EDGE_CACHE_TTL_S,
+  edgeCacheMatch,
+  edgeCachePut,
+  objectFromCacheResponse,
+} from '../lib/edgeCache';
 
 export interface EntityUrl {
   url: string;
@@ -180,11 +186,18 @@ export class DownloadService {
   /**
    * 代理下载：把实体内容以流的形式返回。
    * 支持 Range 透传，便于视频拖动与断点续传。
+   *
+   * **边缘 CDN 缓存**（`policy.settings.edge_cache === true` 且非 Range 请求时）：
+   * 先查 Cloudflare 边缘缓存（规范化键不含签名 query），未命中回源后经
+   * waitUntil 把完整响应写入缓存。同文件重复下载直接边缘命中，
+   * 不再回源存储。Range（206）与限速不参与缓存 —— 限速在路由层施加，
+   * 缓存里始终是未限速的原始流。
    */
   async serveEntity(
     entityHashId: string,
     name: string,
     range?: string | null,
+    edgeCache?: { origin: string; waitUntil?: (p: Promise<unknown>) => void },
   ): Promise<ObjectContent> {
     const entityId = this.ctx.codec.decodeEntityID(entityHashId);
     if (entityId === null) throw new AppError(CodeEntityNotExist, 'Entity not found');
@@ -196,9 +209,30 @@ export class DownloadService {
     if (!policy) throw Err.policyNotAllowed();
     const driver = this.ctx.driverFor(policy);
 
+    const cacheable =
+      !!edgeCache && !range && policy.settings?.edge_cache === true;
+    const cacheKey = `/__edge_cache__/content/${entityHashId}/${encodeURIComponent(name)}`;
+
+    if (cacheable) {
+      const hit = await edgeCacheMatch(edgeCache!.origin, cacheKey);
+      if (hit) return objectFromCacheResponse(hit, entity.size ?? 0);
+    }
+
     const content = await driver.get(entity.source, range ?? null);
     if (!content) throw new AppError(CodeFileNotFound, 'Object not found in storage backend');
     void name;
+
+    // 回源成功且是完整 200 内容 → 后台写入边缘缓存（tee 出一路流，不影响本次响应）
+    if (cacheable && !content.contentRange && content.body) {
+      const [toClient, toCache] = (content.body as ReadableStream).tee();
+      const headers = new Headers();
+      headers.set('Content-Type', content.contentType ?? 'application/octet-stream');
+      headers.set('Content-Length', String(content.size));
+      const cacheRes = new Response(toCache, { status: 200, headers });
+      edgeCachePut(edgeCache!.waitUntil, edgeCache!.origin, cacheKey, cacheRes, EDGE_CACHE_TTL_S);
+      return { ...content, body: toClient };
+    }
+
     return content;
   }
 

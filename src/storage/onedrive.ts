@@ -18,6 +18,7 @@
  */
 import type { Env } from '../env';
 import { kvFor } from '../lib/kvRouter';
+import { getSql } from '../db';
 import type { StoragePolicyRow } from '../db/types';
 import { bytesToBase64, base64ToBytes } from '../lib/crypto';
 import {
@@ -56,6 +57,22 @@ export interface OAuthCredential {
   expires_in: number;
   /** 上一次成功换取 token 的绝对时间（Unix 秒），对应原版 `Credential.RefreshedAtUnix` */
   refreshed_at: number;
+}
+
+/**
+ * L1 凭证缓存（isolate 级）：键与 KV 键一致（cred_od_<policyId>），
+ * validUntil = 凭证绝对过期秒。热路径直接命中内存，省掉一次 KV 往返；
+ * 条目数以策略数为上界，无需清理。
+ */
+const l1Credentials = new Map<string, { credential: OAuthCredential; validUntil: number }>();
+/** 在途「取凭证」单飞承诺（isolate 级），防止并发刷新风暴。 */
+const l1Refresh = new Map<string, Promise<OAuthCredential>>();
+
+/** 管理端改换凭证（换 App ID/Secret、重新授权）后清掉本 isolate 的 L1。 */
+export function invalidateOdCredentialCache(policyId: number): void {
+  const key = `cred_od_${policyId}`;
+  l1Credentials.delete(key);
+  l1Refresh.delete(key);
 }
 
 /** 逐段编码路径；Cloudreve 的文件名校验已禁止 `:` `/` 等字符，这里主要处理空格与 `#`。 */
@@ -118,15 +135,80 @@ export class OneDriveDriver implements StorageDriver {
 
   /**
    * 取可用的 access token。
-   * 命中 KV 缓存且未接近过期就直接用；否则用 refresh_token 换新的。
+   *
+   * 三级：L1 isolate 内存（有效期内零额外往返）→ L2 KV → 用 refresh_token
+   * 现换。并发请求通过单飞承诺共享同一次刷新，避免多个请求同时拿同一个
+   * refresh_token 去微软换新（轮换令牌并发使用可能被作废，正是
+   * 「偶发整页失败、点重新授权才恢复」的来源之一）。
    */
   private async accessToken(): Promise<string> {
-    const cached = (await kvFor(this.env, 'cred').get(this.credentialKey, 'json')) as OAuthCredential | null;
     const now = Math.floor(Date.now() / 1000);
+    const l1 = l1Credentials.get(this.credentialKey);
+    if (l1 && l1.validUntil - TOKEN_EXPIRY_MARGIN > now) return l1.credential.access_token;
+    const credential = await this.getCredential();
+    return credential.access_token;
+  }
+
+  /** 单飞入口：同一策略在同一 isolate 内同时只允许一个「取凭证」在途。 */
+  private getCredential(): Promise<OAuthCredential> {
+    const key = this.credentialKey;
+    const inflight = l1Refresh.get(key);
+    if (inflight) return inflight;
+    const p = this.loadCredential().finally(() => {
+      l1Refresh.delete(key);
+    });
+    l1Refresh.set(key, p);
+    return p;
+  }
+
+  private async loadCredential(): Promise<OAuthCredential> {
+    const now = Math.floor(Date.now() / 1000);
+    const cached = await this.readCredential();
     if (cached?.access_token && cached.expires_in - TOKEN_EXPIRY_MARGIN > now) {
-      return cached.access_token;
+      this.l1Set(cached);
+      return cached;
     }
-    return (await this.refreshToken(cached?.refresh_token ?? this.policy.access_key ?? '')).access_token;
+    try {
+      const credential = await this.refreshToken(cached?.refresh_token ?? this.policy.access_key ?? '');
+      this.l1Set(credential);
+      return credential;
+    } catch (e) {
+      // 刷新失败（微软/网络抖动）时降级：缓存的 access token 若仍在
+      // 真实有效期内就继续用，别让一次抖动把整页操作打挂。
+      // 提前量只有 600 秒，多数情况下该 token 还有实际可用时间。
+      if (cached?.access_token && cached.expires_in > now) {
+        this.l1Set(cached);
+        return cached;
+      }
+      throw e;
+    }
+  }
+
+  /** L1 命中优先，其次读 KV。两个层级中的凭证形状一致（纯 JSON）。 */
+  private async readCredential(): Promise<OAuthCredential | null> {
+    const l1 = l1Credentials.get(this.credentialKey);
+    if (l1) return l1.credential;
+    return (await kvFor(this.env, 'cred').get(this.credentialKey, 'json')) as OAuthCredential | null;
+  }
+
+  private l1Set(credential: OAuthCredential): void {
+    l1Credentials.set(this.credentialKey, { credential, validUntil: credential.expires_in });
+  }
+
+  /** 忽略余量强制换新（Graph 返回 401 时的自愈路径）。同样走单飞。 */
+  private forceRefresh(): Promise<OAuthCredential> {
+    const key = this.credentialKey;
+    const inflight = l1Refresh.get(key);
+    if (inflight) return inflight;
+    const p = (async () => {
+      l1Credentials.delete(key);
+      const cached = await this.readCredential();
+      return this.refreshToken(cached?.refresh_token ?? this.policy.access_key ?? '');
+    })().finally(() => {
+      l1Refresh.delete(key);
+    });
+    l1Refresh.set(key, p);
+    return p;
   }
 
   private async refreshToken(refreshToken: string): Promise<OAuthCredential> {
@@ -165,9 +247,37 @@ export class OneDriveDriver implements StorageDriver {
       refreshed_at: Math.floor(Date.now() / 1000),
     };
 
-    // 缓存到 KV；TTL 取「距过期还有 margin 秒」的下限 60 秒
-    const ttl = Math.max(60, credential.expires_in - TOKEN_EXPIRY_MARGIN - Math.floor(Date.now() / 1000));
-    await kvFor(this.env, 'cred').put(this.credentialKey, JSON.stringify(credential), { expirationTtl: ttl });
+    // 双写：① KV 缓存（TTL = 距过期还剩 margin 秒，下限 60）；
+    // ② **轮换出的新 refresh_token 回写 Neon**。微软的 refresh_token 是
+    //    轮换制——每换一次旧的作废。KV 条目到期后，下一次刷新要从数据库
+    //    拿最新令牌；不回写的话数据库里永远是初始旧令牌，等 KV 一过期
+    //    所有操作都会 invalid_grant，直到管理员重新授权（对应上游
+    //    onedrive/oauth.go:122 UpdateAccessKey 每次刷新后写回）。
+    const now = Math.floor(Date.now() / 1000);
+    const ttl = Math.max(60, credential.expires_in - TOKEN_EXPIRY_MARGIN - now);
+    const rotated =
+      !!credential.refresh_token && credential.refresh_token !== (this.policy.access_key ?? '');
+    await Promise.all([
+      kvFor(this.env, 'cred')
+        .put(this.credentialKey, JSON.stringify(credential), { expirationTtl: ttl })
+        .catch(() => {
+          /* 缓存尽力而为：失败只影响下次命中，不影响本次请求 */
+        }),
+      rotated
+        ? getSql(this.env)`
+            UPDATE storage_policies SET access_key = ${credential.refresh_token}, updated_at = now()
+            WHERE id = ${this.policy.id}
+          `
+            .then(() => {
+              // 同步内存快照，同一驱动实例的后续刷新据此判重，避免重复写回
+              this.policy.access_key = credential.refresh_token;
+            })
+            .catch((e) => {
+              // 数据库写回失败只告警：KV 里已有新令牌，下一轮刷新会再试
+              console.warn('[onedrive] persist rotated refresh_token failed:', e);
+            })
+        : Promise.resolve(),
+    ]);
 
     return credential;
   }
@@ -214,6 +324,9 @@ export class OneDriveDriver implements StorageDriver {
     };
     const ttl = Math.max(60, credential.expires_in - TOKEN_EXPIRY_MARGIN - Math.floor(Date.now() / 1000));
     await kvFor(this.env, 'cred').put(this.credentialKey, JSON.stringify(credential), { expirationTtl: ttl });
+    // 新凭证直接进 L1，并清掉可能在途的旧刷新承诺
+    this.l1Set(credential);
+    l1Refresh.delete(this.credentialKey);
     return credential;
   }
 
@@ -225,7 +338,7 @@ export class OneDriveDriver implements StorageDriver {
    */
   async credentialStatus(): Promise<{ valid: boolean; last_refresh_time: string | null }> {
     if (!this.policy.access_key) return { valid: false, last_refresh_time: null };
-    const cached = (await kvFor(this.env, 'cred').get(this.credentialKey, 'json')) as OAuthCredential | null;
+    const cached = await this.readCredential();
     if (!cached?.refreshed_at) return { valid: false, last_refresh_time: null };
     return { valid: true, last_refresh_time: new Date(cached.refreshed_at * 1000).toISOString() };
   }
@@ -284,6 +397,13 @@ export class OneDriveDriver implements StorageDriver {
     }
 
     const res = await fetch(url, { method, headers, body: init?.body });
+
+    // Graph 401：access token 被提前吊销（改密码 / 管理员重新授权等），
+    // 强制换新后重试一次（对齐上游 ShouldRefresh → Refresh 的自愈行为）
+    if (res.status === 401 && !init?.noAuth && retries > 0) {
+      await this.forceRefresh();
+      return this.request(method, url, init, retries - 1);
+    }
 
     // 429 / 5xx 退避重试
     if ((res.status === 429 || res.status >= 500) && retries > 0) {
