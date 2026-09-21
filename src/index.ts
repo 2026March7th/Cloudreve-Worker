@@ -83,30 +83,42 @@ app.use('*', async (c, next) => {
   // 三件事都幂等，用 KV 标记避免每个请求都打一遍数据库。
   // 失败有 20 秒冷却期：期间的请求直接回 503，避免所有请求同时重放
   // 自举把 Neon 打出限流（那正是「站点配置加载失败 429」的根源）。
-  const bootstrapped = await c.env.KV.get(BOOTSTRAP_FLAG);
-  if (!bootstrapped) {
-    if (await c.env.KV.get(BOOTSTRAP_COOLDOWN)) {
-      return c.json(
-        { code: 50006, msg: '站点正在初始化（刚部署或数据库暂时不可用），请几秒后刷新重试' },
-        503,
-      ) as never;
+  //
+  // KV / 数据库不可用时不能让异常逃出去（平台层回 520，用户看不懂也
+  // 没法重试）。这里统一转成 503 + 明确文案，前端刷新即可恢复。
+  let bootstrapped: string | null;
+  try {
+    bootstrapped = await c.env.KV.get(BOOTSTRAP_FLAG);
+    if (!bootstrapped) {
+      if (await c.env.KV.get(BOOTSTRAP_COOLDOWN)) {
+        return c.json(
+          { code: 50006, msg: '站点正在初始化（刚部署或数据库暂时不可用），请几秒后刷新重试' },
+          503,
+        ) as never;
+      }
+      if (!bootstrapPromise) {
+        bootstrapPromise = (async () => {
+          await provision(c.env);
+          await ensureSettings(c.env);
+          await c.env.KV.put(BOOTSTRAP_FLAG, '1');
+        })().catch(async (err) => {
+          bootstrapPromise = null;
+          try {
+            await c.env.KV.put(BOOTSTRAP_COOLDOWN, '1', { expirationTtl: 20 });
+          } catch {
+            /* KV 也不可用时只能让下一个请求再试 */
+          }
+          throw err;
+        });
+      }
+      await bootstrapPromise;
     }
-    if (!bootstrapPromise) {
-      bootstrapPromise = (async () => {
-        await provision(c.env);
-        await ensureSettings(c.env);
-        await c.env.KV.put(BOOTSTRAP_FLAG, '1');
-      })().catch(async (err) => {
-        bootstrapPromise = null;
-        try {
-          await c.env.KV.put(BOOTSTRAP_COOLDOWN, '1', { expirationTtl: 20 });
-        } catch {
-          /* KV 也不可用时只能让下一个请求再试 */
-        }
-        throw err;
-      });
-    }
-    await bootstrapPromise;
+  } catch (e) {
+    console.error('bootstrap failed', describeError(e));
+    return c.json(
+      { code: 50006, msg: '站点正在初始化（数据库暂时不可用），请几秒后刷新重试' },
+      503,
+    ) as never;
   }
   // 兜底管理员（ADMIN_EMAIL / ADMIN_PASSWORD，可选）——放在自举之外，
   // 后配的环境变量也能在下一个冷启动 isolate 里生效。
@@ -319,12 +331,50 @@ app.onError((err, c) => {
   return fail(c, wrapped);
 });
 
+/**
+ * 最外层兜底包装。
+ *
+ * Hono 的 `#handleError` 只在 `err instanceof Error` 时才走 `onError`，
+ * **其余一律原样 re-throw**（hono-base.js:273-278）。跨序列化边界传回来的
+ * 错误对象（Workers 的 binding/DOMException、Neon 的瞬态失败、子请求超时）
+ * 丢掉原型链后就不再 `instanceof Error`，会被直接抛出到平台层 ——
+ * Cloudflare 拿到未捕获异常就回 **HTTP 520**，且**不经过 `app.onError`**，
+ * 用户只看到「内部错误 (HTTP status 520)」。
+ *
+ * 这里再包一层 try/catch 并归一化错误形态，保证任何抛出物都变成
+ * 标准 JSON 信封（HTTP 200 + code），彻底消除 520。
+ */
+async function fetchWithFallback(
+  request: Request,
+  env: Env,
+  ctx: ExecutionContext,
+): Promise<Response> {
+  try {
+    return await app.fetch(request, env, ctx);
+  } catch (e) {
+    // 连 Correlation ID 都拿不到时也要能回一个合规响应
+    const id = request.headers.get('X-Correlation-ID') ?? crypto.randomUUID();
+    console.error('unhandled error escaped Hono', describeError(e));
+    return new Response(
+      JSON.stringify({
+        code: 50005,
+        msg: 'Internal server error',
+        correlation_id: id,
+      }),
+      {
+        status: 200,
+        headers: { 'Content-Type': 'application/json; charset=utf-8', 'X-Correlation-ID': id },
+      },
+    );
+  }
+}
+
 // ---------------------------------------------------------------------------
 // 导出
 // ---------------------------------------------------------------------------
 
 export default {
-  fetch: app.fetch,
+  fetch: fetchWithFallback,
   /**
    * 定时清理（在 wrangler.toml 的 `[triggers] crons` 里配置后生效）。
    *

@@ -558,6 +558,29 @@ export class PolicyRepo {
     return rows[0] ? normalizePolicy(rows[0]) : null;
   }
 
+  /**
+   * 按 id 集合批量取策略（1 次往返）。
+   *
+   * 组多策略下发路径上原来对每个 id 调一次 `byId`，N 个策略就是 N 次
+   * Neon HTTP 往返（每次 300ms 量级），列表接口因此明显变慢。
+   * 返回顺序与入参一致（调用方按 `upload_policy_id` 匹配时要稳定顺序），
+   * 且自动丢弃不存在 / 已软删的行。
+   */
+  async byIds(ids: number[]): Promise<StoragePolicyRow[]> {
+    if (ids.length === 0) return [];
+    const rows = (await this.sql(
+      `SELECT * FROM storage_policies
+       WHERE deleted_at IS NULL AND id = ANY($1::int[])`,
+      [ids],
+    )) as Record<string, unknown>[];
+    const byId = new Map<number, StoragePolicyRow>();
+    for (const r of rows) {
+      const p = normalizePolicy(r);
+      byId.set(p.id, p);
+    }
+    return ids.map((id) => byId.get(id)).filter((p): p is StoragePolicyRow => p !== undefined);
+  }
+
   async list(): Promise<StoragePolicyRow[]> {
     const rows = (await this.sql`
       SELECT * FROM storage_policies WHERE deleted_at IS NULL ORDER BY id ASC

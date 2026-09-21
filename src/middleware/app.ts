@@ -11,7 +11,7 @@ import type { Env } from '../env';
 import { AppContext } from '../services/context';
 import { logAudit } from '../services/audit';
 import { MailService } from '../services/mail';
-import { loadSettings } from '../settings/provider';
+import { loadSettings, type SettingsProvider } from '../settings/provider';
 import { HashIDCodec } from '../lib/hashid';
 import { JWTService, TokenHeaderPrefix, TokenHeaderPrefixCr } from '../lib/jwt';
 import type { UserWithGroup } from '../db/types';
@@ -38,8 +38,12 @@ export function securityHeaders(): MiddlewareHandler<AppBindings> {
   };
 }
 
-/** 从请求头解析当前用户。 */
-async function resolveUser(env: Env, header: string | null): Promise<UserWithGroup | undefined> {
+/** 从请求头解析当前用户。settings 由调用方复用，避免重复打 KV/DB。 */
+async function resolveUser(
+  env: Env,
+  header: string | null,
+  settings: SettingsProvider,
+): Promise<UserWithGroup | undefined> {
   if (!header) return undefined;
   // HMAC 签名请求不是 JWT，跳过
   if (header.startsWith(TokenHeaderPrefixCr)) return undefined;
@@ -48,7 +52,6 @@ async function resolveUser(env: Env, header: string | null): Promise<UserWithGro
   const tokenStr = header.slice(TokenHeaderPrefix.length);
   if (!tokenStr) return undefined;
 
-  const settings = await loadSettings(env);
   const jwt = new JWTService(settings.secretKey);
   const claims = await jwt.verify(tokenStr);
   if (!claims || claims.token_type !== 'access') return undefined;
@@ -73,7 +76,7 @@ export function appContext(): MiddlewareHandler<AppBindings> {
 
     let scopes: string[] | undefined;
     const header = c.req.header('Authorization') ?? null;
-    const user = await resolveUser(env, header);
+    const user = await resolveUser(env, header, settings);
 
     if (user && header?.startsWith(TokenHeaderPrefix)) {
       const claims = await jwt.verify(header.slice(TokenHeaderPrefix.length));

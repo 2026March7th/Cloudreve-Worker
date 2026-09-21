@@ -15,6 +15,21 @@ const KV_CACHE_KEY = 'settings:all:v1';
 const KV_CACHE_TTL = 60;
 
 /**
+ * isolate 级内存缓存。
+ *
+ * 原来每个请求要读 **3 次** KV（`index.ts` 的自举标记读 + 中间件 `appContext`
+ * 一次 + `resolveUser` 内一次），实测单次 KV get 200~500ms，等于白烧掉
+ * 将近 1 秒的响应时间。设置是「读极多、写极少」的数据，放进模块级缓存后
+ * 同一 isolate 内的所有请求共享一份，只有 TTL 到期才会再打 KV。
+ *
+ * 失效链路：`invalidateSettings()` 同时清 KV 与内存（后台改设置后立即生效）；
+ * TTL 兜底那些跨 isolate 的改动（另一个 isolate 改了设置，这边最多晚
+ * `MEMORY_TTL` 秒看到）。
+ */
+const MEMORY_TTL_MS = 5000;
+let memoryCache: { at: number; map: Map<string, string> } | null = null;
+
+/**
  * 归一化外部服务的 base URL（Meilisearch / Tika endpoint）。
  * 管理员常直接粘贴 `ms-xxx.meilisearch.io` 这种不带协议的主机名，
  * 直接拼路径 fetch 会得到 "Invalid URL"。这里统一补 `https://`、
@@ -209,13 +224,21 @@ export class SettingsProvider {
  * `ensureSettings()` 保证表里每个默认键都有行。
  */
 export async function loadSettings(env: Env): Promise<SettingsProvider> {
+  const now = Date.now();
+  if (memoryCache && now - memoryCache.at < MEMORY_TTL_MS) {
+    return new SettingsProvider(env, memoryCache.map);
+  }
+
   const cached = await env.KV.get(KV_CACHE_KEY, 'json');
   if (cached && typeof cached === 'object') {
     const map = new Map<string, string>();
     for (const [k, v] of Object.entries(cached as Record<string, unknown>)) {
       if (typeof v === 'string') map.set(k, v);
     }
-    if (map.size > 0) return new SettingsProvider(env, map);
+    if (map.size > 0) {
+      memoryCache = { at: Date.now(), map };
+      return new SettingsProvider(env, map);
+    }
   }
 
   const sql = getSql(env);
@@ -237,11 +260,18 @@ export async function loadSettings(env: Env): Promise<SettingsProvider> {
   for (const [k, v] of map) obj[k] = v;
   await env.KV.put(KV_CACHE_KEY, JSON.stringify(obj), { expirationTtl: KV_CACHE_TTL });
 
+  memoryCache = { at: Date.now(), map };
   return new SettingsProvider(env, map);
 }
 
-/** 后台改设置后调用，让 KV 缓存失效。 */
+/** 清掉内存缓存（测试 / 手动失效用）。 */
+export function clearSettingsMemoryCache(): void {
+  memoryCache = null;
+}
+
+/** 后台改设置后调用，让 KV 缓存失效（内存缓存一并清掉）。 */
 export async function invalidateSettings(env: Env): Promise<void> {
+  memoryCache = null;
   await env.KV.delete(KV_CACHE_KEY);
 }
 

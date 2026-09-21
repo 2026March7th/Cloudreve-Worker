@@ -717,8 +717,12 @@ export class FileSystemService {
       typeFilter: params.typeFilter ?? null,
     });
 
-    const metadataMap = await this.loadMetadata(files, uri.fsType === FileSystemType.My);
-    const sharedIds = await this.ctx.shares.sharedFileIds(files.map((f) => f.id));
+    // 这两个查询都依赖上面的 files，彼此独立 —— 并行发出，省掉一次串行等待
+    // （Neon HTTP 驱动每次查询是一次 fetch，串行会线性叠加延迟）。
+    const [metadataMap, sharedIds] = await Promise.all([
+      this.loadMetadata(files, uri.fsType === FileSystemType.My),
+      this.ctx.shares.sharedFileIds(files.map((f) => f.id)),
+    ]);
 
     const fileResponses: FileResponse[] = [];
     for (const f of files) {
@@ -770,7 +774,11 @@ export class FileSystemService {
       dir?.owner_id ?? (uri.fsType === FileSystemType.My ? viewer?.id : undefined);
     if (policyOwnerId != null) {
       try {
-        const owner = await this.ctx.users.byId(policyOwnerId);
+        // my / trash 的属主就是当前用户 —— 上下文里已经有完整行了，省一次查询。
+        const owner =
+          viewer && viewer.id === policyOwnerId
+            ? viewer
+            : await this.ctx.users.byId(policyOwnerId);
         if (owner) {
           // edge 自建 Pro 功能：组多策略。取属主所在组的全部可用策略，
           // 选中的（属主偏好 upload_policy_id，未选取第一个）作为
@@ -778,7 +786,9 @@ export class FileSystemService {
           // 供前端切换器渲染。只有一个策略时与上游行为完全一致。
           const all = await this.ctx.groupPolicies(owner);
           if (all.length > 0) {
-            const preferred = await this.ctx.preferredPolicy(owner);
+            // 用已取到的 all 直接挑，不再调 preferredPolicy() —— 后者会
+            // 把 groupPolicies 再查一遍（列表接口每请求都要走这里）。
+            const preferred = this.ctx.pickPreferredPolicy(all, owner.settings);
             response.storage_policy = this.buildPolicyInfo(preferred);
             if (all.length > 1) {
               response.storage_policies = all.map((p) => this.buildPolicyInfo(p));

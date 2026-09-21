@@ -185,15 +185,16 @@ export class AppContext {
    * 按组关联表取全量并过滤掉类型不支持的驱动；组没绑任何策略时
    * 回落到 resolvePolicy 的默认链。user 缺省时取当前请求用户
    * （列表下发策略跟随**目录属主**，所以要显式传属主）。
+   *
+   * 策略行按 id 批量取（1 次查询），不再逐个 `byId` —— 列表接口对每个
+   * 请求都要走这条路，组绑 N 个策略时原来要 N+1 次往返（每次 ~300ms）。
    */
   async groupPolicies(user?: UserRow): Promise<StoragePolicyRow[]> {
     const u = user ?? this.requireUser();
     const ids = await this.groups.listPolicyIds(u.group_users);
-    const policies: StoragePolicyRow[] = [];
-    for (const id of ids) {
-      const p = await this.policies.byId(id);
-      if (p && isPolicyTypeSupported(p.type)) policies.push(p);
-    }
+    const policies = (await this.policies.byIds(ids)).filter((p) =>
+      isPolicyTypeSupported(p.type),
+    );
     if (policies.length > 0) return policies;
     if (!user) return [await this.resolvePolicy(null)];
     return policies;
@@ -207,13 +208,21 @@ export class AppContext {
     return hit;
   }
 
-  /** 用户在组策略集里当前选中的上传策略（未选/失效时取第一个）。 */
-  async preferredPolicy(user?: UserRow): Promise<StoragePolicyRow> {
-    const u = user ?? this.requireUser();
-    const allowed = await this.groupPolicies(u);
-    const preferred = u.settings?.upload_policy_id;
-    if (preferred != null) {
-      const hit = allowed.find((p) => p.id === Number(preferred));
+  /**
+   * 从**已取到的**策略集里挑出用户当前选中的上传策略（未选/失效时取第一个）。
+   *
+   * 纯函数版本 —— 调用方已经拿到 `groupPolicies()` 结果时用它，避免
+   * `preferredPolicy()` 内部再查一次组策略（列表接口原来就重复查了）。
+   * `ListResponse.storage_policy` 的取法必须与 `preferredPolicy()` 完全一致，
+   * 否则前端展示的策略与实际落盘策略会对不上。
+   */
+  pickPreferredPolicy(
+    allowed: StoragePolicyRow[],
+    settings?: UserRow['settings'],
+  ): StoragePolicyRow {
+    const want = settings?.upload_policy_id;
+    if (want != null) {
+      const hit = allowed.find((p) => p.id === Number(want));
       if (hit) return hit;
     }
     // 组没绑任何存储策略（或绑定的全被删了）：必须抛明确业务错误，
@@ -222,6 +231,13 @@ export class AppContext {
       throw new AppError(40035, 'No available storage policy for your group');
     }
     return allowed[0]!;
+  }
+
+  /** 用户在组策略集里当前选中的上传策略（未选/失效时取第一个）。 */
+  async preferredPolicy(user?: UserRow): Promise<StoragePolicyRow> {
+    const u = user ?? this.requireUser();
+    const allowed = await this.groupPolicies(u);
+    return this.pickPreferredPolicy(allowed, u.settings);
   }
 
   driverFor(policy: StoragePolicyRow): StorageDriver {
