@@ -544,6 +544,17 @@ adminContentRoutes.put('/file/:id', async (c) => {
       if (!name) throw Err.illegalName('File name cannot be empty');
       await ctx.files.rename(id, name);
     }
+    // 存储策略归属（edge 自建）：前端 FileForm 的 SinglePolicySelectionInput 送原始数字 id。
+    if (body.storage_policy_files !== undefined) {
+      const raw = body.storage_policy_files;
+      // 允许 0 表示「不指定」（与前端 emptyValue 语义对齐）。
+      const pid = raw === null || raw === '' ? 0 : Number(raw);
+      if (!Number.isFinite(pid) || pid < 0) throw Err.param('Invalid storage policy');
+      if (pid > 0 && !(await ctx.policies.byId(pid))) {
+        throw new AppError(40040, 'Storage policy not found');
+      }
+      await ctx.files.updateStoragePolicy(id, pid > 0 ? pid : null);
+    }
     return ok(c);
   } catch (e) {
     return fail(c, e);

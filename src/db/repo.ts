@@ -934,6 +934,17 @@ export class FileRepo {
     await this.sql`UPDATE files SET name = ${newName}, updated_at = now() WHERE id = ${id}`;
   }
 
+  /**
+   * 管理端改文件的存储策略。只改 `storage_policy_files` 这一列的「策略归属」，
+   * 不搬动任何 blob —— 与原版 `UpsertFileService` 的语义一致（变更后由后续
+   * 写入/上传落新策略，已存在的实体仍指向原节点）。
+   */
+  async updateStoragePolicy(id: number, policyId: number | null): Promise<void> {
+    await this.sql`
+      UPDATE files SET storage_policy_files = ${policyId}, updated_at = now() WHERE id = ${id}
+    `;
+  }
+
   async move(ids: number[], dstParentId: number | null): Promise<void> {
     if (ids.length === 0) return;
     for (const id of ids) {

@@ -209,16 +209,40 @@ export async function verifyCaptcha(
   ticket: string | undefined | null,
   value: string | undefined | null,
 ): Promise<boolean> {
+  try {
+    return await verifyCaptchaInner(ctx, ticket, value);
+  } catch (e) {
+    // 验证码校验绝不能让请求挂掉：调用方（登录/注册/找回密码）都在 try 之外
+    // 调它，抛出去就是未捕获 rejection → Cloudflare 回 520。
+    // 外部站点（recaptcha / turnstile / cap）不可达或返回体异常时统一判失败，
+    // 由调用方回 40026，前端能看到明确报错而不是 520。
+    console.error('captcha verification failed:', e);
+    return false;
+  }
+}
+
+/** 真正的校验逻辑，见 `verifyCaptcha` 的说明。任何异常都由外层兜住。 */
+async function verifyCaptchaInner(
+  ctx: AppContext,
+  ticket: string | undefined | null,
+  value: string | undefined | null,
+): Promise<boolean> {
   const type = ctx.settings.get('captcha_type', '') || 'normal';
 
   const formPost = async (endpoint: string, body: string): Promise<unknown> => {
-    const res = await fetch(endpoint, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body,
-    });
-    if (!res.ok) return null;
-    return (await res.json().catch(() => null)) as unknown;
+    try {
+      const res = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body,
+        // 外部校验站点挂掉/被墙时不能拖着整个请求：超时按校验失败处理。
+        signal: AbortSignal.timeout(10000),
+      });
+      if (!res.ok) return null;
+      return (await res.json().catch(() => null)) as unknown;
+    } catch {
+      return null;
+    }
   };
 
   if (type === 'turnstile') {
@@ -252,6 +276,7 @@ export async function verifyCaptcha(
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ secret, response: ticket }),
+        signal: AbortSignal.timeout(10000),
       });
       if (!res.ok) return false;
       const json = (await res.json().catch(() => null)) as { success?: boolean } | null;
