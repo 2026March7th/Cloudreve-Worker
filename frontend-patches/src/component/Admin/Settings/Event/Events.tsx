@@ -40,8 +40,8 @@ import {
   NoWrapCell,
   SecondaryButton,
   StyledTableContainerPaper,
-} from "../../../../Common/StyledComponents.tsx";
-import TablePagination from "../../../../Admin/Common/TablePagination.tsx";
+} from "../../../Common/StyledComponents.tsx";
+import TablePagination from "../../../Admin/Common/TablePagination.tsx";
 import { NoMarginHelperText, SettingSection, SettingSectionContent } from "../Settings.tsx";
 import { SettingContext } from "../SettingWrapper.tsx";
 
