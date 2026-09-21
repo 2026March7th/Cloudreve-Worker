@@ -85,6 +85,25 @@ KV_COUNT=3 npm run kv:setup     # 重写 wrangler.toml 的 KV 段
 npm run deploy                  # 缺的 namespace 会自动创建
 ```
 
+> ⚠️ **`KV_COUNT` 千万别填在「Workers → 设置 → 变量和机密」里。** 那是**运行时**
+> 变量，而绑定数量必须在**构建时**确定，构建读不到它就静默落回默认值 1
+> —— 你以为配了 5 个，实际只绑了 1 个，而且**站点不报错**，很难发现。
+>
+> 正确做法二选一：
+> - **在仓库根目录提交一个名为 `KV_COUNT` 的文件**，内容就是一个数字（推荐，最稳）
+> - 或在 **GitHub 仓库 → Settings → Secrets and variables → Actions → Variables**
+>   里加 `KV_COUNT=5`
+
+配好后验证：构建日志里会打印实际读到多少、从哪读的：
+
+```
+  KV_COUNT = 5（来源：文件 KV_COUNT）
+✔ KV 绑定已装配：KV_COUNT=5 → 声明 KV_1..KV_5 + 兜底 KV（共 6 个绑定）
+```
+
+部署后再访问 `https://你的域名/api/v4/site/kv-status`，
+若 `distinct_namespaces` 是 `5` 就说明每个角色都绑到了独立 namespace。
+
 `kv:setup` 只认 1–5 的整数，填 6 会直接报错退出（不构建）。它把 `KV_1..KV_n`
 加一个兜底 `KV` 写进 `wrangler.toml` 的托管区（`# >>> multi-kv:begin` 之间），
 这段不要手改——下次跑会被覆盖。角色分工与回落规则见

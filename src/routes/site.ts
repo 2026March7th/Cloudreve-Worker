@@ -48,6 +48,55 @@ siteRoutes.get('/ping', (c) => {
   return ok(c, BACKEND_VERSION);
 });
 
+/**
+ * 诊断端点：回显当前 Worker 实际拿到的 KV 绑定。
+ *
+ * 存在的意义：多 KV 的绑定是**编译期**决定的（`wrangler.toml` 的
+ * `[[kv_namespaces]]`），配错了不会报错 —— `lib/kvRouter.ts` 会把缺失的
+ * 角色静默回退到兜底 `KV`，于是「配了 5 个实际只生效 1 个」从外部看不出来。
+ * 这个端点让「线上到底绑了几个」变成一条可以直接访问的 URL。
+ *
+ * 只暴露绑定**名字**，不含 ID、不含任何业务数据，无鉴权风险。
+ */
+siteRoutes.get('/kv-status', (c) => {
+  c.header('Cache-Control', 'no-cache');
+  const env = c.env as unknown as Record<string, unknown>;
+  const present = listKvBindings(c.env);
+  const roles = ['site', 'session', 'upload', 'cred', 'flag'] as const;
+
+  // 每个角色实际落到哪个绑定 —— 直接反映回退结果。
+  const resolved: Record<string, string> = {};
+  for (const role of roles) {
+    try {
+      const ns = kvFor(c.env, role);
+      resolved[role] = String((ns as unknown as { __kvBinding?: string }).__kvBinding ?? '?');
+    } catch {
+      resolved[role] = '(未绑定)';
+    }
+  }
+
+  const distinct = new Set(Object.values(resolved));
+  return ok(c, {
+    bindings: present,
+    kv_count: present.filter((b) => b !== 'KV').length,
+    roles: resolved,
+    // 角色实际落在几个不同的 namespace 上。=1 说明多 KV 没生效。
+    distinct_namespaces: distinct.size,
+    // 只有 KV_1 时 KV_COUNT_FILE / KV_COUNT 没被构建读到。
+    hint: distinct.size === 1
+      ? '所有角色都落在同一个 namespace：多 KV 未生效。检查构建时是否读到了 KV_COUNT（看图构建日志里的 "KV_COUNT = N（来源：…）"）。'
+      : '多 KV 已生效。',
+  });
+});
+
+/** 供诊断用：列出当前 env 上实际存在的 KV 绑定名。 */
+function listKvBindings(env: unknown): string[] {
+  const bindings = env as Record<string, unknown>;
+  return Object.keys(bindings)
+    .filter((k) => /^KV(_\d+)?$/.test(k))
+    .sort();
+}
+
 siteRoutes.get('/config/:section', async (c) => {
   const ctx = ctxOf(c);
   const section = c.req.param('section');

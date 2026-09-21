@@ -46,10 +46,14 @@ jobs:
       - name: 类型检查
         run: npm run typecheck
 
+      # 数量来源优先级：仓库 Variables 的 KV_COUNT > 仓库里的 KV_COUNT 文件 > 默认 1。
+      # 注意：这里**不能**写成 `vars.KV_COUNT || '1'` —— 那样在未配置 Variables 时
+      # 会把 KV_COUNT 强制设成 '1'，反而覆盖掉仓库里已提交的 KV_COUNT 文件
+      # （环境变量优先级高于文件）。留空即不设置，让脚本自己去读文件。
       - name: KV 绑定装配（校验 KV_COUNT 上限）
         run: npm run kv:setup
         env:
-          KV_COUNT: ${{ vars.KV_COUNT || '1' }}
+          KV_COUNT: ${{ vars.KV_COUNT }}
 
       # 这两个是纯离线测试（esbuild 打包后在内存里跑，不连任何外部服务），
       # 覆盖多 KV 角色路由与主备切换的路由决策。COPY 真机往返需要本机
@@ -76,7 +80,8 @@ jobs:
       DATABASE_URL_4: ${{ secrets.DATABASE_URL_4 }}
       DATABASE_URL_5: ${{ secrets.DATABASE_URL_5 }}
       DB_FAILOVER: ${{ vars.DB_FAILOVER }}
-      KV_COUNT: ${{ vars.KV_COUNT || '1' }}
+      # 留空即不设置，让 setup-kv.mjs 去读仓库里的 KV_COUNT 文件。
+      KV_COUNT: ${{ vars.KV_COUNT }}
     steps:
       - uses: actions/checkout@v4
 

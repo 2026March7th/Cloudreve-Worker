@@ -23,11 +23,24 @@
  * 数据还在，只是不再绑定 —— 这是刻意的，避免误删数据）。
  *
  * 用法：
- *   node scripts/setup-kv.mjs            # 读 KV_COUNT / KV_COUNT_1..5
+ *   node scripts/setup-kv.mjs            # 读 KV_COUNT / KV_COUNT 文件
  *   node scripts/setup-kv.mjs --count 3
  *   node scripts/setup-kv.mjs --dry      # 只打印将写入的内容
+ *   node scripts/setup-kv.mjs --verify   # 装配后再核对线上实际绑定
+ *
+ * ## 数量从哪来（优先级从高到低）
+ *
+ *   1. `--count N` 命令行参数
+ *   2. 环境变量 `KV_COUNT`（**构建环境**的，不是 Worker 面板的）
+ *   3. 仓库根目录的 `KV_COUNT` / `.kv-count` / `kv-count.txt` 文件（内容为 N）
+ *   4. 默认 1
+ *
+ * ⚠️ **「Cloudflare 面板 → 变量和机密」里的 KV_COUNT 是运行时变量，
+ * 构建时读不到**，会被这条链忽略而落回默认 1。要配这个变量，请放
+ * 「Workers Builds 的环境变量」或「GitHub 仓库 Variables」，或者用文件方式。
  */
 import { readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
@@ -66,29 +79,93 @@ function argOf(name) {
   return i === -1 ? undefined : process.argv[i + 1];
 }
 
-const raw = argOf('--count') ?? envVar('KV_COUNT') ?? '';
+/**
+ * 读取「已提交进仓库」的数量文件。
+ *
+ * ## 为什么需要这个（而不是只靠环境变量）
+ *
+ * `setup-kv.mjs` 跑在**构建环境**里，它读得到的是**构建环境**的环境变量。
+ * 而「Cloudflare 面板 → 变量和机密」里填的 KV_COUNT 是**运行时**变量，
+ * 构建时根本看不到 —— 于是它落回默认值 1，用户以为配了 5 个，实际只绑了 1 个。
+ *
+ * 这是个很难自查的坑：回退机制让站点**不报错**，看起来一切正常。
+ *
+ * 所以除环境变量外，额外支持一个**版本控制里的纯文本文件**：
+ *   - `KV_COUNT` 文件内容为 `5`
+ *   - 或 `.kv-count`
+ * 文件随仓库走，构建时必然可读，且不依赖任何平台侧配置 —— 最不易出错。
+ *
+ * 优先级：`--count` 参数 > 环境变量 > 文件 > 默认 1。
+ */
+function loadCountFile() {
+  for (const name of ['KV_COUNT', '.kv-count', 'kv-count.txt']) {
+    const p = path.join(ROOT, name);
+    if (!existsSync(p)) continue;
+    // 取第一个非空、非注释行；容忍尾随换行与行尾注释。
+    for (const line of readFileSync(p, 'utf8').split('\n')) {
+      const s = line.trim();
+      if (!s || s.startsWith('#')) continue;
+      return { value: s.split('#')[0].trim(), from: name };
+    }
+  }
+  return null;
+}
+
+const countFile = loadCountFile();
+const fromEnv = envVar('KV_COUNT');
+const fromArg = argOf('--count');
+
+const raw = fromArg ?? (fromEnv !== '' ? fromEnv : (countFile?.value ?? ''));
 const countStr = raw === '' ? '1' : raw;
+const countSource =
+  fromArg !== undefined
+    ? '--count 参数'
+    : fromEnv !== ''
+      ? '环境变量 KV_COUNT'
+      : countFile
+        ? `文件 ${countFile.from}`
+        : '默认值（未配置）';
 
 // --- 校验：必须是 1..5 的整数，否则拒绝构建 -------------------------------
 if (!/^\d+$/.test(countStr)) {
   console.error(
-    `\n✘ KV_COUNT 不是整数："${countStr}"\n` +
+    `\n✘ KV_COUNT 不是整数："${countStr}"（来源：${countSource}）\n` +
       `  取值必须是 1 到 ${MAX_KV} 之间的整数。\n`,
   );
   process.exit(1);
 }
 const count = Number(countStr);
 if (count < 1) {
-  console.error(`\n✘ KV_COUNT 不能小于 1（当前 ${count}）。至少要一个 KV 绑定。\n`);
+  console.error(`\n✘ KV_COUNT 不能小于 1（当前 ${count}，来源：${countSource}）。至少要一个 KV 绑定。\n`);
   process.exit(1);
 }
 if (count > MAX_KV) {
   console.error(
-    `\n✘ KV_COUNT = ${count} 超过上限 ${MAX_KV}，拒绝构建。\n` +
+    `\n✘ KV_COUNT = ${count} 超过上限 ${MAX_KV}，拒绝构建（来源：${countSource}）。\n` +
       `  Cloudflare 部署允许的 KV 绑定数有上限，且本项目按 5 个角色分工\n` +
       `  （site/session/upload/cred/flag）。改小到 ≤ ${MAX_KV} 再部署。\n`,
   );
   process.exit(1);
+}
+
+// 把来源打出来。这一行是排查「填了 5 却只绑了 1 个」的关键线索 ——
+// 之前没有任何输出，用户无从知道脚本到底读到了什么、落回了什么。
+console.log(`  KV_COUNT = ${count}（来源：${countSource}）`);
+if (count === 1 && countFile === null && fromEnv === '' && fromArg === undefined) {
+  console.log(
+    `  提示：未在任何地方配置 KV_COUNT，按默认 1 个处理。\n` +
+      `  想用多 KV，二选一：\n` +
+      `    ① 仓库 Settings → Secrets and variables → Actions → Variables 加 KV_COUNT=5\n` +
+      `    ② 在仓库根目录提交一个内容为 5 的 KV_COUNT 文件（最稳，随仓库走）\n`,
+  );
+}
+
+// --- 变更侦测：之前只有 KV_1，现在要 5 个，给出明确提示 -------------------
+const prevToml = readFileSync(TOML_PATH, 'utf8');
+const prevCountMatch = /# KV_COUNT = (\d+)/.exec(prevToml);
+const prevCount = prevCountMatch ? Number(prevCountMatch[1]) : null;
+if (prevCount !== null && prevCount !== count) {
+  console.log(`  KV 绑定数将从 ${prevCount} 变为 ${count}（wrangler.toml 会重写）`);
 }
 
 // --- 生成托管区 -----------------------------------------------------------
@@ -170,3 +247,69 @@ writeFileSync(TOML_PATH, toml);
 console.log(
   `✔ KV 绑定已装配：KV_COUNT=${count} → 声明 KV_1..KV_${count} + 兜底 KV（共 ${count + 1} 个绑定）`,
 );
+
+// --- --verify：查线上 Worker 实际绑定了几个 KV ----------------------------
+//
+// 这是「填了 5 却只绑了 1 个」最容易自查的一步：直接问 Cloudflare
+// 这个 Worker 当前到底挂了哪些绑定，而不是相信配置文件。
+//
+// 需要 CLOUDFLARE_API_TOKEN + CLOUDFLARE_ACCOUNT_ID，或已 `wrangler login`。
+if (process.argv.includes('--verify')) {
+  console.log('\n--- 核对线上 Worker 的实际 KV 绑定 ---');
+  const workerName = readWorkerName();
+
+  const res = runCapture(['wrangler', 'deployments', 'status', '--json'], workerName);
+  // `deployments status` 在部分版本不支持 --json；退回到解析 toml + 提示。
+  if (!res.ok) {
+    console.log(
+      '  无法自动查询线上绑定（需要 wrangler 登录或 CLOUDFLARE_API_TOKEN）。\n' +
+        '  请手动核对：Cloudflare 面板 → Workers & Pages → 该 Worker → 设置 → 变量 → KV 命名空间绑定\n' +
+        `  应当看到 ${count} 个 KV_n 绑定 + 1 个兜底 KV，共 ${count + 1} 个。`,
+    );
+    process.exit(0);
+  }
+
+  const bound = [...res.out.matchAll(/\b(KV_\d+|KV)\b/g)].map((m) => m[1]);
+  const uniq = [...new Set(bound)].sort();
+  const expected = [];
+  for (let i = 1; i <= count; i++) expected.push(`KV_${i}`);
+  expected.push('KV');
+
+  console.log(`  线上绑定：${uniq.length ? uniq.join(', ') : '（未解析到，请手动核对）'}`);
+  console.log(`  期望绑定：${expected.join(', ')}`);
+
+  const missing = expected.filter((b) => !uniq.includes(b));
+  if (missing.length) {
+    console.log(
+      `\n⚠ 缺失 ${missing.length} 个：${missing.join(', ')}\n` +
+        '  说明这次部署没有把新绑定带上。检查：\n' +
+        '    ① 构建时是否真的读到了 KV_COUNT（看本次构建日志里的 "KV_COUNT = N（来源：…）"）\n' +
+        '    ② wrangler.toml 是否被提交并推到仓库\n' +
+        '    ③ 部署后是否重新部署过（改配置必须重新部署才生效）\n',
+    );
+    process.exit(1);
+  }
+  console.log('\n✔ 线上绑定与配置一致。\n');
+}
+
+/** 从 wrangler.toml 读 worker 名。 */
+function readWorkerName() {
+  const m = /^name\s*=\s*"([^"]+)"/m.exec(readFileSync(TOML_PATH, 'utf8'));
+  return m ? m[1] : 'cloudreve-worker';
+}
+
+/** 跑一条命令并捕获输出（失败不退出）。 */
+function runCapture(args, wname) {
+  try {
+    const out = execFileSync('npx', [...args, '--name', wname], {
+      cwd: ROOT,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 120_000,
+      shell: process.platform === 'win32',
+    });
+    return { ok: true, out };
+  } catch (err) {
+    return { ok: false, out: String(err?.stdout ?? '') + String(err?.stderr ?? '') };
+  }
+}
