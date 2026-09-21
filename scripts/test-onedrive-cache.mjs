@@ -127,6 +127,7 @@ function makePolicy(id, accessKey) {
     secret_key: 'client-secret',
     access_key: accessKey ?? 'rt-db-initial-' + id,
     settings: { od_redirect: 'https://example.com/cb' },
+    updated_at: new Date('2026-09-21T12:00:00Z'),
   };
 }
 const driver = (id, accessKey) => new OneDriveDriver(env, makePolicy(id, accessKey));
@@ -278,6 +279,44 @@ const CRED = (id) => 'cred_od_' + id;
   await d.meta('y.txt');
   assert.equal(calls.token - t0, 0, 'T7 KV 里凭证仍有效，不刷新');
   assert.ok(kv.stats.get > kvGets, 'T7 L1 失效后回落到 KV');
+}
+
+// ---------------------------------------------------------------------------
+// T8 授权状态：数据库为权威（KV 传播延迟不误报「掉授权」）
+// ---------------------------------------------------------------------------
+{
+  // 库里有 access_key、KV/L1 全空（模拟刚授权完、KV 未同步到的 colo）
+  const d = driver(8, 'rt-db-8');
+  const st = await d.credentialStatus();
+  assert.equal(st.valid, true, 'T8 库里有 refresh token 即已授权');
+  assert.equal(
+    st.last_refresh_time,
+    new Date('2026-09-21T12:00:00Z').toISOString(),
+    'T8 缓存缺失时回退 policy.updated_at',
+  );
+
+  // 缓存命中时返回精确刷新时间
+  await kvFor(env, 'cred').put(
+    CRED(8),
+    JSON.stringify({
+      access_token: 'AT8',
+      refresh_token: 'RT8',
+      expires_in: nowS() + 3600,
+      refreshed_at: 1700000000,
+    }),
+  );
+  const st2 = await d.credentialStatus();
+  assert.equal(st2.valid, true, 'T8 缓存命中依然有效');
+  assert.equal(
+    st2.last_refresh_time,
+    new Date(1700000000 * 1000).toISOString(),
+    'T8 缓存命中返回精确刷新时间',
+  );
+
+  // 库里没有 access_key → 未授权
+  const d2 = driver(9, '');
+  const st3 = await d2.credentialStatus();
+  assert.deepEqual(st3, { valid: false, last_refresh_time: null }, 'T9 无 refresh token 即未授权');
 }
 
 // ---------------------------------------------------------------------------

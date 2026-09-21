@@ -336,11 +336,25 @@ export class OneDriveDriver implements StorageDriver {
    * 原版从凭据管理器拿 Credential 后取 `RefreshedAt()`；这里读同一份 KV 缓存。
    * 缓存里没有（未授权 / 已过期）或策略本身没存 refresh token 时，都算未授权。
    */
+  /**
+   * 读取当前凭证状态，对应原版 `OauthCredentialStatus`。
+   *
+   * **数据库是权威**：`policy.access_key`（refresh token）非空即视为已授权。
+   * KV 是缓存且有最终一致性延迟（全球传播可达 30-60 秒）——刚授权完的
+   * status 查询若落在未同步的 colo，缓存读空；若据此报「未授权」，用户会
+   * 看到「授权成功、返回刷新又掉了」的假象，并被诱导反复重新授权。
+   * `last_refresh_time` 优先取缓存里的精确刷新时间；缓存没有时回退到
+   * `policy.updated_at`（callback / signin 写 access_key 时都会刷新它）。
+   */
   async credentialStatus(): Promise<{ valid: boolean; last_refresh_time: string | null }> {
     if (!this.policy.access_key) return { valid: false, last_refresh_time: null };
     const cached = await this.readCredential();
-    if (!cached?.refreshed_at) return { valid: false, last_refresh_time: null };
-    return { valid: true, last_refresh_time: new Date(cached.refreshed_at * 1000).toISOString() };
+    const refreshedAt = cached?.refreshed_at
+      ? new Date(cached.refreshed_at * 1000).toISOString()
+      : this.policy.updated_at
+        ? new Date(this.policy.updated_at).toISOString()
+        : null;
+    return { valid: true, last_refresh_time: refreshedAt };
   }
 
   /**
