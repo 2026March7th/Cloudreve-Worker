@@ -61,9 +61,11 @@ import { isSocialMediaBot, renderSharePreview } from './services/share-preview';
  *     里建，导致「只按 migrations 建库」的备库缺这张表 → 该表同步不过去）。
  * v8：新增归档迁移 0010（archive_entries 表 + 只增不改触发器）。
  * v9：新增迁移 0011（存量 file_viewers='[]' 行回填内置查看器默认集，
- *     修复前端「打开方式」菜单为空）。
+ *     修复前端「打开方式」菜单为空）。⚠️ v9 被一次漏注册迁移的部署烧掉
+ *     （迁移文件没进 provision.ts 的 MIGRATIONS 清单，flag 先置位了）。
+ * v10：0011 真正注册进 MIGRATIONS 清单后重新触发自举。
  */
-const BOOTSTRAP_FLAG = 'bootstrap:done:v9';
+const BOOTSTRAP_FLAG = 'bootstrap:done:v10';
 /** 自举失败后的冷却键（20 秒 TTL）：期间请求直接快速失败，不再重放自举。 */
 const BOOTSTRAP_COOLDOWN = 'bootstrap:cooldown:v1';
 /** 同一 isolate 内的并发请求共享一次自举。 */
