@@ -273,6 +273,17 @@ adminRoutes.patch('/settings', async (c) => {
   const PROTECTED_KEYS = new Set(['secret_key', 'siteID', 'hash_id_salt']);
 
   const sql = (await import('../db')).getSql(ctx.env);
+
+  // 先读旧值用于归档 —— 归档要的是「被覆盖前是什么」，必须在 UPDATE 之前读。
+  const keys = Object.keys(raw).filter((k) => !PROTECTED_KEYS.has(k));
+  const oldRows = keys.length
+    ? ((await sql`SELECT name, value FROM settings WHERE name = ANY(${keys})`) as {
+        name: string;
+        value: string | null;
+      }[])
+    : [];
+  const oldValues = new Map(oldRows.map((r) => [r.name, r.value ?? '']));
+
   const saved: Record<string, string> = {};
   for (const [key, value] of Object.entries(raw)) {
     if (PROTECTED_KEYS.has(key)) continue;
@@ -300,6 +311,28 @@ adminRoutes.patch('/settings', async (c) => {
     `;
   }
   await invalidateSettings(ctx.env);
+
+  // 归档被覆盖的旧值 —— 只记录**真的变了**的键（没变的不产生噪声）。
+  // 归档是增强能力：失败不影响保存结果，所以整体 try/catch 且不 await
+  // 太久（用 ctx 的 waitUntil 更好，但这些值很小、KV put 很快）。
+  try {
+    const changed = Object.entries(saved).filter(([k, v]) => oldValues.get(k) !== v);
+    if (changed.length) {
+      const { archivePut } = await import('../services/archive');
+      for (const [key, newValue] of changed) {
+        await archivePut(
+          ctx.env,
+          'settings',
+          key,
+          { name: key, value: oldValues.get(key) ?? '' },
+          { actor: ctx.user?.id, note: `updated to ${String(newValue).slice(0, 120)}` },
+        );
+      }
+    }
+  } catch {
+    // 归档失败绝不影响设置保存本身
+  }
+
   return ok(c, saved);
 });
 

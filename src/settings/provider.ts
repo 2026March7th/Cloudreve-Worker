@@ -245,6 +245,26 @@ export async function loadSettings(env: Env, db: DbHandle = resolveDb(env)): Pro
     }
   }
 
+  const map = await refillSettingsFromDb(env, db);
+  memoryCache = { at: Date.now(), map };
+  return new SettingsProvider(env, map);
+}
+
+/** 清掉内存缓存（测试 / 手动失效用）。 */
+export function clearSettingsMemoryCache(): void {
+  memoryCache = null;
+}
+
+/**
+ * 从数据库读全量设置并**覆盖写**进 KV。
+ *
+ * 这是「回源 + 写回」的唯一实现，被 `loadSettings` 的未命中路径与
+ * `refreshSettingsCache` 共用 —— 避免「两份实现各写一遍键格式」而漂移。
+ *
+ * 不删旧键、不读缓存：直接算出一份新的再 put 覆盖。这样**不存在**
+ * 「键被删掉、新值还没写」的空窗（空窗期间并发请求会全部回源打库）。
+ */
+async function refillSettingsFromDb(env: Env, db: DbHandle = resolveDb(env)): Promise<Map<string, string>> {
   const sql = db.sql;
   // 空闲后（Neon 免费版会自动休眠计算节点）第一条查询偶尔会撞上瞬态错误，
   // 定时任务一小时才来一次，正好踩在这个场景上 —— 限流/网络抖动统一退避重试。
@@ -263,14 +283,43 @@ export async function loadSettings(env: Env, db: DbHandle = resolveDb(env)): Pro
   const obj: Record<string, string> = {};
   for (const [k, v] of map) obj[k] = v;
   await kvFor(env, 'site').put(KV_CACHE_KEY, JSON.stringify(obj), { expirationTtl: KV_CACHE_TTL });
-
-  memoryCache = { at: Date.now(), map };
-  return new SettingsProvider(env, map);
+  return map;
 }
 
-/** 清掉内存缓存（测试 / 手动失效用）。 */
-export function clearSettingsMemoryCache(): void {
-  memoryCache = null;
+/**
+ * 强制回源数据库并**重新写回** KV 缓存（预热 / 定时刷新用）。
+ *
+ * 与 `loadSettings` 的区别：`loadSettings` 命中内存或 KV 就返回，**不会**
+ * 刷新 KV 里的值；而定时任务要的正是「把 KV 里的旧值换成新值」。
+ *
+ * ## 为什么是「先算新值再覆盖」而不是「先删旧值」
+ *
+ * 早先的实现是 `delete(KV_CACHE_KEY)` + `loadSettings()` —— 能工作，
+ * 但有两个毛病：
+ *   1. **空窗**：删掉之后到新值写回之间，并发请求会全部回源打库
+ *      （免费档 Neon 会被打限流，正是本项目最怕的那种放大）。
+ *   2. **失败即丢缓存**：如果删完之后回源失败，一份本来可用的缓存
+ *      就白白没了，站点从「读缓存」退化成「每个请求都回源」。
+ * 改成「读出新的、再覆盖旧」后，两个毛病都没有：旧值一直可用，
+ * 直到新值就位才被替换。这也是下面测试断言「预热零 delete」的原因。
+ *
+ * 顺带修一个潜在问题：`loadSettings` 命中 KV 时会 `memoryCache = {at: now}`，
+ * 于是**每次命中都重置 TTL**，内存缓存实际上永不过期（只要请求不断）。
+ * 对普通请求这反而是好事（少打 KV），但定时刷新要的是「拿到最新的」，
+ * 所以这里显式清掉内存，保证真的回源。
+ *
+ * 失败返回 false，**不抛** —— 预热是优化，不能把定时任务打挂。
+ */
+export async function refreshSettingsCache(env: Env): Promise<boolean> {
+  try {
+    memoryCache = null;
+    const map = await refillSettingsFromDb(env);
+    memoryCache = { at: Date.now(), map };
+    return true;
+  } catch (e) {
+    console.error('settings cache refresh failed', e instanceof Error ? e.message : String(e));
+    return false;
+  }
 }
 
 /** 后台改设置后调用，让 KV 缓存失效（内存缓存一并清掉）。 */

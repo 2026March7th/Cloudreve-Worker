@@ -55,16 +55,24 @@ jobs:
         env:
           KV_COUNT: ${{ vars.KV_COUNT }}
 
-      # 这三个是纯离线测试（esbuild 打包后在内存里跑，不连任何外部服务），
-      # 覆盖多 KV 角色路由、主备切换的路由决策、以及用户/用户组两级缓存
+      # 这四个是纯离线测试（esbuild 打包后在内存里跑，不连任何外部服务），
+      # 覆盖多 KV 角色路由、主备切换的路由决策、用户/用户组两级缓存
       # （含「8 个写方法是否都自动失效」——漏一个就是「改了不生效」甚至
-      # 封禁不生效的安全问题）。COPY 真机往返需要本机 PostgreSQL，跑不了，
-      # 因此不进 CI。
-      - name: 多 KV / 主备路由 / 用户缓存回归测试
+      # 封禁不生效的安全问题）、以及缓存清空/刷新（含最关键的一条：
+      # **清理绝不能碰自举标记**，否则每次冷启动都会重放自举把库打限流）。
+      # COPY 真机往返需要本机 PostgreSQL，跑不了，因此不进 CI。
+      - name: 多 KV / 主备路由 / 用户缓存 / 缓存清理回归测试
         run: |
           npm run test:kv-router
           npm run test:db-failover
           npm run test:user-cache
+          npm run test:cache-purge
+
+      # 干跑清理脚本：验证「缓存清单能被解析出来、角色映射没漂移」。
+      # 不清任何东西（--dry），也不需要 Cloudflare 凭据 —— 未开通 KV 时
+      # 它会因「toml 里没有真实 id」而跳过，同样是成功路径。
+      - name: 校验 KV 清理脚本（干跑，不实际清理）
+        run: npm run kv:purge:dry
 
       - name: 构建 + dry-run 检查（含拉取官方前端）
         run: npm run build

@@ -92,6 +92,14 @@ export interface Env {
   KV_3?: KVNamespace;
   KV_4?: KVNamespace;
   KV_5?: KVNamespace;
+  /**
+   * 归档区 KV（**可选**）。独立于 KV_1..KV_5，用来留「被覆盖前的旧值」。
+   *
+   * 为什么不复用上面某个角色：归档是**只增不减**的历史，而业务 KV 是
+   * 可被整体清理的缓存区。混在一起的话清一次业务缓存就把历史清了。
+   * 未绑定时归档功能整体降级为 no-op（见 `services/archive.ts`）。
+   */
+  ARCHIVE_KV?: KVNamespace;
   /** R2：内置对象存储后端 */
   R2: R2Bucket;
   /**

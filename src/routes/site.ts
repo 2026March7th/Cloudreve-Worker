@@ -19,6 +19,10 @@ import { publicOidcInfo } from '../services/oidc';
 import type { AppContext } from '../services/context';
 import { kvFor } from '../lib/kvRouter';
 import { backupDatabaseUrls, databaseUrls, failoverEnabled } from '../db';
+import { archiveCount, archiveEnabled } from '../services/archive';
+import { walUnfinished } from '../services/wal';
+import { purgeAllCaches, warmAllCaches } from '../services/cacheWarmer';
+import { CACHE_ENTRIES, purgeableEntries } from '../lib/cacheRegistry';
 
 const CAPTCHA_PREFIX = 'captcha:';
 const CAPTCHA_TTL = 1800; // 与原版 CaptchaTTL 一致（30 分钟）
@@ -162,6 +166,124 @@ function safeHost(url: string): string {
     return '(无法解析)';
   }
 }
+
+/**
+ * 诊断端点：归档区（ARCHIVE_KV）与写前日志（WAL）是否可用。
+ *
+ * 归档与 WAL 都是**可选增强**，没绑 `ARCHIVE_KV` 时整体降级为 no-op
+ * —— 站点照常工作，但你不会得到「历史版本」与「未完成操作」这两项能力。
+ * 因为这个降级是静默的（设计如此，避免把可选项变成必需项），所以需要
+ * 一个端点明确告诉你「到底有没有在生效」。
+ */
+siteRoutes.get('/archive-status', async (c) => {
+  c.header('Cache-Control', 'no-cache');
+  const env = c.env;
+  const enabled = archiveEnabled(env);
+  if (!enabled) {
+    return ok(c, {
+      archive_enabled: false,
+      wal_enabled: false,
+      hint:
+        '未绑定 ARCHIVE_KV —— 归档与写前日志整体降级为 no-op（站点照常运行，但没有历史版本与未完成操作记录）。' +
+        '要启用：在 Cloudflare 面板为该 Worker 添加一个 KV namespace 绑定，名字填 ARCHIVE_KV。',
+    });
+  }
+
+  // 只读探测：列几页，确认读写真的通（绑定存在但权限/状态异常时也能发现）。
+  let archiveCountNum = 0;
+  let unfinished: unknown[] = [];
+  try {
+    archiveCountNum = await archiveCount(env);
+    unfinished = (await walUnfinished(env, 20)).map((e) => ({
+      op: e.op,
+      ref: e.ref,
+      status: e.status,
+      started_at: e.startedAt,
+      error: e.error,
+    }));
+  } catch {
+    return ok(c, {
+      archive_enabled: true,
+      wal_enabled: true,
+      readable: false,
+      hint: 'ARCHIVE_KV 已绑定但读取失败，请检查该 namespace 的状态。',
+    });
+  }
+
+  return ok(c, {
+    archive_enabled: true,
+    wal_enabled: true,
+    readable: true,
+    archive_entries: archiveCountNum,
+    unfinished_operations: unfinished,
+    hint:
+      unfinished.length === 0
+        ? '归档区正常，当前没有未完成的多步操作。'
+        : `有 ${unfinished.length} 个多步操作标为未完成（pending/failed）。这些是「起了头但没走完」的操作，需人工核对。`,
+  });
+});
+
+
+/**
+ * 诊断端点：缓存清单、每类键的数量、以及手动触发一次刷新/清理。
+ *
+ * 存在的理由与 `/kv-status`、`/db-status` 相同 —— 「清空 + 重填 + 每小时
+ * 刷新」这套机制如果没在生效，从外部完全看不出来（缓存本身就是透明的）。
+ * 这个端点让「到底缓存了些什么、每类有多少、上次刷新成不成功」变成一条
+ * 可以直接访问的 URL。
+ *
+ * 查询参数：
+ *   - `?refresh=1` 手动触发一次**刷新**（覆盖写，安全、开销恒定）；
+ *   - `?purge=1`   尝试**清理**（受 subrequest 预算限制，可能清不干净；
+ *                  完整的清理请用构建期脚本 `npm run kv:refill`）。
+ *
+ * 无鉴权：只暴露**条数**与**清单**，不含任何业务数据值。
+ */
+siteRoutes.get('/cache-status', async (c) => {
+  c.header('Cache-Control', 'no-cache');
+  const env = c.env;
+  const q = new URL(c.req.url).searchParams;
+
+  // 每类缓存当前的键数（只列首页，够判断「有没有在缓存」）。
+  const counts: { id: string; label: string; role: string; keys: number; purged: boolean }[] = [];
+  for (const entry of CACHE_ENTRIES) {
+    let n = 0;
+    try {
+      const listed = await kvFor(env, entry.role).list({ prefix: entry.prefix, limit: 1000 });
+      n = listed.keys.length;
+    } catch {
+      n = -1; // 角色未绑定
+    }
+    counts.push({
+      id: entry.id,
+      label: entry.label,
+      role: entry.role,
+      keys: n,
+      purged: entry.purge,
+    });
+  }
+
+  const result: Record<string, unknown> = {
+    entries: counts,
+    purge_roles: purgeableEntries().map((e) => e.role),
+    // 关键说明：`flag` 永不参与清理，避免触发重新自举。
+    note: '清理只覆盖 purge=true 的条目；自举标记（flag 角色）永不清理，否则会触发站点重新自举。',
+  };
+
+  if (q.get('refresh') === '1') {
+    const warmed = await warmAllCaches(env);
+    result.refresh = warmed;
+  }
+  if (q.get('purge') === '1') {
+    const purged = await purgeAllCaches(env);
+    result.purge = purged;
+    result.purge_note =
+      'Worker 内清理受 subrequest 预算限制（免费档 50），可能只清了一部分。完整清空请用构建期脚本。';
+  }
+
+  return ok(c, result) as never;
+});
+
 
 siteRoutes.get('/config/:section', async (c) => {
   const ctx = ctxOf(c);

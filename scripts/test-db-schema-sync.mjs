@@ -35,6 +35,7 @@ const MIGRATION_FILES = [
   '0001_init.sql', '0002_admin_content.sql', '0003_dav_passkey.sql',
   '0004_node_settings.sql', '0005_payment.sql', '0006_audit_log.sql',
   '0007_paid_share.sql', '0008_oidc.sql', '0009_group_storage_policies.sql',
+  '0010_archive.sql',
 ];
 
 /** db-sync.mjs 的 SYNC_TABLES —— 全量同步要覆盖的表。 */
@@ -43,7 +44,7 @@ const SYNC_TABLES = [
   'users', 'files', 'entities', 'file_entities', 'metadata', 'shares',
   'share_purchases', 'direct_links', 'tasks', 'dav_accounts', 'passkeys',
   'oauth_clients', 'oauth_grants', 'user_oidc_bindings', 'orders',
-  'gift_codes', 'audit_logs',
+  'gift_codes', 'audit_logs', 'archive_entries',
 ];
 
 const TEST_DB = 'cre_schema_sync_test';

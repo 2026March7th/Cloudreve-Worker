@@ -110,7 +110,7 @@ const SYNC_TABLES = [
   'users', 'files', 'entities', 'file_entities', 'metadata', 'shares',
   'share_purchases', 'direct_links', 'tasks', 'dav_accounts', 'passkeys',
   'oauth_clients', 'oauth_grants', 'user_oidc_bindings', 'orders',
-  'gift_codes', 'audit_logs',
+  'gift_codes', 'audit_logs', 'archive_entries',
 ];
 
 const only = argOf('--only')?.split(',').map((s) => s.trim()).filter(Boolean);
@@ -198,6 +198,7 @@ const MIGRATION_FILES = [
   '0007_paid_share.sql',
   '0008_oidc.sql',
   '0009_group_storage_policies.sql',
+  '0010_archive.sql',
 ];
 
 /** 去注释后按分号切分。与 src/db/provision.ts 的 splitStatements 同源。 */

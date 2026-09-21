@@ -158,6 +158,55 @@ DB_SYNC_SKIP=audit_logs npm run db:sync   # 跳过指定表
 
 CI 里这三步的顺序是「**先同步、后部署**」，避免出现「新代码 + 旧数据」的窗口。数据搬运的偶发错误不阻断部署（备库是安全网）；但**结构性失败（连不上/建不出表/缺表）会让 CI 失败**，因为那意味着这个备库根本没被用上。
 
+## 缓存：构建时清空，每小时刷新
+
+KV 在这里**纯粹是缓存** —— 唯一的真相在 Neon 里。所以「缓存键」是可以随时丢掉的，而**每次部署都从零开始是必要的**：缓存键的语义契约会随版本变化，但键名不变，于是「上一版写的值」在新版读出来就是错的。本项目踩过这个坑（前端把站点配置缓存在 localStorage 旧键里，脏值被永久缓存，每次打开都崩），所以每次构建都清一遍。
+
+### 清空 + 重填（构建期，`kv:purge`）
+
+`npm run deploy` 会自动跑 `scripts/kv-purge-refill.mjs`（在「KV 已就绪」之后、「发布」之前）：
+
+```bash
+npm run kv:purge        # 清空 + 交回填给 Worker
+npm run kv:purge:dry    # 只看会清哪些 namespace / 前缀，不动手
+```
+
+**清哪些、不清哪些，由 `src/lib/cacheRegistry.ts` 这张清单决定**（唯一真相，脚本只是把它翻译成命令）：
+
+| 缓存类 | 角色 | 键前缀 | 清理 |
+|---|---|---|---|
+| 站点设置 | site | `settings:` | ✅ |
+| 用户行 | session | `user:` | ✅ |
+| 验证码 | session | `captcha:` | ✅ |
+| 一次性会话状态（吊销/2FA/OIDC state/OAuth code/passkey） | session | `session:` | ✅ |
+| 上传 / 打包 / WebDAV 锁 / WOPI | upload | `upload` | ✅ |
+| 外部凭据缓存（OneDrive token / OIDC discovery） | cred | （整块） | ✅ |
+| **自举 / 迁移标记** | **flag** | `bootstrap:` | ❌ **永不清理** |
+
+> **`flag` 角色永不清理，这是整套机制里最重要的一条。** 清掉 `bootstrap:done:v*` 会让 Worker 认为站点还没自举，于是每次冷启动重放 `provision()` + `ensureSettings()`（两次全表扫描）——免费档 Neon 直接打限流，而症状是「站点变慢」不是「报错」，极难定位。这条不变量由 `npm run test:cache-purge` 的断言固化。
+
+**为什么清空放在构建脚本里、不放 Worker 里**：KV 的绑定 API **没有批量删**（`delete(key)` 只收一个键名，与 Durable Object 的 `delete(keys[])` 不同）。在 Worker 里清空 = `list` 翻页 + 逐键 `delete`，而每个键的删除都是一个 subrequest —— 免费档总共 50 个，清 200 个键就把预算烧光。CLI 走 Cloudflare HTTP API 没这个限制（`kv bulk delete` 一次最多 10000 个键）。
+
+**回填**不在这步做：构建脚本没有 Worker 的 env 绑定（拿不到库连接）。交给 Worker —— 部署后第一次请求重建站点设置缓存，其余按需填充。
+
+### 每小时刷新（Cron，`0 * * * *`）
+
+`src/index.ts` 的 `scheduled()` 每小时整点做两件事：
+
+1. **缓存刷新** —— 把站点设置回源重写一遍（覆盖写，**零 list / 零 delete**，开销恒定，不随缓存键数增长），保证内容不会因为「某条写路径漏了失效」而长期陈旧；
+2. 回收站到期清理（对应原版的 `trash_collector`）。
+
+刷新用的是「**先算出新值、再覆盖旧值**」，而不是「先删旧值、再回源」。后者有两个毛病：删掉之后到新值写回之间有**空窗**（并发请求全部回源打库），而且如果回源失败，一份本来可用的缓存就白白丢了。覆盖写没有这两个问题。
+
+### 怎么确认在生效
+
+```bash
+curl https://你的域名/api/v4/site/cache-status
+curl "https://你的域名/api/v4/site/cache-status?refresh=1"   # 顺手刷一次
+```
+
+返回每类缓存的**键数**与清理名单（只给条数，不含任何业务数据）。`keys` 为 `-1` 表示该角色未绑定。
+
 ## 架构
 
 ```

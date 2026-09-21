@@ -80,7 +80,7 @@ function extractJsonArray(text) {
   return null;
 }
 
-console.log('▶ 1/5 检查 KV namespace…');
+console.log('▶ 1/6 检查 KV namespace…');
 
 // 先按 KV_COUNT 装配绑定（超过 5 直接拒绝构建，见该脚本的说明）。
 runOrDie(
@@ -185,7 +185,7 @@ if (bindingsNeedingWork.length === 0) {
   console.log('  已把 KV ID 回填进 wrangler.toml。');
 }
 
-console.log('▶ 2/5 检查 R2 bucket…');
+console.log('▶ 2/6 检查 R2 bucket…');
 {
   const list = run(NPX, npxArgs(['r2', 'bucket', 'list']));
   let exists = false;
@@ -205,10 +205,32 @@ console.log('▶ 2/5 检查 R2 bucket…');
   }
 }
 
-console.log('▶ 3/5 准备官方前端（frontend/，缺了会自动拉源码构建）…');
+console.log('▶ 3/6 准备官方前端（frontend/，缺了会自动拉源码构建）…');
 runOrDie(process.execPath, [path.join(ROOT, 'scripts', 'fetch-frontend.mjs')], '准备官方前端');
 
-console.log('▶ 4/5 发布 Worker…');
+/**
+ * 清空 KV 缓存，让新版本从零开始（需求：「每一次构建的时候，清空所有 kv
+ * 数据库，然后再把要缓存的东西重新填进去」）。
+ *
+ * 放在「KV 已就绪」之后、「发布」之前：此时 wrangler.toml 里的 namespace id
+ * 都是真实的，脚本才能定位到正确的 namespace。
+ *
+ * **失败不阻断部署**：清缓存失败最多是「这次没清干净」，而阻断部署是
+ * 「站点没更新」—— 后者严重得多。所以这里只警告，不加 runOrDie。
+ * 想让它硬失败就加 `--strict`（见该脚本）。
+ *
+ * 回填不在这一步做：构建脚本没有 Worker 的 env 绑定（拿不到库连接），
+ * 让 Worker 部署后自己重建（第一次请求 + 每小时 cron）才是唯一真相源。
+ */
+{
+  const r = run(process.execPath, [path.join(ROOT, 'scripts', 'kv-purge-refill.mjs')]);
+  console.log(r.all.trimEnd());
+  if (r.code !== 0) {
+    console.log('  （清缓存失败不阻断部署 —— 缓存最多脏一轮，下次构建会再清）');
+  }
+}
+
+console.log('▶ 4/6 发布 Worker…');
 {
   const args = ['deploy'];
   for (const key of ['SITE_URL', 'FRONTEND_URL']) {
@@ -231,10 +253,10 @@ console.log('▶ 4/5 发布 Worker…');
   ].filter((k) => process.env[k]?.trim());
 
   if (secrets.length === 0) {
-    console.log('▶ 5/5 跳过 Secret（CI 环境变量里没有 DATABASE_URL）。');
+    console.log('▶ 5/6 跳过 Secret（CI 环境变量里没有 DATABASE_URL）。');
     console.log('  记得到 Cloudflare 面板 → 该 Worker → 设置 → 变量和机密，添加 DATABASE_URL。');
   } else {
-    console.log(`▶ 5/5 写入 ${secrets.length} 个数据库连接 Secret…`);
+    console.log(`▶ 5/6 写入 ${secrets.length} 个数据库连接 Secret…`);
     for (const key of secrets) {
       // secret put 非交互时从 stdin 读值；失败不阻断（也许面板里已手动设过）
       const r = run(NPX, npxArgs(['secret', 'put', key]), {

@@ -24,6 +24,7 @@ import m0006 from '../../migrations/0006_audit_log.sql';
 import m0007 from '../../migrations/0007_paid_share.sql';
 import m0008 from '../../migrations/0008_oidc.sql';
 import m0009 from '../../migrations/0009_group_storage_policies.sql';
+import m0010 from '../../migrations/0010_archive.sql';
 import { withRetry } from './index';
 import { randomString } from '../lib/crypto';
 import type { Env } from '../env';
@@ -40,6 +41,7 @@ const MIGRATIONS: ReadonlyArray<readonly [name: string, sqlText: string]> = [
   ['0007_paid_share.sql', m0007],
   ['0008_oidc.sql', m0008],
   ['0009_group_storage_policies.sql', m0009],
+  ['0010_archive.sql', m0010],
 ];
 
 /** KV 标记：值是最后一个已应用的迁移文件名，文件名不变就跳过。 */

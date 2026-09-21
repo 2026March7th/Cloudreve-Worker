@@ -1,0 +1,64 @@
+# ---------------------------------------------------------------------------
+# 每日备份：主库 → 备库全量同步
+#
+# 为什么要有这个独立工作流（而不是只靠每次构建时的那次同步）：
+#
+#   构建期同步只在「你 push 代码」时发生。如果你的站点在两次提交之间
+#   跑了一周，那这一周的数据**从来没有进过备库** —— 主库这时挂掉，
+#   备库还停在上一周。备份的意义在于「随时可用」，所以需要按时间跑。
+#
+# 这个工作流与构建期同步**共用同一个脚本**（scripts/db-sync.mjs），
+# 包括其中的「自动为备库建表」逻辑。
+#
+# 需要的 Secrets（与 CI 其它工作流相同）：
+#   DATABASE_URL      主库连接串
+#   DATABASE_URL_2..5 备库连接串（有几个配几个）
+#
+# 没配 DATABASE_URL_2 时会自动跳过（不报错）——只配了主库的部署不该
+# 每天收到一个失败通知。
+# ---------------------------------------------------------------------------
+name: 每日备份（主库 → 备库）
+
+on:
+  schedule:
+    # 每天 UTC 18:00 = 北京时间凌晨 2:00（低峰时段，不干扰正常使用）
+    - cron: '0 18 * * *'
+  workflow_dispatch: # 也允许手动点一下立刻备份
+
+jobs:
+  backup:
+    name: 全量同步到备库
+    runs-on: ubuntu-latest
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      DATABASE_URL_2: ${{ secrets.DATABASE_URL_2 }}
+      DATABASE_URL_3: ${{ secrets.DATABASE_URL_3 }}
+      DATABASE_URL_4: ${{ secrets.DATABASE_URL_4 }}
+      DATABASE_URL_5: ${{ secrets.DATABASE_URL_5 }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: 安装依赖
+        run: npm install
+
+      - name: 检查是否配置了备库
+        id: backups
+        run: |
+          if [ -n "$DATABASE_URL" ] && [ -n "$DATABASE_URL_2" ]; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::未配置备库（DATABASE_URL_2..），跳过每日备份"
+          fi
+
+      # 这里**用 --strict**：定时备份与构建期同步的取舍不同 ——
+      # 构建期同步失败不该拦着站点更新（安全网没铺好不该影响业务），
+      # 但定时备份失败就是**备份没做成**，必须让人知道（红掉 + 通知）。
+      - name: 主库 → 备库全量同步
+        if: steps.backups.outputs.ok == 'true'
+        run: node scripts/db-sync.mjs --strict

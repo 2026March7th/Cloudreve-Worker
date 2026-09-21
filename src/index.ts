@@ -26,6 +26,7 @@ import { ensureSettings, loadSettings } from './settings/provider';
 import { provision } from './db/provision';
 import { resolveDb } from './db/shard';
 import { kvFor } from './lib/kvRouter';
+import { warmAllCaches } from './services/cacheWarmer';
 import { ensureEnvAdmin } from './services/envAdmin';
 import { HashIDCodec } from './lib/hashid';
 import { JWTService } from './lib/jwt';
@@ -58,8 +59,9 @@ import { isSocialMediaBot, renderSharePreview } from './services/share-preview';
  * v6：新增 OIDC 迁移 0008（user_oidc_bindings 表）。
  * v7：group_storage_policies 建表移入迁移 0009（此前只在 seedSystemData
  *     里建，导致「只按 migrations 建库」的备库缺这张表 → 该表同步不过去）。
+ * v8：新增归档迁移 0010（archive_entries 表 + 只增不改触发器）。
  */
-const BOOTSTRAP_FLAG = 'bootstrap:done:v7';
+const BOOTSTRAP_FLAG = 'bootstrap:done:v8';
 /** 自举失败后的冷却键（20 秒 TTL）：期间请求直接快速失败，不再重放自举。 */
 const BOOTSTRAP_COOLDOWN = 'bootstrap:cooldown:v1';
 /** 同一 isolate 内的并发请求共享一次自举。 */
@@ -400,25 +402,48 @@ async function fetchWithFallback(
 export default {
   fetch: fetchWithFallback,
   /**
-   * 定时清理（在 wrangler.toml 的 `[triggers] crons` 里配置后生效）。
+   * 定时任务（在 wrangler.toml 的 `[triggers] crons` 里配置，当前是每小时整点）。
    *
-   * 目前只做一件事：清掉回收站里已到期的项 —— 对应原版的队列任务
-   * `trash_collector`，判定依据是软删除时写入的 `sys:expected_collect_time`。
-   * KV 里的上传会话 / 验证码靠 TTL 自动过期，不需要在这里处理。
+   * 做三件事，按「重要性从高到低」排列，任何一件失败都不影响后面的：
+   *   1. **缓存刷新**：把站点设置这类缓存回源重写一遍，保证内容不会因为
+   *      「某条写路径漏了失效」而长期陈旧（需求：每小时自动拉取一次）。
+   *      只做覆盖写，不 list/delete —— 开销恒定，不受缓存键数影响。
+   *   2. 清掉回收站里已到期的项 —— 对应原版的队列任务 `trash_collector`，
+   *      判定依据是软删除时写入的 `sys:expected_collect_time`。
+   *   3. （隐含）KV 里的上传会话 / 验证码靠 TTL 自动过期，不需要在这里处理。
+   *
+   * ⚠️ **这里刻意不做「清空 KV」**：KV 绑定没有批量删，逐键删会把
+   * 免费档 50 subrequests 的预算烧光（见 `services/cacheWarmer.ts` 的说明）。
+   * 「清空再重填」在**构建期**由 `scripts/kv-purge-refill.mjs` 完成 ——
+   * 走 CLI 的批量接口，没有预算限制。这里只负责「刷新」。
    */
   async scheduled(_event: ScheduledController, env: Env, _ctx: ExecutionContext): Promise<void> {
     // 自举没完成（刚部署、还没人访问过）时 settings 表可能还不存在，
     // 定时任务直接跳过 —— 第一次网页请求会完成自举。
     try {
       if (!(await kvFor(env, 'flag').get(BOOTSTRAP_FLAG))) {
-        console.log('trash collector: skipped (bootstrap not finished yet)');
+        console.log('cron: skipped (bootstrap not finished yet)');
         return;
       }
     } catch {
-      // KV 都不可用就没什么可清理的，等下一轮
+      // KV 都不可用就没什么可刷新的，等下一轮
       return;
     }
 
+    // 1. 缓存刷新。独立 try —— 刷新失败不能影响下面的回收站清理。
+    try {
+      const warmed = await warmAllCaches(env);
+      const failed = warmed.filter((w) => !w.ok).map((w) => w.id);
+      console.log(
+        failed.length === 0
+          ? `cron: cache refreshed (${warmed.length} entries)`
+          : `cron: cache refresh partial, failed=[${failed.join(',')}]`,
+      );
+    } catch (e) {
+      console.error('cron: cache refresh failed', describeError(e));
+    }
+
+    // 2. 回收站到期清理。
     try {
       const settings = await loadSettings(env);
       const appCtx = new AppContext(

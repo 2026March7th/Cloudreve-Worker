@@ -126,6 +126,30 @@ function withPrefixGuard(ns: KVNamespace, role: KvRole, bindingName: string): KV
 
   const prefix = `${role}:`;
   const p = (key: string) => `${prefix}${key}`;
+  /**
+   * 幂等加前缀。
+   *
+   * ## 为什么必须有这个（真实踩过的坑）
+   *
+   * `list()` 返回的键名是**已经带过角色前缀的完整键**（底层 namespace
+   * 不知道「角色」这回事，它只认识完整键名）。于是「list 出来的键名」
+   * 直接回传给同一层代理的 `delete`，就会**被再叠一次前缀**：
+   *
+   *     list({prefix:'settings:'}) → 返回 'site:settings:all:v1'
+   *     delete('site:settings:all:v1') → 实际删 'site:site:settings:all:v1'
+   *
+   * 结果：**一个键都没删掉，而且不报任何错** —— 静默失效。
+   * 「清空缓存」这类运维动作如果静默失效，你会以为清干净了，实际
+   * 每一版脏数据都留在原地，正是本项目踩过的那类最难查的问题
+   * （见 README 的 siteConfigSlice 缓存事故）。
+   *
+   * 所以：已经带前缀的键**原样返回**，只给没带的加。
+   * 注意这里只判断「以本角色前缀开头」而不是「含任意角色前缀」——
+   * 因为同一个 namespace 可能被多个角色共享（KV_COUNT 小时回退到
+   * 兜底 KV），此时 `session:...` 这类键必须能原样删掉，不能再叠
+   * 一层 `site:`（那样会删错键）。判断本角色前缀即可覆盖 list 往返。
+   */
+  const pIdem = (key: string) => (key.startsWith(prefix) ? key : `${prefix}${key}`);
 
   const proxy = new Proxy(ns, {
     get(target, prop, receiver) {
@@ -136,12 +160,25 @@ function withPrefixGuard(ns: KVNamespace, role: KvRole, bindingName: string): KV
           return bindingName;
         case 'get':
           return (key: string, ...rest: unknown[]) =>
-            (target.get as (...a: unknown[]) => unknown)(p(key), ...rest);
+            (target.get as (...a: unknown[]) => unknown)(pIdem(key), ...rest);
         case 'put':
           return (key: string, ...rest: unknown[]) =>
-            (target.put as (...a: unknown[]) => unknown)(p(key), ...rest);
+            (target.put as (...a: unknown[]) => unknown)(pIdem(key), ...rest);
         case 'delete':
-          return (key: string) => target.delete(p(key));
+          // KV 的绑定 API 只接受**单个键名**（`delete(key: Key): Promise<void>`，
+          // 见 workers-types；与 Durable Object 的 `delete(keys[])` 不同，
+          // KV **没有**批量删）。
+          // 这里仍然显式拒绝数组：`prefix + array` 会走 Array.toString()
+          // 拼成 "role:a,b" 这种根本不存在的键，删不掉任何东西且不报错 ——
+          // 静默失效是最糟的形态，宁可让它当场炸出来。
+          return (key: string) => {
+            if (Array.isArray(key)) {
+              throw new TypeError(
+                'kvFor(...).delete() 不接受数组：KV 绑定没有批量删。逐键删，或改用 wrangler CLI 的 bulk delete。',
+              );
+            }
+            return target.delete(pIdem(key));
+          };
         case 'list': {
           return (opts?: { prefix?: string }) => {
             const next = { ...(opts ?? {}) };

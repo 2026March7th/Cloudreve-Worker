@@ -22,6 +22,7 @@ import { md5 } from '../lib/md5';
 import { randomString } from '../lib/crypto';
 import { MailService } from './mail';
 import { logAudit } from './audit';
+import { walDone, walFail, walStart } from './wal';
 
 // ---------------------------------------------------------------------------
 // 配置（settings JSON 键）
@@ -237,11 +238,21 @@ export class PaymentService {
       return orderPublic(latest ?? order);
     }
 
+    // WAL：记下「开始履行这笔订单」。若下面中途失败或进程被杀，这条
+    // pending 记录会留在独立于业务库的 KV 上，事后可查「哪笔没走完」。
+    // 这是本函数最脆弱的一段 —— 钱已经收了，履行却可能只做了一半。
+    const wal = await walStart(this.ctx.env, 'payment.fulfill', claimed.order_no, {
+      userId: claimed.user_id,
+      productType: claimed.product_type,
+    });
+
     try {
       await this.fulfill(claimed.user_id, claimed.product_type, claimed.product_snapshot ?? {});
       await this.orders.markFulfilled(claimed.id);
       logAudit(this.ctx, 'payment_paid', claimed.user_id, { order_no: claimed.order_no });
       logAudit(this.ctx, 'payment_fulfilled', claimed.user_id, { order_no: claimed.order_no });
+      // 履行成功 → 撤掉 WAL（只留没走完的，成功的留着会淹没真正要关注的）
+      await walDone(this.ctx.env, wal);
       // 支付收据邮件（原版 Pro 的 mail_receipt_template）：履行成功后发送，
       // 失败不影响订单状态。走 waitUntil，不阻塞回调响应。
       this.sendReceiptMail(claimed);
@@ -249,6 +260,7 @@ export class PaymentService {
       // 履行失败：订单留在 paid 态（钱已收），错误信息入库供管理员排查
       const msg = e instanceof Error ? e.message : String(e);
       await this.orders.markFailed(claimed.id, `fulfill failed after paid: ${msg}`);
+      await walFail(this.ctx.env, wal, 'payment.fulfill', claimed.order_no, e);
       logAudit(this.ctx, 'payment_fulfill_failed', claimed.user_id, {
         order_no: claimed.order_no,
         error: msg,

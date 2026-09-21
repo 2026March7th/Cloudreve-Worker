@@ -96,6 +96,22 @@ id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
 preview_id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID_PREVIEW"
 # <<< multi-kv:end
 
+# ---------------------------------------------------------------------------
+# 归档区 KV（可选，与上面的 KV_1..KV_5 相互独立）。
+#
+# 用途：留「被覆盖前的旧值」（归档）与「起了头但没走完的多步操作」（写前日志）。
+# 之所以要独立一个 namespace：归档是**只增不减**的历史，而上面那些是
+# 可被整体清理的缓存区 —— 放一起的话清一次缓存就把历史清了。
+#
+# 不想要这个能力可以不配：代码检测不到该绑定时会整体降级为 no-op，
+# 站点所有功能照常（只是没有历史版本 / 未完成操作记录）。
+# 想启用就删掉下面的注释，把 id 换成真实 namespace id（或让 deploy.mjs 自动创建）。
+# ---------------------------------------------------------------------------
+# [[kv_namespaces]]
+# binding = "ARCHIVE_KV"
+# id = "REPLACE_WITH_YOUR_ARCHIVE_KV_NAMESPACE_ID"
+# preview_id = "REPLACE_WITH_YOUR_ARCHIVE_KV_NAMESPACE_ID_PREVIEW"
+
 [assets]
 directory = "./frontend"
 binding = "ASSETS"
@@ -103,8 +119,16 @@ not_found_handling = "single-page-application"
 run_worker_first = ["/api/*", "/s/*", "/f/*", "/dav/*", "/manifest.json"]
 
 # ---------------------------------------------------------------------------
-# 定时任务：回收站到期清理（对应原版的 trash_collector 队列任务）
-# 需要同步在 src/index.ts 的 scheduled() 里处理，已实现。
+# 定时任务（每小时整点）。需要同步在 src/index.ts 的 scheduled() 里处理，已实现。
+# 目前做两件事：
+#   1. **缓存刷新** —— 把站点设置这类缓存回源重写一遍，保证内容不会因为
+#      「某条写路径漏了失效」而长期陈旧。只做覆盖写（零 list / 零 delete），
+#      开销恒定，不随缓存键数增长。
+#   2. 回收站到期清理（对应原版的 trash_collector 队列任务）。
+#
+# ⚠️ 这里**不做「清空 KV」**：KV 绑定没有批量删，逐键删会把免费档 50
+#    subrequests 的预算烧光。「清空再重填」在构建期由
+#    scripts/kv-purge-refill.mjs 完成（走 CLI 批量接口，无预算限制）。
 # ---------------------------------------------------------------------------
 [triggers]
 crons = ["0 * * * *"]
