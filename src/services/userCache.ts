@@ -30,7 +30,7 @@
 import type { Env } from '../env';
 import type { UserWithGroup } from '../db/types';
 import { kvFor } from '../lib/kvRouter';
-import { UserRepo } from '../db/repo';
+import { UserRepo, reviveUserWithGroup } from '../db/repo';
 import type { Sql } from '../db';
 
 /** L1 内存存活时间。短 TTL：只吸收同一 isolate 内的突发并发。 */
@@ -90,9 +90,14 @@ export async function getCachedUser(
     try {
       const cached = await kv.get(USER_KEY(id), 'json');
       if (cached && typeof cached === 'object') {
-        const user = cached as UserWithGroup;
-        l1Set(id, user);
-        return user;
+        // JSON 反序列化丢了运行时类型（Date→字符串、Uint8Array→普通对象），
+        // 必须经 reviveUserWithGroup 复原，否则下游 Date 方法崩、权限位清空。
+        const user = reviveUserWithGroup(cached as Record<string, unknown>);
+        if (user) {
+          l1Set(id, user);
+          return user;
+        }
+        // 形状不对（旧版本键 / 损坏数据）：按未命中处理，走下面的回源
       }
     } catch {
       // KV 抖动时静默退到 DB，不能让缓存问题变成请求失败
@@ -126,6 +131,26 @@ export async function getCachedUser(
 export async function invalidateUser(env: Env, id: number): Promise<void> {
   rememberEnv(env);
   await evictUserCache(id);
+}
+
+/**
+ * 主动预热某个用户的缓存（L1 + L2）。
+ *
+ * 注册 / 登录 / 激活成功时调用：这些路径手里已经拿到完整的 UserWithGroup，
+ * 顺手写一次 KV（1 次写、0 次 DB 查询），用户随后的第一批请求
+ * （/user/me、/file/list…）就能直接命中 L2，省一次 ~200-500ms 的
+ * users JOIN groups 回源 —— 这正是「登录后首屏慢」的主要构成之一。
+ */
+export async function warmUserCache(env: Env, user: UserWithGroup): Promise<void> {
+  if (!user || !user.id) return;
+  l1Set(user.id, user);
+  try {
+    await kvFor(env, 'session').put(USER_KEY(user.id), JSON.stringify(user), {
+      expirationTtl: L2_TTL_S,
+    });
+  } catch {
+    // 预热是尽力而为，失败不影响业务
+  }
 }
 
 /** 测试用：清空 L1。 */

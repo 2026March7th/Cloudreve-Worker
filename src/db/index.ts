@@ -311,6 +311,20 @@ export function toBytes(v: unknown): Uint8Array {
     return out;
   }
   if (Array.isArray(v)) return Uint8Array.from(v as number[]);
+  // KV 缓存复活：JSON.stringify(Uint8Array) 会把字节序列变成 {"0":1,"1":2} 的
+  // 普通对象（数字键）。按数字键序还原字节；其余对象视为空。
+  if (typeof v === 'object') {
+    const keys = Object.keys(v)
+      .filter((k) => /^\d+$/.test(k))
+      .map(Number)
+      .sort((a, b) => a - b);
+    const src = v as Record<string, unknown>;
+    const out = new Uint8Array(keys.length);
+    for (let i = 0; i < keys.length; i++) {
+      out[i] = Number(src[String(keys[i])]) & 0xff;
+    }
+    return out;
+  }
   return new Uint8Array(0);
 }
 

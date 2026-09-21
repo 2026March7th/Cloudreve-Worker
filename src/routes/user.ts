@@ -84,7 +84,9 @@ userRoutes.post('/', async (c) => {
 userRoutes.get('/me', async (c) => {
   const ctx = ctxOf(c);
   if (!ctx.user) return fail(c, Err.loginRequired());
-  return ok(c, await new UserService(ctx).buildUserResponse(ctx.user, true));
+  // ctx.user 由中间件经 byIdWithGroup/缓存解析而来，组行已在手 —— 直接传入，
+  // 不再让 buildUserResponse 重复查一次 groups（/me 是首屏必调的热端点）。
+  return ok(c, await new UserService(ctx).buildUserResponse(ctx.user, true, ctx.user.group));
 });
 
 /** 指定用户（脱敏） */

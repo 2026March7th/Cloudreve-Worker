@@ -24,6 +24,7 @@ writeFileSync(
   `
 export * from ${JSON.stringify(path.join(ROOT, 'src/services/userCache.ts'))};
 export * from ${JSON.stringify(path.join(ROOT, 'src/db/repo.ts'))};
+export * from ${JSON.stringify(path.join(ROOT, 'src/lib/kvRouter.ts'))};
 `,
 );
 
@@ -42,7 +43,7 @@ await esbuild.build({
 });
 
 const mod = await import('file://' + out.replace(/\\/g, '/'));
-const { getCachedUser, evictUserCache, clearUserCacheMemory, rememberEnv, userCacheSize, UserRepo } = mod;
+const { getCachedUser, evictUserCache, clearUserCacheMemory, rememberEnv, userCacheSize, warmUserCache, kvFor, UserRepo } = mod;
 
 /** 极简 KV stub：内存 Map，记录 get/put/delete 调用次数。 */
 function makeKv() {
@@ -191,6 +192,103 @@ console.log('── 用户缓存 ──');
   console.log(`  ✓ ${writeMethods.length} 个写方法全部自动失效（L1+L2），无遗漏`);
 
   // 还原
+  repoProto.byIdWithGroup = orig;
+}
+
+// ---------- 5. L2 复活：JSON 反序列化的类型塌陷必须被复原 ----------
+// KV 里只能存 JSON：Date → ISO 字符串、bytea(Uint8Array) → {"0":..} 普通对象。
+// 复活路径必须经 normalizeUser/normalizeGroup 还原，否则：
+//   - created_at.toISOString() 等 Date 方法不存在 → /me 直接 500；
+//   - permissionsOf() 的 instanceof 判定失败 → 权限位被静默清空。
+{
+  clearUserCacheMemory();
+  const kv = makeKv();
+  const env = { KV_2: kv.ns };
+  rememberEnv(env);
+
+  let dbHits = 0;
+  const repoProto = UserRepo.prototype;
+  const orig = repoProto.byIdWithGroup;
+  repoProto.byIdWithGroup = async function (id) {
+    dbHits += 1;
+    return fakeUser(id);
+  };
+
+  // 用「真实形状」的用户行：Date + Uint8Array 权限位（normalize* 的产物）。
+  const realUser = {
+    id: 42,
+    email: 'real@example.com',
+    nick: 'real',
+    password: 'salt:digest',
+    status: 'active',
+    storage: 4096,
+    two_factor_secret: null,
+    avatar: null,
+    created_at: new Date('2026-09-21T00:00:00.000Z'),
+    updated_at: new Date('2026-09-21T00:00:00.000Z'),
+    deleted_at: null,
+    settings: { quota_packs: [{ size: 1 }], pined: [] },
+    group_users: 2,
+    group: {
+      id: 2,
+      name: 'Default',
+      max_storage: 1073741824,
+      speed_limit: null,
+      permissions: new Uint8Array([0b101]),
+      settings: { trash_retention: 7 },
+      storage_policy_id: 3,
+      created_at: new Date('2026-09-21T00:00:00.000Z'),
+      updated_at: new Date('2026-09-21T00:00:00.000Z'),
+      deleted_at: null,
+    },
+  };
+  // 模拟「早前代码写进 KV 的旧格式条目」（JSON.stringify 原样序列化）。
+  // 必须经 kvFor(env,'session') 写入 —— 生产代码的键带 `<role>:` 前缀
+  // （kvRouter 的角色隔离规则），裸键写进去 getCachedUser 永远读不到。
+  await kvFor(env, 'session').put('user:v2:42', JSON.stringify(realUser));
+
+  const revived = await getCachedUser(env, {}, 42);
+  assert.equal(revived.id, 42);
+  assert.ok(revived.created_at instanceof Date, 'created_at 应复原为 Date');
+  assert.equal(revived.created_at.toISOString(), '2026-09-21T00:00:00.000Z');
+  assert.ok(revived.group.permissions instanceof Uint8Array, 'permissions 应复原为 Uint8Array');
+  assert.equal(revived.group.permissions.length, 1, 'permissions 字节长度应保留');
+  assert.equal(revived.group.permissions[0], 0b101, '权限位内容应逐字节还原');
+  assert.ok(Array.isArray(revived.settings.quota_packs), 'settings 对象应原样保留');
+  assert.equal(dbHits, 0, 'L2 命中不该回源');
+  console.log('  ✓ L2 复原：Date / Uint8Array 权限位 / settings 全部还原，0 次 DB');
+
+  // 损坏的 L2 条目（缺 group）→ 按未命中回源兜底
+  clearUserCacheMemory();
+  await kvFor(env, 'session').put('user:v2:43', JSON.stringify({ id: 43, email: 'x@x.com' }));
+  const u43 = await getCachedUser(env, {}, 43);
+  assert.equal(u43.id, 43);
+  assert.equal(dbHits, 1, '坏形状条目应回源兜底');
+  console.log('  ✓ 损坏的 L2 条目按未命中处理，安全回源');
+
+  // ---------- 6. warmUserCache：注册/登录路径的主动预热 ----------
+  clearUserCacheMemory();
+  const kv2 = makeKv();
+  const env2 = { KV_2: kv2.ns };
+  rememberEnv(env2);
+  repoProto.byIdWithGroup = async function (id) {
+    dbHits += 1;
+    return realUser;
+  };
+  await warmUserCache(env2, realUser);
+  assert.equal(kv2.stats.put, 1, '预热应写一次 L2');
+  assert.equal(userCacheSize(), 1, '预热应写 L1');
+  const warm = await getCachedUser(env2, {}, 42);
+  assert.equal(warm.id, 42);
+  assert.equal(dbHits, 1, '预热后命中，不该回源');
+  assert.equal(kv2.stats.get, 0, 'L1 直接命中，连 KV 都不用读');
+  // 预热写入的 L2 条目也要能被另一 isolate 复活（形状正确）
+  clearUserCacheMemory();
+  const warm2 = await getCachedUser(env2, {}, 42);
+  assert.ok(warm2.created_at instanceof Date, '预热条目复活后 Date 应保留');
+  assert.ok(warm2.group.permissions instanceof Uint8Array, '预热条目复活后权限位应保留');
+  console.log('  ✓ warmUserCache：L1/L2 双写，跨 isolate 复活形状正确');
+
   repoProto.byIdWithGroup = orig;
 }
 

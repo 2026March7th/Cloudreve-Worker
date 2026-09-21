@@ -10,7 +10,8 @@
  */
 import { AppContext } from './context';
 import { logAudit } from './audit';
-import type { UserRow, UserWithGroup } from '../db/types';
+import { warmUserCache } from './userCache';
+import type { GroupRow, UserRow, UserWithGroup } from '../db/types';
 import { BooleanSet, GroupPermission } from '../lib/boolset';
 import {
   AppError,
@@ -115,9 +116,12 @@ export class UserService {
   /**
    * 构造用户响应。
    * @param self 是否本人视角（本人可见 email 与私有设置）
+   * @param group 调用方手里已有的组行（ctx.user / byEmailWithGroup / 刚查过）
+   *              —— 传入可免掉这次 groups 查询；/me、/config、登录响应都是
+   *              每请求必走的热路径，这一下省的是 ~200-500ms 的串行往返。
    */
-  async buildUserResponse(user: UserRow, self: boolean): Promise<UserResponse> {
-    const group = await this.ctx.groups.byId(user.group_users);
+  async buildUserResponse(user: UserRow, self: boolean, group?: GroupRow | null): Promise<UserResponse> {
+    const g = group !== undefined ? group : await this.ctx.groups.byId(user.group_users);
     const settings = user.settings ?? {};
 
     const res: UserResponse = {
@@ -140,18 +144,18 @@ export class UserService {
       res.avatar = user.avatar;
     }
 
-    if (group) {
-      const perms = group.permissions instanceof Uint8Array
-        ? new BooleanSet(group.permissions)
-        : BooleanSet.fromBase64(group.permissions as unknown as string);
+    if (g) {
+      const perms = g.permissions instanceof Uint8Array
+        ? new BooleanSet(g.permissions)
+        : BooleanSet.fromBase64(g.permissions as unknown as string);
       res.group = {
-        id: this.ctx.codec.encodeGroupID(group.id),
-        name: group.name,
+        id: this.ctx.codec.encodeGroupID(g.id),
+        name: g.name,
         permission: perms.toBase64(),
         // 对应原版 BuildGroup：DirectLinkBatchSize 取 group.Settings.SourceBatchSize，
         // TrashRetention 取 group.Settings.TrashRetention（都是组级配置，不是站点设置）
-        direct_link_batch_size: group.settings?.source_batch,
-        trash_retention: group.settings?.trash_retention,
+        direct_link_batch_size: g.settings?.source_batch,
+        trash_retention: g.settings?.trash_retention,
       };
     }
 
@@ -183,9 +187,13 @@ export class UserService {
       logAudit(this.ctx, 'user_login_failed', user.id, { email });
       throw new AppError(CodeInvalidPassword, 'Incorrect password or email address');
     }
-    // v2 老密码惰性升级为 v4 安全格式（仅当命中 md5 老格式时附带）
+    // v2 老密码惰性升级为 v4 安全格式（仅当命中 md5 老格式时附带）。
+    // 内存行必须同步新摘要：issueToken 的 state_hash 与下面写入缓存的行都
+    // 依赖它，否则「刚升级完就签发的 refresh token」在刷新时会因 state
+    // 不匹配而被误判失效。
     if (pwCheck.upgradeToV4) {
       await this.ctx.users.updatePassword(user.id, pwCheck.upgradeToV4);
+      user.password = pwCheck.upgradeToV4;
     }
     if (user.status === 'manual_banned' || user.status === 'sys_banned') {
       throw new AppError(CodeUserBaned, 'This account has been blocked');
@@ -204,13 +212,19 @@ export class UserService {
       return { two_fa_session_id: sessionId };
     }
 
-    // 确保根目录存在
-    await this.ctx.files.ensureRoot(user.id);
+    // 确保根目录存在；登录成功即预热 KV 用户缓存 —— 手里已有完整
+    // UserWithGroup，只多花一次 KV 写（0 次 DB 查询），用户登录后的首批
+    // 请求（/user/me、/file/list…）直接命中缓存，不再回源。两个操作互不
+    // 依赖，并行发出。
+    await Promise.all([
+      this.ctx.files.ensureRoot(user.id),
+      warmUserCache(this.ctx.env, user),
+    ]);
 
     logAudit(this.ctx, 'user_login', user.id);
     const token = await this.issueToken(user);
     return {
-      user: await this.buildUserResponse(user, true),
+      user: await this.buildUserResponse(user, true, user.group),
       token,
     };
   }
@@ -268,11 +282,24 @@ export class UserService {
    * 一次 user_login 审计，这里的重复写入会造成两条记录，因此由调用方按需
    * 传 `logAudit: false`（OIDC 路径如此处理）。
    */
-  async completeLogin(user: UserRow, logAuditEvent = true): Promise<LoginResult> {
-    await this.ctx.files.ensureRoot(user.id);
+  async completeLogin(
+    user: UserRow,
+    logAuditEvent = true,
+    /** 调用方手里已有的组行（如 login 走 byEmailWithGroup）——传入可省一次查询。 */
+    preloadedGroup?: GroupRow | null,
+  ): Promise<LoginResult> {
+    // 组查询与 ensureRoot 互不依赖 —— 一次并行拿完（省 1 次串行往返）；
+    // 拿到组行顺手预热 KV 用户缓存（登录后首屏直接命中，见 login 内注释）。
+    const [group] = await Promise.all([
+      preloadedGroup !== undefined
+        ? Promise.resolve(preloadedGroup)
+        : this.ctx.groups.byId(user.group_users),
+      this.ctx.files.ensureRoot(user.id),
+    ]);
+    if (group) await warmUserCache(this.ctx.env, { ...user, group });
     if (logAuditEvent) logAudit(this.ctx, 'user_login', user.id);
     const token = await this.issueToken(user);
-    return { user: await this.buildUserResponse(user, true), token };
+    return { user: await this.buildUserResponse(user, true, group), token };
   }
 
   /** 写入 / 清除 TOTP 密钥。传 null 表示关闭两步验证。 */
@@ -407,7 +434,12 @@ export class UserService {
 
     const needActivation = this.ctx.settings.emailActive;
 
-    const existing = await this.ctx.users.byEmail(normalized);
+    // 「邮箱已占用」与「站点是否还没有用户」两条只读查询互不依赖 ——
+    // 并行发出（注册新号时两条都会用到；撞已有邮箱时后者浪费一次，可接受）。
+    const [existing, siteEmpty] = await Promise.all([
+      this.ctx.users.byEmail(normalized),
+      this.ctx.users.isEmpty(),
+    ]);
     if (existing) {
       if (existing.status === 'inactive') {
         await this.sendActivationEmail(existing);
@@ -421,10 +453,10 @@ export class UserService {
     // 第一个注册的用户进管理员组。原版靠 CLI seed 建管理员账号；边缘版的
     // 部署路径是「云端一键部署、不碰本机」，没有机会预设密码，所以采用
     // 「先到先得」：站点无用户时，注册即管理员。之后注册的仍按 default_group。
-    const groupId =
-      (await this.ctx.users.isEmpty())
-        ? 1 // Admin 组（seed 与上游 application/migrator 的约定一致）
-        : this.ctx.settings.defaultGroupId;
+    // （isEmpty 已在上面与 byEmail 并行查过，这里直接用结果。）
+    const groupId = siteEmpty
+      ? 1 // Admin 组（seed 与上游 application/migrator 的约定一致）
+      : this.ctx.settings.defaultGroupId;
 
     const user = await this.ctx.users.create({
       email: normalized,
@@ -435,7 +467,13 @@ export class UserService {
       language,
     });
 
-    await this.ctx.files.ensureRoot(user.id);
+    // 根目录与组行互不依赖 —— 并行一次往返拿完。组行用于构造响应，也用于
+    // 把新用户的完整数据预热进 KV：注册一完成，用户登录后的首批请求
+    // （/user/me、容量、文件列表）就直接命中缓存，不必回源 users JOIN groups。
+    const [, group] = await Promise.all([
+      this.ctx.files.ensureRoot(user.id),
+      this.ctx.groups.byId(groupId),
+    ]);
 
     logAudit(this.ctx, 'user_signup', user.id, { email: normalized });
     if (needActivation) {
@@ -444,7 +482,8 @@ export class UserService {
       await this.sendActivationEmail(user);
       return { kind: 'needActivation' };
     }
-    return { kind: 'ok', user: await this.buildUserResponse(user, true) };
+    if (group) await warmUserCache(this.ctx.env, { ...user, group });
+    return { kind: 'ok', user: await this.buildUserResponse(user, true, group) };
   }
 
   // -------------------------------------------------------------------------
@@ -508,8 +547,14 @@ export class UserService {
     await this.ctx.users.updateStatus(uid, 'active');
     await this.ctx.files.ensureRoot(uid);
     logAudit(this.ctx, 'user_activated', uid);
-    const activeUser = await this.ctx.users.byId(uid);
-    return this.buildUserResponse(activeUser ?? inactiveUser, true);
+    // withGroup：拿到组行就能预热缓存（激活是注册-激活流程的收尾，与
+    // register 同一套预热），也不再让 buildUserResponse 重复查一次组。
+    const activeUser = await this.ctx.users.byIdWithGroup(uid);
+    if (activeUser) {
+      await warmUserCache(this.ctx.env, activeUser);
+      return this.buildUserResponse(activeUser, true, activeUser.group);
+    }
+    return this.buildUserResponse(inactiveUser, true);
   }
 
   // -------------------------------------------------------------------------
@@ -703,7 +748,8 @@ export class UserService {
     await this.ctx.users.updateSettings(user.id, settings as Record<string, unknown>);
 
     const updated = await this.ctx.users.byId(user.id);
-    return this.buildUserResponse(updated!, true);
+    // 组行不受本次资料修改影响，直接复用请求里已解析的行，省一次查询
+    return this.buildUserResponse(updated!, true, user.group);
   }
 
   /** 固定 / 取消固定侧栏文件。 */

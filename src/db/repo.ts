@@ -56,6 +56,27 @@ export function normalizeUser(r: Record<string, unknown>): UserRow {
   };
 }
 
+/**
+ * 把 KV 缓存里 JSON 反序列化出来的 user+group 对象复原成带类型的行。
+ *
+ * JSON 序列化不保留运行时类型：`created_at` 等 Date 字段变成 ISO 字符串、
+ * `group.permissions`（bytea → Uint8Array）变成 `{"0":..,"1":..}` 的普通对象。
+ * 把这样的对象直接当 UserWithGroup 用会出两类事故：
+ *   - `created_at.toISOString()` 等 Date 方法不存在 → /me 500；
+ *   - `permissionsOf()` 的 `instanceof Uint8Array` 判定失败后按 base64 解析
+ *     对象，异常被吞 → **权限位静默清空**（上传/删除/管理全部误判无权限）。
+ * 所以 KV 命中后必须先过一遍 normalizeUser/normalizeGroup（配合 toBytes
+ * 的数字键对象分支）复原成真正的行类型。形状不对（旧版本键 / 损坏数据）
+ * 返回 null，调用方按缓存未命中回源处理。
+ */
+export function reviveUserWithGroup(r: Record<string, unknown>): UserWithGroup | null {
+  const g = r.group;
+  if (!g || typeof g !== 'object' || Array.isArray(g)) return null;
+  const user = normalizeUser(r);
+  const group = normalizeGroup(g as Record<string, unknown>);
+  return { ...user, group };
+}
+
 export function normalizePolicy(r: Record<string, unknown>): StoragePolicyRow {
   return {
     id: toNum(r.id),

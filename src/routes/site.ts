@@ -292,7 +292,8 @@ siteRoutes.get('/config/:section', async (c) => {
 
   // 未登录时按匿名用户返回（原版 SiteConfig.User 由 BuildUser 构造，匿名时 id 为空）
   const userPayload = ctx.user
-    ? await new UserService(ctx).buildUserResponse(ctx.user, true)
+    // 组行已在 ctx.user 里，直接传入省一次查询（config/:section 每次进站都会调）
+    ? await new UserService(ctx).buildUserResponse(ctx.user, true, ctx.user.group)
     : {
         id: '',
         nickname: '',
