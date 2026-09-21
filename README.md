@@ -93,7 +93,7 @@ Workers 的 isolate 模型不支持长驻进程、原生 socket、任意文件�
 
 ### 已实现的主要功能
 
-文件管理与回收站、分享（密码/有效期/付费位）、上传下载（R2 + OneDrive，含分片与直传回调）、文件版本自动裁剪与版本切换、两步验证（TOTP）、Passkey/WebAuthn（ES256/RS256/Ed25519）、WebDAV（账号 CRUD + 完整协议服务端）、OAuth2 授权码流程（PKCE + userinfo + 桌面客户端自动注册）、打包下载（`/workflow/archive` 入库 + `/file/archive/:id/archive.zip` 流式直链下载）、解压与压缩包在线浏览（含 GBK 等非 UTF-8 文件名）、从存储策略导入（R2/S3 兼容/OneDrive）、远程下载（HTTP 直链 + URL 列表文件导入）、事件推送（SSE）、WOPI / 在线预览会话、验证码（内置 SVG + Turnstile / reCAPTCHA / Cap）、下载限速（代理下载按用户组 `speed_limit` 生效）、全文检索（Meilisearch + Tika，与原版同构）、管理后台（用户/组/策略/文件/实体/分享/节点/OAuth 应用）、SMTP 邮件（激活/找回/测试发信 + 自定义模板）。
+文件管理与回收站、分享（密码 / 有效期 / 付费分享：访客支付积分才能下载）、上传下载（R2 + OneDrive，含分片与直传回调）、文件版本自动裁剪与版本切换、两步验证（TOTP）、Passkey/WebAuthn（ES256/RS256/Ed25519）、WebDAV（账号 CRUD + 完整协议服务端）、OAuth2 授权码流程（PKCE + userinfo + 桌面客户端自动注册）、打包下载（`/workflow/archive` 入库 + `/file/archive/:id/archive.zip` 流式直链下载）、解压与压缩包在线浏览（含 GBK 等非 UTF-8 文件名）、从存储策略导入（R2/S3 兼容/OneDrive）、远程下载（HTTP 直链 + URL 列表文件导入）、事件推送（SSE）、WOPI / 在线预览会话、验证码（内置 SVG + Turnstile / reCAPTCHA / Cap）、下载限速（代理下载按用户组 `speed_limit` 生效）、全文检索（Meilisearch + Tika，与原版同构）、管理后台（用户/组/策略/文件/实体/分享/节点/OAuth 应用）、SMTP 邮件（激活/找回/测试发信 + 自定义模板）、支付体系（订单 / 礼品卡 / 易支付 Epay 协议 / /shop 商店页，支持积分、容量包、用户组套餐等商品）、增值服务（VAS）设置、事件（Events）审计系统（39 类事件埋点 + 审计日志查看器）。
 
 ### 未实现（明确不支持的能力）
 
@@ -101,7 +101,6 @@ Workers 的 isolate 模型不支持长驻进程、原生 socket、任意文件�
 |---|---|---|
 | 缩略图本地转码 | `GET /admin/tool/thumbExecutable` | 不做服务端 ffmpeg/vips 转码；只透传存储驱动声明的缩略图能力（OneDrive 原生缩略图可用） |
 | 其它驱动上传回调 | `/callback/:driver/*` | 只实现 OneDrive 回调；R2/S3 等直传协议不走回调，此端点保留但返回 40019 |
-| 付费分享 | — | 没有支付体系，相关错误码保留但不会有路径返回 |
 | 多节点分派 | `/admin/node/*` | 节点 CRUD 与连通性测试可用，但任务不分派到节点（请求内同步跑完） |
 | v2 密码哈希登录 | — | 老版 `md5:hash:salt` 密码格式不迁移，全新部署不受影响 |
 
