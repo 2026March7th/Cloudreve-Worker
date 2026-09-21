@@ -44,10 +44,16 @@ import { fail, ok } from '../lib/response';
 import { UserService } from '../services/user';
 import { MailService } from '../services/mail';
 import { BooleanSet, GroupPermission, PolicyType } from '../lib/boolset';
-import { AppError, CodeFeatureNotEnabled, Err } from '../lib/errors';
+import {
+  AppError,
+  CodeFeatureNotEnabled,
+  CodeInternalSetting,
+  describeError,
+  Err,
+} from '../lib/errors';
 import { invalidateSettings } from '../settings/provider';
 import { AuditRepo } from '../db/audit';
-import { SUPPORTED_POLICY_TYPES, isPolicyTypeSupported } from '../storage';
+import { SUPPORTED_POLICY_TYPES, getStorageDriver, isPolicyTypeSupported } from '../storage';
 import { BACKEND_VERSION } from './site';
 import { adminContentRoutes } from './admin-content';
 import { numericId, paginationArgs, paginationOf, unwrapBody } from './shared';
@@ -868,19 +874,64 @@ function oauthCallbackUrlFor(siteUrl: string): string {
 }
 
 /**
- * 一键建 CORS。上游对 oss/cos/s3/ks3/obs 分别调驱动；边缘版这两种策略类型
- * （r2 / onedrive）都没有「桶 CORS」这个概念，所以按上游 `default` 分支
- * 返回参数错误，而不是假装成功。
+ * 一键建 CORS。对应上游 `PostCreateStoragePolicyCors`（router.go:1009）
+ * → `service/admin/policy.go:325` `CreateStoragePolicyCorsService.Create`：
+ * oss / cos / s3 / ks3 / obs 五种类型各取驱动后调 `driver.CORS()`，
+ * 其余类型按上游 `default` 分支返回参数错误。
+ *
+ * 边缘版这五种类型底层共用 `S3CompatibleDriver`（PutBucketCors 是 S3 标准
+ * 子资源，R2 / MinIO / 阿里 / 腾讯 / 华为 / 金山都实现），所以只需一次调用。
+ * 内建「R2 Default」策略走 Worker 的 R2 绑定、本身没有桶 CORS 的概念，
+ * 与 OneDrive 一样归入不支持的分支。
+ *
+ * **请求体里的策略对象就是权威来源**（与上游一致）：新建流程中调用发生在
+ * 「保存策略」之前，库里的 id 还是 0，凭据只存在于表单。此时用表单里的
+ * AK/SK 现取驱动。若请求体里没有凭据（编辑已有策略时前端回填的是掩码），
+ * 才回落到按 id 读库，避免拿掩码去签名。
  */
 adminRoutes.post('/policy/cors', async (c) => {
+  const ctx = ctxOf(c);
   const raw = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
   const body = unwrapBody<Record<string, unknown>>(raw, 'policy');
-  return fail(
-      c,
-      Err.param(
-        `CORS setup is not available for policy type "${String(body.type ?? '')}"`,
-      ),
-    );
+
+  const type = String(body.type ?? '');
+  if (!type) return fail(c, Err.param('policy type is required'));
+  if (!isPolicyTypeSupported(type)) {
+    return fail(c, Err.param(`CORS setup is not available for policy type "${type}"`));
+  }
+
+  // 1) 优先用请求体里的完整策略（新建向导场景：还没落库，凭据只在这儿）
+  const inlineKey = typeof body.access_key === 'string' ? body.access_key : '';
+  const inlineSecret = typeof body.secret_key === 'string' ? body.secret_key : '';
+  const hasInlineCreds = inlineKey !== '' && inlineSecret !== '' && !inlineKey.includes('*');
+
+  let policy: StoragePolicyRow | undefined;
+  if (hasInlineCreds) {
+    policy = {
+      ...(body as unknown as StoragePolicyRow),
+      id: Number(body.id ?? 0) || 0,
+      type,
+      settings: (body.settings as Record<string, unknown>) ?? {},
+    } as StoragePolicyRow;
+  } else {
+    // 2) 回落：按 id 读库（编辑已有策略，前端只回填掩码）
+    const id = numericId(String(body.id ?? ''), (v) => ctx.codec.decodePolicyID(v));
+    if (id === null) return fail(c, Err.param('policy id is required'));
+    const stored = await ctx.policies.byId(id);
+    if (!stored) return fail(c, new AppError(40035, 'Policy not found'));
+    policy = stored;
+  }
+
+  try {
+    const driver = getStorageDriver(c.env, policy);
+    if (typeof driver.setCors !== 'function') {
+      return fail(c, Err.param(`CORS setup is not available for policy type "${policy.type}"`));
+    }
+    await driver.setCors();
+    return ok(c);
+  } catch (e) {
+    return fail(c, new AppError(CodeInternalSetting, `Failed to create CORS: ${describeError(e)}`));
+  }
 });
 
 /** 获取 OAuth 回调地址。对应 `AdminGetPolicyOAuthCallbackURL`。 */

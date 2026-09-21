@@ -21,7 +21,7 @@ import type { Context } from 'hono';
 import type { Env } from './env';
 import { appContext, ctxOf, type AppBindings } from './middleware/app';
 import { fail, ok } from './lib/response';
-import { AppError, CodeNotFound } from './lib/errors';
+import { AppError, CodeNotFound, describeError } from './lib/errors';
 import { ensureSettings, loadSettings } from './settings/provider';
 import { provision } from './db/provision';
 import { ensureEnvAdmin } from './services/envAdmin';
@@ -433,21 +433,4 @@ export default {
     }
   },
 };
-
-/** 把任意抛出的值整理成带完整上下文的字符串，专治没有 message 的错误对象。 */
-function describeError(e: unknown): string {
-  if (e instanceof Error) {
-    const cause = e.cause !== undefined ? ` | cause: ${describeError(e.cause)}` : '';
-    const extra = Object.getOwnPropertyNames(e)
-      .filter((k) => !['stack', 'message', 'cause'].includes(k))
-      .map((k) => `${k}=${JSON.stringify((e as unknown as Record<string, unknown>)[k])}`)
-      .join(', ');
-    return `${e.name}: ${e.message || '(no message)'}${extra ? ` | ${extra}` : ''}${cause}\n${e.stack ?? ''}`;
-  }
-  try {
-    return JSON.stringify(e) ?? String(e);
-  } catch {
-    return String(e);
-  }
-}
 

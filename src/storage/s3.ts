@@ -618,6 +618,36 @@ export class S3CompatibleDriver implements StorageDriver {
     };
   }
 
+  /**
+   * 为桶写入跨域规则。对应上游 `driver/s3/s3.go:442` 的 `CORS()`。
+   *
+   * 直传（`relay=false`）时浏览器要直接把分片 PUT 到对象存储端点，PREFLIGHT
+   * 与响应都必须带 CORS 头，否则浏览器侧只会看到 `Network Error`（没有
+   * HTTP 响应）。PutBucketCors 是 S3 标准子资源，R2 / MinIO / OSS / COS
+   * 等兼容实现都认，所以这里用统一的 S3 签名请求发出。
+   *
+   * 规则与上游逐字段对齐：AllowedMethods 五种全开、Origin/Header 均为 `*`、
+   * ExposeHeaders 只放 ETag（分片上传要读回它做 Complete）、MaxAge 3600。
+   */
+  async setCors(): Promise<void> {
+    const xml =
+      '<CORSConfiguration>' +
+      '<CORSRule>' +
+      ['GET', 'POST', 'PUT', 'DELETE', 'HEAD'].map((m) => `<AllowedMethod>${m}</AllowedMethod>`).join('') +
+      '<AllowedOrigin>*</AllowedOrigin>' +
+      '<AllowedHeader>*</AllowedHeader>' +
+      '<ExposeHeader>ETag</ExposeHeader>' +
+      '<MaxAgeSeconds>3600</MaxAgeSeconds>' +
+      '</CORSRule>' +
+      '</CORSConfiguration>';
+
+    // `?cors` 是子资源，必须进签名（signedFetch → signedHeaders 会带上 query）
+    await this.signedFetch('PUT', this.objectUrl('', [['cors', '']]), {
+      body: xml,
+      headers: { 'content-type': 'application/xml' },
+    });
+  }
+
   async source(source: string, args: GetSourceArgs): Promise<string> {
     const expires =
       args.expire && args.expire > 0

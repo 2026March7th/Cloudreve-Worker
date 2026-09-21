@@ -139,6 +139,23 @@ export function newError(code: number, msg: string, raw?: unknown): AppError {
   return new AppError(code, msg, raw);
 }
 
+/** 把任意抛出的值整理成带完整上下文的字符串，专治没有 message 的错误对象。 */
+export function describeError(e: unknown): string {
+  if (e instanceof Error) {
+    const cause = e.cause !== undefined ? ` | cause: ${describeError(e.cause)}` : '';
+    const extra = Object.getOwnPropertyNames(e)
+      .filter((k) => !['stack', 'message', 'cause'].includes(k))
+      .map((k) => `${k}=${JSON.stringify((e as unknown as Record<string, unknown>)[k])}`)
+      .join(', ');
+    return `${e.name}: ${e.message || '(no message)'}${extra ? ` | ${extra}` : ''}${cause}\n${e.stack ?? ''}`;
+  }
+  try {
+    return JSON.stringify(e) ?? String(e);
+  } catch {
+    return String(e);
+  }
+}
+
 /** 常用错误的快捷构造，消息文案与原版保持一致（前端可能按 msg 做展示）。 */
 export const Err = {
   param: (msg = 'Invalid parameters.') => new AppError(CodeParamErr, msg),

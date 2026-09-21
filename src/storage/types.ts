@@ -162,6 +162,13 @@ export interface StorageDriver {
     keys: { key: string; size: number; lastModified: Date }[];
     continuation: string | null;
   }>;
+
+  /**
+   * 一键写入桶级 CORS 规则（对应上游 `StorageDriver.CORS()`）。
+   * 只有 S3 兼容驱动实现；直传模式下浏览器会跨域 PUT 分片，桶上没有
+   * CORS 规则时预检直接失败，前端只能看到 `Network Error`。
+   */
+  setCors?(): Promise<void>;
 }
 
 /** 解析策略设置里的分片大小；为 0 时用驱动默认值。 */
