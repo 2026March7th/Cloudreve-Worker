@@ -18,6 +18,7 @@ import type { UserWithGroup } from '../db/types';
 import { UserRepo } from '../db/repo';
 import { resolveDb, type DbHandle } from '../db/shard';
 import { kvFor } from '../lib/kvRouter';
+import { getCachedUser, invalidateUser, rememberEnv } from '../services/userCache';
 
 export interface AppBindings {
   Bindings: Env;
@@ -63,7 +64,10 @@ async function resolveUser(
   const uid = codec.decodeUserID(claims.sub);
   if (uid === null) return undefined;
 
-  const user = await new UserRepo(db.sql).byIdWithGroup(uid);
+  // 走缓存：首屏会并发 6~8 个请求，每个都查一次 `users JOIN groups`
+  // 是免费档 Neon 最烧不起的开销（180~550ms/次，并发高了还回 5xx）。
+  // L1 内存命中 0 往返，L2(KV) 命中 1 次 KV get —— 见 services/userCache.ts。
+  const user = await getCachedUser(env, db.sql, uid);
   if (!user) return undefined;
 
   // 把 claims 一并带出去 —— 调用方需要 client_id / scopes，
@@ -77,6 +81,9 @@ export function appContext(): MiddlewareHandler<AppBindings> {
     const env = c.env;
     const correlationId = c.req.header('X-Correlation-ID') ?? crypto.randomUUID();
     c.set('correlationId', correlationId);
+
+    // 记下本 isolate 的 env，供仓储层写用户后清缓存用（见 userCache.ts）。
+    rememberEnv(env);
 
     // 数据库句柄：本请求**唯一**的库引用。整个请求生命周期内不再重解析，
     // 保证 11 个 repo 与所有裸 SQL 都落在同一个库上（多库模型的硬约束，
@@ -116,6 +123,9 @@ export function appContext(): MiddlewareHandler<AppBindings> {
           if (g) {
             user.group = g.group;
           }
+          // 组变了 → 缓存必须失效，否则其他请求还会拿到「已过期但仍是高级组」
+          // 的用户，等于购买到期后权限没收回。
+          await invalidateUser(env, user.id);
         } catch {
           // 回退失败保持现状，下个请求再试
         }

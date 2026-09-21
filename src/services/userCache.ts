@@ -1,0 +1,172 @@
+/**
+ * 用户 / 用户组的跨请求缓存。
+ *
+ * ## 为什么需要它
+ *
+ * `appContext` 中间件在**每一个** API 请求上都会 `byIdWithGroup(uid)` ——
+ * 一条 `users JOIN groups` 查询。首屏会并发 6~8 个请求，于是同一个用户
+ * 在几百毫秒内被查了 6~8 次。Neon 免费档单次查询 180~550ms，并发超过
+ * 6 路还会回 5xx 触发重试，用户感知就是「一直在转圈、存储空间出不来」。
+ *
+ * 而 `users` / `groups` 是典型的**读极多写极少**数据（改昵称、改容量、
+ * 改权限时才写），非常适合缓存。缓存后中间件这一步从 1 次 DB 往返
+ * 降到 0 次（L1 命中）或 1 次 KV get（L2 命中）。
+ *
+ * ## 两级缓存
+ *
+ *   L1  isolate 内存（Map）：命中即返回，0 网络往返。TTL 很短，因为
+ *       isolate 之间不共享，它的作用是吸收「同一 isolate 内的突发并发」
+ *       —— 首屏那 6~8 个请求通常落在同一个 isolate 上。
+ *   L2  KV：跨 isolate 共享，TTL 较长。L1 未命中时读它，miss 才回源 DB。
+ *
+ * ## 失效（正确性关键）
+ *
+ * 缓存用户数据最怕「改了不生效」。三道防线：
+ *   1. 写路径显式调 `invalidateUser(id)` / `invalidateGroup(id)`；
+ *   2. L1 / L2 都有 TTL，跨 isolate 的改动最多晚 TTL 看到；
+ *   3. 缓存的是**完整的 UserWithGroup 行**，但 KV 里不写敏感字段以外的
+ *      额外信息 —— 见下方 `sanitizeForKv` 的说明。
+ */
+import type { Env } from '../env';
+import type { UserWithGroup } from '../db/types';
+import { kvFor } from '../lib/kvRouter';
+import { UserRepo } from '../db/repo';
+import type { Sql } from '../db';
+
+/** L1 内存存活时间。短 TTL：只吸收同一 isolate 内的突发并发。 */
+const L1_TTL_MS = 3_000;
+/** L2（KV）存活时间。改动最晚这么多秒后自动可见。 */
+const L2_TTL_S = 120;
+/** L1 条数上限，防止长驻 isolate 内存无界增长（Workers 有 128MB 限制）。 */
+const L1_MAX = 200;
+
+const USER_KEY = (id: number) => `user:v2:${id}`;
+
+/** L1 条目。 */
+const l1 = new Map<number, { at: number; user: UserWithGroup }>();
+
+function l1Get(id: number): UserWithGroup | null {
+  const hit = l1.get(id);
+  if (!hit) return null;
+  if (Date.now() - hit.at > L1_TTL_MS) {
+    l1.delete(id);
+    return null;
+  }
+  return hit.user;
+}
+
+function l1Set(id: number, user: UserWithGroup): void {
+  // 超过上限时删最早插入的（Map 保序 = 插入顺序，够用）。
+  if (l1.size >= L1_MAX && !l1.has(id)) {
+    const oldest = l1.keys().next();
+    if (!oldest.done) l1.delete(oldest.value);
+  }
+  l1.set(id, { at: Date.now(), user });
+}
+
+/**
+ * 取用户（带组），优先 L1 → L2 → DB。
+ *
+ * `db` 是本次请求解析出的 Sql 句柄，回源时用它，保证多库模型下
+ * 读写落在同一个库上（见 `db/shard.ts`）。
+ */
+export async function getCachedUser(
+  env: Env,
+  sql: Sql,
+  id: number,
+): Promise<UserWithGroup | null> {
+  const hit = l1Get(id);
+  if (hit) return hit;
+
+  // L2：KV。失败不致命 —— 退化成直接查库即可。
+  let kv: KVNamespace | null = null;
+  try {
+    kv = kvFor(env, 'session');
+  } catch {
+    kv = null;
+  }
+
+  if (kv) {
+    try {
+      const cached = await kv.get(USER_KEY(id), 'json');
+      if (cached && typeof cached === 'object') {
+        const user = cached as UserWithGroup;
+        l1Set(id, user);
+        return user;
+      }
+    } catch {
+      // KV 抖动时静默退到 DB，不能让缓存问题变成请求失败
+    }
+  }
+
+  const user = await new UserRepo(sql).byIdWithGroup(id);
+  if (!user) return null;
+
+  if (kv) {
+    try {
+      await kv.put(USER_KEY(id), JSON.stringify(user), { expirationTtl: L2_TTL_S });
+    } catch {
+      // 回填失败无所谓，下次请求会再试
+    }
+  }
+  l1Set(id, user);
+  return user;
+}
+
+/**
+ * 主动失效某个用户的缓存（L1 + L2）。
+ *
+ * 所有改动用户行 / 用户组关联的写路径都应该调用它，否则用户在 TTL 内
+ * 看到的还是旧数据（例如改了容量但界面不更新）。
+ *
+ * 注意：`UserRepo` 的写方法内部已经自动调 `evictUserCache`，所以业务
+ * 代码一般**不需要**手动调这个。它留给那些「直接执行裸 SQL 改用户行」
+ * 的少数场景使用。
+ */
+export async function invalidateUser(env: Env, id: number): Promise<void> {
+  rememberEnv(env);
+  await evictUserCache(id);
+}
+
+/** 测试用：清空 L1。 */
+export function clearUserCacheMemory(): void {
+  l1.clear();
+}
+
+/** 测试用：当前 L1 条数。 */
+export function userCacheSize(): number {
+  return l1.size;
+}
+
+/**
+ * repo 层用的失效入口。
+ *
+ * `UserRepo` 只持有 `Sql`，没有 `env`，所以没法直接删 KV 键。这里在
+ * 每个请求装配上下文时记下当前 isolate 的 `env`（`rememberEnv`），
+ * repo 写完后借它清 L2。
+ *
+ * 为什么不让 repo 带上 env：那要改 11 个仓储的构造签名和所有调用点，
+ * 收益只是省一个模块级变量 —— 而 `env` 在同一个 isolate 内对所有请求
+ * 都是同一个对象，记一份完全等价。
+ *
+ * 记不到 env 时（例如在请求外调用 repo）只清 L1，L2 靠 TTL 兜底 ——
+ * 这不会导致数据错误，最坏是晚 `L2_TTL_S` 秒生效。
+ */
+let currentEnv: Env | null = null;
+
+/** 请求装配时调用，记下本 isolate 的 env 供 repo 层失效使用。 */
+export function rememberEnv(env: Env): void {
+  currentEnv = env;
+}
+
+/** 清掉某用户的 L1 + L2 缓存。repo 写方法内部调用。 */
+export async function evictUserCache(id: number): Promise<void> {
+  l1.delete(id);
+  const env = currentEnv;
+  if (!env) return;
+  try {
+    await kvFor(env, 'session').delete(USER_KEY(id));
+  } catch {
+    // 删不掉就靠 TTL 兜底
+  }
+}

@@ -277,6 +277,7 @@ export class UserRepo {
       UPDATE users SET password = ${digest}, updated_at = now()
       WHERE id = ${id}
     `;
+    await this.touchCache(id);
   }
 
   async updateProfile(id: number, args: { nick?: string; avatar?: string }): Promise<void> {
@@ -287,6 +288,7 @@ export class UserRepo {
           updated_at = now()
       WHERE id = ${id}
     `;
+    await this.touchCache(id);
   }
 
   async updateSettings(id: number, settings: Record<string, unknown>): Promise<void> {
@@ -294,30 +296,55 @@ export class UserRepo {
       UPDATE users SET settings = ${JSON.stringify(settings)}::jsonb, updated_at = now()
       WHERE id = ${id}
     `;
+    await this.touchCache(id);
   }
 
   async updateGroup(id: number, groupId: number): Promise<void> {
     await this.sql`
       UPDATE users SET group_users = ${groupId}, updated_at = now() WHERE id = ${id}
     `;
+    await this.touchCache(id);
   }
 
   async updateStatus(id: number, status: string): Promise<void> {
     await this.sql`
       UPDATE users SET status = ${status}, updated_at = now() WHERE id = ${id}
     `;
+    await this.touchCache(id);
   }
 
   async updateEmail(id: number, email: string): Promise<void> {
     await this.sql`
       UPDATE users SET email = ${email}, updated_at = now() WHERE id = ${id}
     `;
+    await this.touchCache(id);
   }
 
   async setTwoFactorSecret(id: number, secret: string | null): Promise<void> {
     await this.sql`
       UPDATE users SET two_factor_secret = ${secret}, updated_at = now() WHERE id = ${id}
     `;
+    await this.touchCache(id);
+  }
+
+  /**
+   * 写用户行后清掉它的缓存。
+   *
+   * 放在**仓储层**而不是各个调用点，是因为用户写路径有 30 多处
+   * （改密码 / 改组 / 改容量 / 封禁 / 支付履行 …）。散落着写失效调用
+   * 一定会漏掉某一处，而漏掉的后果是「改了不生效」甚至「封禁了还能登录」
+   * —— 安全相关，不能靠自觉。写在仓储层就是单一收口点。
+   *
+   * 本类没有 env（`UserRepo` 只持有 Sql），所以通过动态 import 拿
+   * env 无关的 L1 清理 + KV 删除；KV 失败不阻断写操作本身。
+   */
+  private async touchCache(id: number): Promise<void> {
+    try {
+      const { evictUserCache } = await import('../services/userCache');
+      await evictUserCache(id);
+    } catch {
+      // 缓存失效失败不该让写操作失败：TTL 会兜底
+    }
   }
 
   /** 增减已用容量。容量计算依赖这个字段，必须与实际写入同步。 */
@@ -326,6 +353,7 @@ export class UserRepo {
       UPDATE users SET storage = GREATEST(0, storage + ${delta}), updated_at = now()
       WHERE id = ${id}
     `;
+    await this.touchCache(id);
   }
 
   /** 按已归属实体的实际大小重算容量（用于校正漂移）。 */
@@ -341,6 +369,7 @@ export class UserRepo {
     `) as Record<string, unknown>[];
     const total = toNum(rows[0]?.total);
     await this.sql`UPDATE users SET storage = ${total}, updated_at = now() WHERE id = ${id}`;
+    await this.touchCache(id);
     return total;
   }
 
