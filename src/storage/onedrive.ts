@@ -529,7 +529,7 @@ export class OneDriveDriver implements StorageDriver {
       const dir = pending[0] ?? '';
       const children =
         dir === ''
-          ? `${this.url('root:/children')}?`
+          ? `${this.url('root')}/children?`
           : `${this.url(`root:/${graphPath(dir)}`)}:/children?`;
       const pageUrl =
         nextLink ??
