@@ -9,6 +9,7 @@
  * 少数几项默认值与上游不同，都单独标注了原因。
  */
 import { DEFAULT_MAIL_TEMPLATES } from './mail-templates';
+import { DEFAULT_FILE_VIEWERS } from './fileViewers';
 
 export const DEFAULT_SETTINGS: Record<string, string> = {
   // --- 站点基础 ---
@@ -182,7 +183,12 @@ export const DEFAULT_SETTINGS: Record<string, string> = {
   explorer_icons: '[]',
   emojis: '{}',
   custom_props: '[]',
-  file_viewers: '[]',
+  // 内置文件查看器默认集（上游安装时播种的同一套 13 个查看器）。
+  // 这里**必须**给真实默认集而不是 '[]'：SettingsProvider.get 的解析顺序是
+  // 缓存/DB → DEFAULT_SETTINGS → 调用方 fallback，defaults 里的值会遮蔽
+  // 调用方（site.ts）的 fallback。给 '[]' 的后果是前端「打开方式」菜单
+  // 整个为空（4430507 → 本修复踩过）。存量 '[]' 行由 0011 迁移回填。
+  file_viewers: DEFAULT_FILE_VIEWERS,
   viewer_default_apps: '{}',
   show_encryption_status: '1',
   map_provider: 'openstreetmap',

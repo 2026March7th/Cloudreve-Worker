@@ -60,8 +60,10 @@ import { isSocialMediaBot, renderSharePreview } from './services/share-preview';
  * v7：group_storage_policies 建表移入迁移 0009（此前只在 seedSystemData
  *     里建，导致「只按 migrations 建库」的备库缺这张表 → 该表同步不过去）。
  * v8：新增归档迁移 0010（archive_entries 表 + 只增不改触发器）。
+ * v9：新增迁移 0011（存量 file_viewers='[]' 行回填内置查看器默认集，
+ *     修复前端「打开方式」菜单为空）。
  */
-const BOOTSTRAP_FLAG = 'bootstrap:done:v8';
+const BOOTSTRAP_FLAG = 'bootstrap:done:v9';
 /** 自举失败后的冷却键（20 秒 TTL）：期间请求直接快速失败，不再重放自举。 */
 const BOOTSTRAP_COOLDOWN = 'bootstrap:cooldown:v1';
 /** 同一 isolate 内的并发请求共享一次自举。 */

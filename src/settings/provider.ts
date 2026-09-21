@@ -349,7 +349,13 @@ export async function ensureSettings(env: Env, db: DbHandle = resolveDb(env)): P
     toInsert.push({ name: key, value: v });
   }
 
-  if (toInsert.length === 0) return;
+  if (toInsert.length === 0) {
+    // 即便没有新键要插，自举本身意味着「刚部署新版本」——迁移（如 0011
+    // 回填 file_viewers）可能改过 settings 行，而 KV 里的 settings 快照
+    // 还是旧的。这里无条件清一次缓存，让下个请求回源读到库里的新值。
+    await invalidateSettings(env);
+    return;
+  }
 
   // 全部缺失键合并成一个事务提交（= 1 个 HTTP 请求）。逐条插在免费版
   // Workers 里会撞 50-subrequest 上限，并发冷启动还会触发 Neon 429。

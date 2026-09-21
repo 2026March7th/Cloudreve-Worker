@@ -15,10 +15,10 @@
  */
 import { readFileSync } from 'node:fs';
 
-const srcPath = new URL('../src/routes/site.ts', import.meta.url);
+const srcPath = new URL('../src/settings/fileViewers.ts', import.meta.url);
 const src = readFileSync(srcPath, 'utf8');
 
-const MARKER = 'const DEFAULT_FILE_VIEWERS = JSON.stringify(';
+const MARKER = 'export const DEFAULT_FILE_VIEWERS = JSON.stringify(';
 const start = src.indexOf(MARKER);
 if (start < 0) {
   console.error('FATAL: 找不到 DEFAULT_FILE_VIEWERS 定义');
