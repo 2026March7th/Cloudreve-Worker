@@ -28,6 +28,140 @@ const CAPTCHA_PREFIX = 'captcha:';
 const CAPTCHA_TTL = 1800; // 与原版 CaptchaTTL 一致（30 分钟）
 
 /**
+ * 内置「文件查看器」默认定义。与上游 `inventory/setting.go` 的
+ * `defaultFileViewers` 逐字段对齐（JSON snake_case；type 取值
+ * builtin / custom；archive 的 required_group_permission=[5] 即
+ * GroupPermissionArchiveTask，与边缘版 boolset 位表一致）。
+ *
+ * 前端预览器注册表完全由 explorer 配置的 `file_viewers` 构建——
+ * 上游安装时会播种这组默认值；边缘版不落库（省一次 BOOTSTRAP_FLAG
+ * 迁移），settings 键缺失时用这里的默认值，管理员在后台
+ * 「文件系统 → 文件查看器」保存过的自定义配置会自然覆盖它。
+ */
+const DEFAULT_FILE_VIEWERS = JSON.stringify([
+  {
+    viewers: [
+      {
+        id: 'music',
+        type: 'builtin',
+        display_name: 'fileManager.musicPlayer',
+        exts: ['mp3', 'ogg', 'wav', 'flac', 'm4a'],
+      },
+      {
+        id: 'epub',
+        type: 'builtin',
+        display_name: 'fileManager.epubViewer',
+        exts: ['epub'],
+      },
+      {
+        id: 'googledocs',
+        type: 'custom',
+        display_name: 'fileManager.googledocs',
+        icon: '/static/img/viewers/gdrive.png',
+        url: 'https://docs.google.com/gview?url={$src}&embedded=true',
+        exts: [
+          'jpeg', 'png', 'gif', 'tiff', 'bmp', 'webm', 'mpeg4', '3gpp', 'mov', 'avi',
+          'mpegps', 'wmv', 'flv', 'txt', 'css', 'html', 'php', 'c', 'cpp', 'h', 'hpp',
+          'js', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'pdf', 'pages', 'ai',
+          'psd', 'tiff', 'dxf', 'svg', 'eps', 'ps', 'ttf', 'xps',
+        ],
+        max_size: 26214400,
+      },
+      {
+        id: 'm365online',
+        type: 'custom',
+        display_name: 'fileManager.m365viewer',
+        icon: '/static/img/viewers/m365.svg',
+        url: 'https://view.officeapps.live.com/op/view.aspx?src={$src}',
+        exts: [
+          'doc', 'docx', 'docm', 'dotm', 'dotx', 'xlsx', 'xlsb', 'xls', 'xlsm',
+          'pptx', 'ppsx', 'ppt', 'pps', 'pptm', 'potm', 'ppam', 'potx', 'ppsm',
+        ],
+        max_size: 10485760,
+      },
+      {
+        id: 'pdf',
+        type: 'builtin',
+        display_name: 'fileManager.pdfViewer',
+        exts: ['pdf'],
+      },
+      {
+        id: 'video',
+        type: 'builtin',
+        icon: '/static/img/viewers/artplayer.png',
+        display_name: 'Artplayer',
+        exts: ['mp4', 'mkv', 'webm', 'avi', 'mov', 'm3u8', 'flv'],
+      },
+      {
+        id: 'markdown',
+        type: 'builtin',
+        display_name: 'fileManager.markdownEditor',
+        exts: ['md'],
+        templates: [{ ext: 'md', display_name: 'Markdown' }],
+      },
+      {
+        id: 'drawio',
+        type: 'builtin',
+        icon: '/static/img/viewers/drawio.svg',
+        display_name: 'draw.io',
+        exts: ['drawio', 'dwb'],
+        props: { host: 'https://embed.diagrams.net' },
+        templates: [
+          { ext: 'drawio', display_name: 'fileManager.diagram' },
+          { ext: 'dwb', display_name: 'fileManager.whiteboard' },
+        ],
+      },
+      {
+        id: 'image',
+        type: 'builtin',
+        display_name: 'fileManager.imageViewer',
+        exts: ['bmp', 'png', 'gif', 'jpg', 'jpeg', 'svg', 'webp', 'heic', 'heif'],
+      },
+      {
+        id: 'monaco',
+        type: 'builtin',
+        icon: '/static/img/viewers/monaco.svg',
+        display_name: 'fileManager.monacoEditor',
+        exts: [
+          'md', 'txt', 'json', 'php', 'py', 'bat', 'c', 'h', 'cpp', 'hpp', 'cs',
+          'css', 'dockerfile', 'go', 'html', 'htm', 'ini', 'java', 'js', 'jsx',
+          'less', 'lua', 'sh', 'sql', 'xml', 'yaml',
+        ],
+        templates: [{ ext: 'txt', display_name: 'fileManager.text' }],
+      },
+      {
+        id: 'photopea',
+        type: 'builtin',
+        icon: '/static/img/viewers/photopea.png',
+        display_name: 'Photopea',
+        exts: [
+          'psd', 'ai', 'indd', 'xcf', 'xd', 'fig', 'kri', 'clip', 'pxd', 'pxz',
+          'cdr', 'ufo', 'afphoyo', 'svg', 'esp', 'pdf', 'pdn', 'wmf', 'emf', 'png',
+          'jpg', 'jpeg', 'gif', 'webp', 'ico', 'icns', 'bmp', 'avif', 'heic', 'jxl',
+          'ppm', 'pgm', 'pbm', 'tiff', 'dds', 'iff', 'anim', 'tga', 'dng', 'nef',
+          'cr2', 'cr3', 'arw', 'rw2', 'raf', 'orf', 'gpr', '3fr', 'fff',
+        ],
+      },
+      {
+        id: 'excalidraw',
+        type: 'builtin',
+        icon: '/static/img/viewers/excalidraw.svg',
+        display_name: 'Excalidraw',
+        exts: ['excalidraw'],
+        templates: [{ ext: 'excalidraw', display_name: 'Excalidraw' }],
+      },
+      {
+        id: 'archive',
+        type: 'builtin',
+        display_name: 'fileManager.archivePreview',
+        exts: ['zip', '7z'],
+        required_group_permission: [5],
+      },
+    ],
+  },
+]);
+
+/**
  * 设置表里部分字段存的是 JSON 字符串，但原版 SiteConfig 在 Go 侧已
  * unmarshal 成结构化值再返回（如 `[]setting.CustomNavItem`、
  * `types.DefaultViewerMapping`），前端 redux slice 也按数组/对象消费。
@@ -322,9 +456,11 @@ siteRoutes.get('/config/:section', async (c) => {
     case 'explorer':
       // JSON 型字段（file_viewers / default_viewer_mapping / custom_props）
       // 原版返回结构化值，必须 parse 后再给前端；icons 上游就是字符串原样。
+      // file_viewers 缺省时给内置查看器默认集（上游安装时播种的同一套），
+      // 否则前端「打开方式」菜单整个为空，所有文件都只能下载。
       return ok(c, {
         max_batch_size: s.maxBatchedFile,
-        file_viewers: parseJson(s.get('file_viewers', '[]'), [] as unknown[]),
+        file_viewers: parseJson(s.get('file_viewers', DEFAULT_FILE_VIEWERS), []),
         default_viewer_mapping: parseJson(s.get('viewer_default_apps', '{}'), {}),
         icons: s.get('explorer_icons', '[]'),
         map_provider: s.get('map_provider', 'openstreetmap'),
