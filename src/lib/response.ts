@@ -9,6 +9,7 @@
  */
 import type { Context } from 'hono';
 import { AppError, CodeDBError, CodeNotSet, CodeParamErr } from './errors';
+import { isUpstream5xxError, isRateLimitError } from '../db';
 
 export interface Envelope<T = unknown> {
   code: number;
@@ -45,6 +46,12 @@ export function okWithCode<T>(c: Context, code: number, data?: T): Response {
  *   - 底层是 AppError 时，取其 code 与 msg；
  *   - 非生产模式下附加 `error` 明细；
  *   - status 仅在原版确实返回非 200 时使用（如 /f/ 直链不存在回 404）。
+ *
+ * 特例：数据库上游（Neon 网关）返回 5xx / 限流时，不再把驱动的英文原文塞进
+ * `msg` —— 前端 `errors[50001]` 的渲染结果是「数据库操作失败 ({{message}})」，
+ * 直接把 `Server error (HTTP status 520): ...` 拼进去，用户看到的是一句
+ * 既看不懂、又误导（以为是数据库本身坏了）的话。这种情况改用可读文案，
+ * 并把原始信息留在 `error` 里便于排查。
  */
 export function fail(c: Context, err: unknown, status: 200 | 404 = 200): Response {
   let code = CodeNotSet;
@@ -57,7 +64,14 @@ export function fail(c: Context, err: unknown, status: 200 | 404 = 200): Respons
     raw = err.raw;
   } else if (err instanceof Error) {
     code = CodeDBError;
-    msg = err.message;
+    if (isRateLimitError(err) || isUpstream5xxError(err)) {
+      // 上游瞬态抖动。fetch 层已重试过仍失败，说明这一波确实过不去。
+      // 文案要能塞进前端的 `数据库操作失败 ({{message}})` 模板里读通顺，
+      // 所以写成名词短语、不带句号，也不直译驱动的英文原文。
+      msg = 'upstream temporarily unavailable, please retry';
+    } else {
+      msg = err.message;
+    }
   } else if (typeof err === 'string') {
     msg = err;
   }
