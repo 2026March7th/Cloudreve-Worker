@@ -140,3 +140,36 @@ export const DEFAULT_FILE_VIEWERS = JSON.stringify([
     ],
   },
 ]);
+
+/** 与 DEFAULT_FILE_VIEWERS 同源的数组形态（兜底时直接返回，免重复 stringify+parse）。 */
+const DEFAULT_FILE_VIEWERS_ARRAY: unknown[] = JSON.parse(DEFAULT_FILE_VIEWERS);
+
+/**
+ * 解析 settings 里存的 file_viewers 值，返回 ViewerGroup[]。
+ *
+ * ★ 空集 / 坏值一律回落到内置默认集——不要相信「存了值就是有效配置」：
+ * 实测存量库里的脏值（`[ ]` / `null` 等非空但解析为空的形态）既躲过了
+ * 0011 迁移的 `WHERE value='[]'`，也压住了 defaults 层，线上「打开方式」
+ * 持续为空（248e20d 之后的最终修法，读取层 + 数据层双保险）。
+ * 语义代价：管理员「故意清空全部查看器」会被视为未配置而回落默认集；
+ * 管理员保存任何非空配置都原样生效。
+ */
+export function parseFileViewers(raw: string | null | undefined): unknown[] {
+  if (raw) {
+    try {
+      const parsed: unknown = JSON.parse(raw);
+      const hasViewers = Array.isArray(parsed) &&
+        parsed.some(
+          (g) =>
+            g !== null &&
+            typeof g === 'object' &&
+            Array.isArray((g as { viewers?: unknown }).viewers) &&
+            (g as { viewers: unknown[] }).viewers.length > 0,
+        );
+      if (hasViewers) return parsed as unknown[];
+    } catch {
+      /* 坏 JSON → 走默认集 */
+    }
+  }
+  return DEFAULT_FILE_VIEWERS_ARRAY;
+}

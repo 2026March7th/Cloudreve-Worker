@@ -34,6 +34,7 @@ import type { AppContext } from '../services/context';
 import type { FileRow } from '../db/types';
 import { AppContext as AppContextClass } from '../services/context';
 import { FileSystemService } from '../services/fs';
+import { parseFileViewers } from '../settings/fileViewers';
 import { SearchService } from '../services/search';
 import { UploadService } from '../services/upload';
 import { DownloadService } from '../services/download';
@@ -1095,8 +1096,9 @@ fileRoutes.post('/viewerSession', async (c) => {
     const file = await service.mustResolve(uri);
     if (file.type === FileType.Folder) return fail(c, Err.param('Target is a folder'));
 
-    // 找 viewer（file_viewers 设置：ViewerGroup[]）
-    const groups = JSON.parse(ctx.settings.get('file_viewers', '[]')) as ViewerDef[][];
+    // 找 viewer（file_viewers 设置：ViewerGroup[]；空集/坏值回落内置默认集，
+    // 与 site.ts 的 explorer 配置同一套解析，别在这里裸 JSON.parse）
+    const groups = parseFileViewers(ctx.settings.get('file_viewers')) as ViewerDef[][];
     let viewer: ViewerDef | undefined;
     for (const group of groups) {
       const list = Array.isArray(group) ? group : (group as unknown as { viewers?: ViewerDef[] }).viewers ?? [];

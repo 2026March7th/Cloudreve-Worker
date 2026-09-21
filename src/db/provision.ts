@@ -26,6 +26,7 @@ import m0008 from '../../migrations/0008_oidc.sql';
 import m0009 from '../../migrations/0009_group_storage_policies.sql';
 import m0010 from '../../migrations/0010_archive.sql';
 import m0011 from '../../migrations/0011_file_viewers.sql';
+import m0012 from '../../migrations/0012_file_viewers_backfill.sql';
 import { withRetry } from './index';
 import { randomString } from '../lib/crypto';
 import { splitStatements } from '../lib/sql-split.mjs';
@@ -47,6 +48,8 @@ const MIGRATIONS: ReadonlyArray<readonly [name: string, sqlText: string]> = [
   // 0011 是数据迁移（UPDATE settings），放最后：先于 ensureSettings 执行，
   // 存量 '[]' 行回填后 ensureSettings 见行已存在即跳过。
   ['0011_file_viewers.sql', m0011],
+  // 0012 放宽 WHERE 的兜底回填（0011 已应用、MARKER 指着它，原地改不会重跑）。
+  ['0012_file_viewers_backfill.sql', m0012],
 ];
 
 /** KV 标记：值是最后一个已应用的迁移文件名，文件名不变就跳过。 */

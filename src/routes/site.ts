@@ -23,7 +23,7 @@ import { archiveCount, archiveEnabled } from '../services/archive';
 import { walUnfinished } from '../services/wal';
 import { purgeAllCaches, warmAllCaches } from '../services/cacheWarmer';
 import { CACHE_ENTRIES, purgeableEntries } from '../lib/cacheRegistry';
-import { DEFAULT_FILE_VIEWERS } from '../settings/fileViewers';
+import { DEFAULT_FILE_VIEWERS, parseFileViewers } from '../settings/fileViewers';
 
 const CAPTCHA_PREFIX = 'captcha:';
 const CAPTCHA_TTL = 1800; // 与原版 CaptchaTTL 一致（30 分钟）
@@ -323,11 +323,11 @@ siteRoutes.get('/config/:section', async (c) => {
     case 'explorer':
       // JSON 型字段（file_viewers / default_viewer_mapping / custom_props）
       // 原版返回结构化值，必须 parse 后再给前端；icons 上游就是字符串原样。
-      // file_viewers 缺省时给内置查看器默认集（上游安装时播种的同一套），
-      // 否则前端「打开方式」菜单整个为空，所有文件都只能下载。
+      // file_viewers 用 parseFileViewers：空集/坏值/缺键一律回落内置查看器
+      // 默认集，否则前端「打开方式」菜单整个为空，所有文件都只能下载。
       return ok(c, {
         max_batch_size: s.maxBatchedFile,
-        file_viewers: parseJson(s.get('file_viewers', DEFAULT_FILE_VIEWERS), []),
+        file_viewers: parseFileViewers(s.get('file_viewers', DEFAULT_FILE_VIEWERS)),
         default_viewer_mapping: parseJson(s.get('viewer_default_apps', '{}'), {}),
         icons: s.get('explorer_icons', '[]'),
         map_provider: s.get('map_provider', 'openstreetmap'),

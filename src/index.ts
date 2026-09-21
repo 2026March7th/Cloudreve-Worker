@@ -64,8 +64,10 @@ import { isSocialMediaBot, renderSharePreview } from './services/share-preview';
  *     修复前端「打开方式」菜单为空）。⚠️ v9 被一次漏注册迁移的部署烧掉
  *     （迁移文件没进 provision.ts 的 MIGRATIONS 清单，flag 先置位了）。
  * v10：0011 真正注册进 MIGRATIONS 清单后重新触发自举。
+ * v11：新增迁移 0012（file_viewers 脏形态兜底回填——存量值非空但解析为
+ *     空集且不等于 '[]'，躲过 0011；读取层 parseFileViewers 同步兜底）。
  */
-const BOOTSTRAP_FLAG = 'bootstrap:done:v10';
+const BOOTSTRAP_FLAG = 'bootstrap:done:v11';
 /** 自举失败后的冷却键（20 秒 TTL）：期间请求直接快速失败，不再重放自举。 */
 const BOOTSTRAP_COOLDOWN = 'bootstrap:cooldown:v1';
 /** 同一 isolate 内的并发请求共享一次自举。 */
