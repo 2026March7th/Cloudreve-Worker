@@ -137,6 +137,85 @@ async function columnsOf(sql, t) {
   return r.map((x) => x.column_name);
 }
 
+/**
+ * 备库建表（**自动**）。
+ *
+ * 备库是新开的 Neon 项目，里面什么都没有 —— 表都不存在的话全量同步
+ * 无从下手。以前这里只打印一段「请把备库连接串临时配成 DATABASE_URL
+ * 部署一次」的操作指引，结果是：**同步默默跳过、构建照常成功、备库
+ * 永远是空的**，用户以为自己配了 5 个库，实际只有 1 个在跑。
+ *
+ * 现在直接把 migrations/*.sql 灌进去。**唯一事实来源仍是那些 .sql 文件**
+ * （和 Worker 自举用的是同一批），这里不复制任何 DDL，避免漂移。
+ * 语句全部幂等（CREATE TABLE IF NOT EXISTS 等），重复跑无害。
+ */
+async function ensureSchema(sql, label) {
+  const missing = [];
+  for (const t of SYNC_TABLES) {
+    if (!(await tableExists(sql, t))) missing.push(t);
+  }
+  if (!missing.length) return true;
+
+  console.log(`  备库缺 ${missing.length} 张表，应用迁移建表…`);
+  let applied = 0;
+  for (const file of MIGRATION_FILES) {
+    const text = readFileSync(path.join(ROOT, 'migrations', file), 'utf8');
+    const statements = splitSqlStatements(text);
+    try {
+      // 一个文件一次事务：与 Worker 自举同策略，避免逐条打爆请求预算。
+      await sql.transaction(statements.map((s) => sql(s)));
+      applied += statements.length;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      // 并发/重复执行时「已存在」是正常的，不算失败。
+      if (!/already exists|duplicate/i.test(msg)) {
+        console.error(`  ✘ 应用 ${file} 失败：${msg}`);
+        return false;
+      }
+    }
+  }
+  console.log(`  ✓ 已应用 ${applied} 条建表语句（来源：migrations/*.sql）`);
+
+  const still = [];
+  for (const t of SYNC_TABLES) {
+    if (!(await tableExists(sql, t))) still.push(t);
+  }
+  if (still.length) {
+    console.error(`  ✘ 建表后仍缺表：${still.join(', ')}`);
+    return false;
+  }
+  return true;
+}
+
+/** 迁移文件名清单（按序）。与 src/db/provision.ts 的 MIGRATIONS 对应。 */
+const MIGRATION_FILES = [
+  '0001_init.sql',
+  '0002_admin_content.sql',
+  '0003_dav_passkey.sql',
+  '0004_node_settings.sql',
+  '0005_payment.sql',
+  '0006_audit_log.sql',
+  '0007_paid_share.sql',
+  '0008_oidc.sql',
+  '0009_group_storage_policies.sql',
+];
+
+/** 去注释后按分号切分。与 src/db/provision.ts 的 splitStatements 同源。 */
+function splitSqlStatements(sqlText) {
+  const noBlock = sqlText.replace(/\/\*[\s\S]*?\*\//g, '');
+  const noLine = noBlock
+    .split('\n')
+    .map((line) => {
+      const idx = line.indexOf('--');
+      return idx === -1 ? line : line.slice(0, idx);
+    })
+    .join('\n');
+  return noLine
+    .split(';')
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+}
+
 /** 从驱动返回值里抠出 COPY 的文本输出（字段名跨版本会变，不绑死）。 */
 function firstString(v) {
   if (typeof v === 'string') return v;
@@ -154,19 +233,38 @@ function firstString(v) {
 }
 
 let failed = false;
+/**
+ * 「结构性失败」= 备库连不上 / 建不出表 / 缺表。
+ *
+ * 这与「某张表搬数据时报错」不同：前者意味着**这个备库根本没有被用上**
+ * ——用户看到「配了 5 个库」，实际同步一个都没铺成。这种情况必须让 CI
+ * 步骤红掉，否则它会永远静默地保持空库状态。
+ * （数据搬运的偶发错误仍按原设计只警告，不阻断部署。）
+ */
+let structuralFailure = false;
 
 for (const [i, b] of backups.entries()) {
   console.log(`\n── 备库 ${i + 1}/${backups.length}：${describe(b.url)}`);
+
+  // 备库是新开的 Neon 项目、通常是空的 —— 先自动把 schema 建起来。
+  // 以前这里只打印操作指引，于是同步被跳过、构建照样成功、备库永远空着。
+  if (!(await ensureSchema(b.sql, `备库 ${i + 1}`))) {
+    failed = true;
+    structuralFailure = true;
+    continue;
+  }
+
   const missing = [];
   for (const t of SYNC_TABLES) {
     if ((await tableExists(primary, t)) && !(await tableExists(b.sql, t))) missing.push(t);
   }
   if (missing.length) {
     failed = true;
+    structuralFailure = true;
     console.error(
       `✘ 备库缺表：${missing.join(', ')}\n` +
-        `  备库必须先把 schema 建起来。做法：把该备库连接串临时配成 DATABASE_URL，\n` +
-        `  部署一次让 Worker 自举（建表 + 播种），再换回主库连接串。`,
+        `  主库有这些表但备库建表后仍不存在，说明迁移文件与主库 schema 已漂移。\n` +
+        `  检查 migrations/*.sql 是否缺了对应的 CREATE TABLE。`,
     );
     continue;
   }
@@ -217,6 +315,15 @@ for (const [i, b] of backups.entries()) {
       if (has('--strict')) process.exit(1);
     }
   }
+}
+
+if (structuralFailure) {
+  console.error(
+    '\n✘ 备库未能铺好（结构性问题：连不上 / 建表失败 / 缺表）。\n' +
+      '  这不只是「这次同步没成功」——而是这个备库根本没有被用上，\n' +
+      '  现在退出非零，让 CI 步骤变红而不是静默通过。',
+  );
+  process.exit(1);
 }
 
 if (failed) {

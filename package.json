@@ -20,7 +20,8 @@
     "test:user-cache": "node scripts/test-user-cache.mjs",
     "test:copy:setup": "node scripts/test-copy-fixture.mjs",
     "test:copy": "node scripts/test-copy-roundtrip.mjs",
-    "test:multidb": "node scripts/test-kv-router.mjs && node scripts/test-db-failover.mjs && node scripts/test-user-cache.mjs && node scripts/test-copy-fixture.mjs && node scripts/test-copy-roundtrip.mjs"
+    "test:db-schema": "node scripts/test-db-schema-sync.mjs",
+    "test:multidb": "node scripts/test-kv-router.mjs && node scripts/test-db-failover.mjs && node scripts/test-user-cache.mjs && node scripts/test-db-schema-sync.mjs && node scripts/test-copy-fixture.mjs && node scripts/test-copy-roundtrip.mjs"
   },
   "dependencies": {
     "@neondatabase/serverless": "^0.10.4",

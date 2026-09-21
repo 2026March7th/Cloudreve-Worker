@@ -107,15 +107,56 @@ KV **只做缓存**，不存业务数据。加多个不是做哈希分片，而�
 
 这里有个必须讲清的取舍：**「备库接流量」和「构建时全量覆盖」不能同时成立**——只要备库接受过写入，下一次全量同步就会把这些写入抹掉。所以本项目选择前者让位后者：备库只读，换来「备份内容永远等于主库快照」这个确定性。真要双活写入，得做主从复制（Neon 上属于付费能力），不是这套机制能提供的。
 
-全量同步走 `COPY ... TO STDOUT / FROM STDIN`（每张表 1 个 HTTP 子请求，按 500 行分批），比逐行 INSERT 省下大量 Workers 子请求配额。表清单见 `src/db/replicate.ts` 的 `TABLES`。
+> **所以「我绑了 5 个库」的正常表现就是：只有主库在处理读写，另外 4 个平时是安静的。** 这不是没生效 —— 它们是备份，备份的用途就是平时不动。判断有没有生效看下面两条，不要看「请求打到了哪个库」。
+
+#### `DATABASE_URL_2..5` 要填在哪里
+
+和 KV 不同，数据库连接串**运行时要读**（Worker 用它连库），**构建时也要读**（CI 用它做全量同步）。所以位置分两处：
+
+| 位置 | 构建期同步用 | 运行时连库用 | 说明 |
+|---|---|---|---|
+| Cloudflare 面板 → 该 Worker → 设置 → **变量和机密** | ❌ | ✅ **必须配** | Worker 运行时只认这里。5 个库都要加进来 |
+| GitHub：Settings → Secrets → Actions | ✅ **必须配** | ❌ | CI 靠它跑「主库 → 备库全量同步」 |
+| Workers Builds → 设置 → 构建 → 环境变量 | ✅ | ❌ | 同上，作用于构建过程 |
+| 仓库 `.dev.vars`（本机） | ✅ | — | 只在 `wrangler dev` / 本机脚本生效，不入库 |
+
+**两边都要配**。只配了 GitHub Secrets：构建日志里能看到同步成功，但 Worker 运行时读不到 `DATABASE_URL_2..5`，等于只有主库在跑。只配了面板：运行时有，但每次构建不会自动同步，备库会一直是空的。
+
+#### 怎么确认 5 个库真的被运行时用上了
 
 ```bash
-npm run db:sync            # 主库 → 全部备库，全量同步
-npm run db:sync:verify     # 只校验备库表结构是否与主库一致
+curl https://你的域名/api/v4/site/db-status
+```
+
+```json
+{ "present": [
+    { "name": "DATABASE_URL",   "present": true, "host": "ep-aaa.aws.neon.tech" },
+    { "name": "DATABASE_URL_2", "present": true, "host": "ep-bbb.aws.neon.tech" },
+    { "name": "DATABASE_URL_3", "present": true, "host": "ep-ccc.aws.neon.tech" },
+    { "name": "DATABASE_URL_4", "present": true, "host": "ep-ddd.aws.neon.tech" },
+    { "name": "DATABASE_URL_5", "present": true, "host": "ep-eee.aws.neon.tech" }
+  ],
+  "database_count": 5,
+  "backup_count": 4,
+  "failover_enabled": false,
+  "single_writer": true }
+```
+
+`database_count` 为 `1` 就说明**运行时只看到 1 个库**（面板里没配齐）。端点只回显 host，**不暴露用户名和密码**。
+
+#### 备库的建表（已自动化）
+
+新开的 Neon 备库是**空的**，一张表都没有，直接同步会失败。`scripts/db-sync.mjs` 现在会**自动**把 `migrations/*.sql` 应用过去建表，再开始搬数据 —— 不需要你手工把备库临时设成主库去自举。
+
+如果备库始终建不出表（连不上、迁移漂移），同步步骤会**直接让 CI 变红**，而不是静默跳过 —— 以前那种「构建全绿、备库全空」的情况不会再发生。
+
+```bash
+npm run db:sync            # 主库 → 全部备库：自动建表 + 全量同步
+npm run db:sync:verify     # 只校验备库 schema 是否齐备，不搬数据
 DB_SYNC_SKIP=audit_logs npm run db:sync   # 跳过指定表
 ```
 
-CI 里这三步的顺序是「**先同步、后部署**」，避免出现「新代码 + 旧数据」的窗口。同步失败默认不阻断部署（备库是安全网，没铺好不该拦着站点更新）。
+CI 里这三步的顺序是「**先同步、后部署**」，避免出现「新代码 + 旧数据」的窗口。数据搬运的偶发错误不阻断部署（备库是安全网）；但**结构性失败（连不上/建不出表/缺表）会让 CI 失败**，因为那意味着这个备库根本没被用上。
 
 ## 架构
 

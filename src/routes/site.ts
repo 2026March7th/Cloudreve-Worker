@@ -18,6 +18,7 @@ import { UserService } from '../services/user';
 import { publicOidcInfo } from '../services/oidc';
 import type { AppContext } from '../services/context';
 import { kvFor } from '../lib/kvRouter';
+import { backupDatabaseUrls, databaseUrls, failoverEnabled } from '../db';
 
 const CAPTCHA_PREFIX = 'captcha:';
 const CAPTCHA_TTL = 1800; // 与原版 CaptchaTTL 一致（30 分钟）
@@ -95,6 +96,71 @@ function listKvBindings(env: unknown): string[] {
   return Object.keys(bindings)
     .filter((k) => /^KV(_\d+)?$/.test(k))
     .sort();
+}
+
+/**
+ * 诊断端点：回显当前 Worker 运行时**实际拿到**的数据库连接串。
+ *
+ * 与 `/kv-status` 同一个存在理由 —— 多库配置配错了不会报错：
+ * `db/shard.ts` 在只配了主库时照常工作（备库为空数组 → 恒用主库），
+ * 于是「配了 5 个库、实际只有 1 个可见」从外部完全看不出来。
+ *
+ * ⚠️ **只回显 host 与是否存在，绝不回显用户名/密码**（连接串含密码）。
+ *
+ * 这里同时读取 `env` 上的**绑定**。关键区别（很多人在这里踩坑）：
+ *   - Cloudflare 面板「变量和机密」= **运行时**，Worker 这里能读到；
+ *   - GitHub Secrets / Workers Builds 构建环境变量 = **构建期**，
+ *     只有构建脚本（db:sync / deploy）能读，Worker 运行时读不到。
+ *   要让运行时看到 N 个库，必须在**面板**里配齐 DATABASE_URL_2..5
+ *   （或走 deploy.mjs 的 `wrangler secret put`，它写的也是运行时机密）。
+ */
+siteRoutes.get('/db-status', (c) => {
+  c.header('Cache-Control', 'no-cache');
+  const env = c.env as unknown as Record<string, string | undefined>;
+  const names = ['DATABASE_URL', 'DATABASE_URL_2', 'DATABASE_URL_3', 'DATABASE_URL_4', 'DATABASE_URL_5'] as const;
+
+  const configured = names
+    .map((name) => {
+      const raw = env[name]?.trim();
+      if (!raw) return { name, present: false as const };
+      return {
+        name,
+        present: true as const,
+        // 只给 host，用于区分「是不是不同的库」。用户名/密码一律不出。
+        host: safeHost(raw),
+        duplicated: names.some((other) => other !== name && env[other]?.trim() === raw),
+      };
+    })
+    .filter((x) => x.present);
+
+  const urls = databaseUrls(c.env as never);
+  const backups = backupDatabaseUrls(c.env as never);
+  const failover = failoverEnabled(c.env as never);
+
+  return ok(c, {
+    present: configured,
+    database_count: urls.length,
+    backup_count: backups.length,
+    failover_enabled: failover,
+    // 主库是不是唯一可写：这里是恒定 true（设计如此），写出来是为了让人
+    // 一眼看懂「备库不接流量」不是配置错误。
+    single_writer: true,
+    hint:
+      urls.length <= 1
+        ? 'Worker 运行时只看到 1 个数据库。面板「变量和机密」里需要同时配 DATABASE_URL_2..5（构建期变量运行时读不到）。'
+        : failover
+          ? `运行时看到 ${urls.length} 个库（1 主 + ${backups.length} 备），已开启故障切换。备库平时不接流量，每次构建由 CI 全量同步。`
+          : `运行时看到 ${urls.length} 个库（1 主 + ${backups.length} 备）。备库平时不接流量，每次构建由 CI 全量同步；主库挂了要临时接管需设 DB_FAILOVER=1。`,
+  });
+});
+
+/** 从连接串里取 host（去掉账号密码）。解析失败返回 '(无法解析)'。 */
+function safeHost(url: string): string {
+  try {
+    return new URL(url).host || '(空)';
+  } catch {
+    return '(无法解析)';
+  }
 }
 
 siteRoutes.get('/config/:section', async (c) => {

@@ -55,8 +55,11 @@ import { isSocialMediaBot, renderSharePreview } from './services/share-preview';
  * v4：seedSystemData 新增 group_storage_policies 建表 + 旧单绑定迁入
  * （cf12733 漏 bump 导致存量部署查表报 relation does not exist）。
  * v5：新增付费分享迁移 0007（shares.score + share_purchases 表）。
+ * v6：新增 OIDC 迁移 0008（user_oidc_bindings 表）。
+ * v7：group_storage_policies 建表移入迁移 0009（此前只在 seedSystemData
+ *     里建，导致「只按 migrations 建库」的备库缺这张表 → 该表同步不过去）。
  */
-const BOOTSTRAP_FLAG = 'bootstrap:done:v6';
+const BOOTSTRAP_FLAG = 'bootstrap:done:v7';
 /** 自举失败后的冷却键（20 秒 TTL）：期间请求直接快速失败，不再重放自举。 */
 const BOOTSTRAP_COOLDOWN = 'bootstrap:cooldown:v1';
 /** 同一 isolate 内的并发请求共享一次自举。 */
