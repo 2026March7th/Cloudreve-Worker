@@ -176,10 +176,14 @@ export class UserService {
       logAudit(this.ctx, 'user_login_failed', null, { email });
       throw new AppError(CodeInvalidPassword, 'Incorrect password or email address');
     }
-    const ok = await checkPassword(user.password, password);
-    if (!ok) {
+    const pwCheck = await checkPassword(user.password, password);
+    if (!pwCheck.ok) {
       logAudit(this.ctx, 'user_login_failed', user.id, { email });
       throw new AppError(CodeInvalidPassword, 'Incorrect password or email address');
+    }
+    // v2 老密码惰性升级为 v4 安全格式（仅当命中 md5 老格式时附带）
+    if (pwCheck.upgradeToV4) {
+      await this.ctx.users.updatePassword(user.id, pwCheck.upgradeToV4);
     }
     if (user.status === 'manual_banned' || user.status === 'sys_banned') {
       throw new AppError(CodeUserBaned, 'This account has been blocked');
@@ -598,8 +602,11 @@ export class UserService {
     }
 
     if (patch.new_password) {
-      const ok = await checkPassword(user.password, patch.current_password ?? '');
-      if (!ok) throw new AppError(CodeIncorrectPassword, 'Incorrect password');
+      const pwCheck = await checkPassword(user.password, patch.current_password ?? '');
+      if (!pwCheck.ok) throw new AppError(CodeIncorrectPassword, 'Incorrect password');
+      if (pwCheck.upgradeToV4) {
+        await this.ctx.users.updatePassword(user.id, pwCheck.upgradeToV4);
+      }
       const digest = await digestPassword(patch.new_password);
       await this.ctx.users.updatePassword(user.id, digest);
       logAudit(this.ctx, 'change_password', user.id);

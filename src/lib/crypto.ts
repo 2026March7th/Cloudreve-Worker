@@ -6,6 +6,8 @@
  * 校验时按冒号切分；第二段长度为 64 视为 sha256（v4），否则按 sha1 处理（v3 兼容）。
  */
 
+import { md5 } from './md5';
+
 const ALPHABET = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
 
 /** 生成指定长度的随机串，取自密码学安全随机源。 */
@@ -81,23 +83,42 @@ export async function digestPassword(password: string): Promise<string> {
  *   3. 第二段长度为 64 用 SHA-256，否则用 SHA-1（v3 兼容），
  *      比对 `H(password + salt)`，其中 salt 是第一段。
  */
+export interface PasswordCheckResult {
+  ok: boolean;
+  /** 命中 v2 老格式且校验通过时，附带重算后的 v4 摘要，供调用方惰性升级为安全格式。 */
+  upgradeToV4?: string;
+}
+
 export async function checkPassword(
   stored: string | null | undefined,
   password: string,
-): Promise<boolean> {
-  if (!stored) return false;
+): Promise<PasswordCheckResult> {
+  if (!stored) return { ok: false };
   const parts = stored.split(':');
-  if (parts.length !== 2 && parts.length !== 3) return false;
+  if (parts.length !== 2 && parts.length !== 3) return { ok: false };
+
+  // v2 遗留格式：`md5:<hash>:<salt>`。Cloudreve v2 的 digestPassword 为
+  // `md5(password + salt)`（个别版本写成 `md5(md5(password) + salt)`，两种都试）。
+  // Web Crypto 不提供 MD5，这里用自实现的 md5.ts（与 Epay 协议同款）。
+  if (parts.length === 3 && parts[0] === 'md5') {
+    const expected = parts[1];
+    const salt = parts[2];
+    const candidates = [md5(password + salt), md5(md5(password) + salt)];
+    if (candidates.some((c) => timingSafeEqual(c, expected))) {
+      return { ok: true, upgradeToV4: await digestPassword(password) };
+    }
+    return { ok: false };
+  }
 
   if (parts.length === 3) {
-    // v2 格式，需要 MD5；未实现，一律拒绝（与上游在缺少 MD5 时的结果一致）。
-    return false;
+    // 其它 3 段格式暂不支持
+    return { ok: false };
   }
 
   const [salt, expected] = parts as [string, string];
   const hasher = expected.length === 64 ? sha256Hex : sha1Hex;
   const actual = await hasher(password + salt);
-  return timingSafeEqual(actual, expected);
+  return { ok: timingSafeEqual(actual, expected) };
 }
 
 /** 生成 RFC4122 v4 UUID。 */

@@ -1156,7 +1156,8 @@ adminRoutes.delete('/tool/entityUrlCache', async (c) => ok(c));
 // ---------------------------------------------------------------------------
 
 const NOT_IMPLEMENTED_ADMIN: Record<string, string> = {
-  '/tool/thumbExecutable': 'Thumbnail generation is not implemented in the edge build',
+  '/tool/thumbExecutable':
+    'Edge 版缩略图由 Cloudflare Image Resizing 实时生成（需 zone 启用 Image Resizing），无本地可执行文件需检测。',
 };
 
 for (const [path, message] of Object.entries(NOT_IMPLEMENTED_ADMIN)) {

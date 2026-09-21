@@ -201,7 +201,14 @@ export class DownloadService {
     return content;
   }
 
-  /** 缩略图地址；驱动不支持时返回 null（原版返回空 url）。 */
+  /**
+   * 缩略图地址。
+   *
+   * 优先用驱动自带的原生缩略图（OneDrive 等）；R2/S3 等无原生缩略图的驱动，
+   * 对图片走 Cloudflare Image Resizing 实时缩放——把原始对象签名地址交给新增的
+   * `/api/v4/file/thumbimg` 端点，由 Worker 在取图时实时缩放后回传。视频/Office
+   * 文档缩略图仍依赖驱动原生能力（OneDrive 可用）。
+   */
   async thumb(uri: URI): Promise<{ url: string; expires: string | null }> {
     const file = await this.fs.mustResolve(uri);
     if (file.type !== FileType.File || !file.primary_entity) {
@@ -214,8 +221,34 @@ export class DownloadService {
     if (!policy) return { url: '', expires: null };
     const driver = this.ctx.driverFor(policy);
 
-    const url = await driver.thumb(entity.source, 'large').catch(() => null);
-    return { url: url ?? '', expires: null };
+    // 驱动自带的原生缩略图（OneDrive 等）优先
+    const native = await driver.thumb(entity.source, 'large').catch(() => null);
+    if (native) return { url: native, expires: null };
+
+    // R2/S3 等无原生缩略图：对图片走 Cloudflare Image Resizing 实时缩放
+    const ext = file.name.split('.').pop()?.toLowerCase() ?? '';
+    const isImage = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'avif', 'tif', 'tiff'].includes(
+      ext,
+    );
+    if (!isImage) return { url: '', expires: null };
+
+    const ttl = this.ctx.settings.getInt('entity_url_default_ttl', 3600);
+    const src = await driver
+      .source(entity.source, {
+        expire: Date.now() + ttl * 1000,
+        isDownload: false,
+        displayName: file.name,
+        speed: 0,
+      })
+      .catch(() => null);
+    if (!src) return { url: '', expires: null };
+
+    const w = this.ctx.settings.getInt('thumb_width', 512);
+    const h = this.ctx.settings.getInt('thumb_height', 512);
+    const sign = await this.ctx.signer.sign(src);
+    const base = this.ctx.settings.siteUrl.replace(/\/+$/, '');
+    const url = `${base}/api/v4/file/thumbimg?src=${encodeURIComponent(src)}&w=${w}&h=${h}&sign=${encodeURIComponent(sign)}`;
+    return { url, expires: null };
   }
 
   // -------------------------------------------------------------------------

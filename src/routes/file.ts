@@ -253,6 +253,48 @@ fileRoutes.get('/thumb', async (c) => {
 });
 
 /**
+ * 缩略图实际成像端点（GET）。由 `download.thumb()` 生成带签名 `src` 的 URL，
+ * 浏览器以 `<img src>` 拉取。这里取出 `src`（已 HMAC 签名防篡改），用
+ * Cloudflare Image Resizing 实时缩放后返回。
+ *
+ * 需要站点所在 zone 启用 Image Resizing 付费附加项；未启用（或缩放失败）时
+ * 回退为原图（浏览器按 CSS 缩放），缩略图依然可用。
+ */
+fileRoutes.get('/thumbimg', async (c) => {
+  const ctx = ctxOf(c);
+  const src = c.req.query('src');
+  const sign = c.req.query('sign');
+  const w = Number.parseInt(c.req.query('w') ?? '0', 10);
+  const h = Number.parseInt(c.req.query('h') ?? '0', 10);
+  if (!src || !sign) return fail(c, Err.param('missing src or sign'));
+  try {
+    await ctx.signer.check(src, sign);
+  } catch {
+    return fail(c, Err.noPermission());
+  }
+
+  const opts: RequestInit & { cf?: { image?: Record<string, unknown> } } = { method: 'GET' };
+  if (w > 0 && h > 0) opts.cf = { image: { width: w, height: h, fit: 'cover' } };
+
+  let res = await fetch(src, opts);
+  if (!res.ok && opts.cf) {
+    // Image Resizing 不可用 / 失败 → 回退原图
+    res = await fetch(src);
+  }
+  if (!res.ok) {
+    return fail(c, new AppError(res.status, 'image source unavailable'));
+  }
+
+  const headers = new Headers();
+  const ct = res.headers.get('content-type');
+  if (ct) headers.set('content-type', ct);
+  headers.set('cache-control', 'public, max-age=86400');
+  const disposition = res.headers.get('content-disposition');
+  if (disposition) headers.set('content-disposition', disposition);
+  return new Response(res.body, { status: 200, headers });
+});
+
+/**
  * 实体内容分发（代理下载）。
  * 需要 URL 签名；支持 Range，便于视频拖动。
  */
