@@ -75,6 +75,15 @@ import {
 import { isShareInvalid } from './share-rules';
 import { publish } from './events';
 
+/**
+ * 拼父子路径。父路径是 `/`（根目录）时避免出现 `//name`。
+ * 与 `pathOf()` 的输出格式保持一致（都以 `/` 开头）。
+ */
+function joinPath(parentPath: string, name: string): string {
+  if (parentPath === '/' || parentPath === '') return `/${name}`;
+  return `${parentPath.replace(/\/+$/, '')}/${name}`;
+}
+
 /** 向同 isolate 的 SSE 订阅者广播一条文件事件（失败静默，不影响主流程）。 */
 function notifyFsEvent(
   ctx: AppContext,
@@ -220,6 +229,13 @@ export interface BuildFileOptions {
    * 显示名要取 `sys:restore_uri` 的最后一段（原版 `File.DisplayName()`）。
    */
   displayName?: string;
+  /**
+   * 预先算好的「用户视角路径」。列表接口里同目录所有条目共享一条祖先链，
+   * 由调用方算一次后传入，避免每个文件各走一次 `pathOf()`（深度 × 条目的
+   * 串行数据库查询 —— 实测这是列目录最贵的一块）。
+   * 不传时回退到旧的逐文件 `pathOf()`。
+   */
+  precomputedPath?: string;
 }
 
 const ORDER_BY_OPTIONS = ['name', 'size', 'updated_at', 'created_at'];
@@ -431,6 +447,23 @@ export class FileSystemService {
     return segments.length === 0 ? '/' : `/${segments.join('/')}`;
   }
 
+  /**
+   * 取**同目录兄弟节点**共用的路径前缀。
+   *
+   * 原实现是「每个文件各调一次 `pathOf()`」，而 `pathOf()` 每上一级都要打一次
+   * 数据库。列一个 7 项的根目录就等于 7 次**串行**查询；目录层级越深越糟
+   * （深度 × 条目数）。但同一目录下的所有条目共享**同一条祖先链**，
+   * 所以这里只走一遍，把父路径算出来复用。
+   *
+   * 返回父路径（形如 `/a/b`，根目录为 `/`）；调用方自行拼上 `file.name`。
+   * ⚠️ 只对「条目都是同一目录直接子节点」的文件系统有效（my / share）。
+   * trash 与 sharedWithMe 是扁平列表，调用方须传 null 走逐项 pathOf。
+   */
+  private parentPathOf(dir: FileRow | null): Promise<string> {
+    if (!dir || this.isRootFolder(dir)) return Promise.resolve('/');
+    return this.pathOf(dir);
+  }
+
   /** 判断是否根目录。 */
   isRootFolder(file: FileRow): boolean {
     return file.file_children === null && file.name === '';
@@ -465,7 +498,7 @@ export class FileSystemService {
 
   async buildFileResponse(file: FileRow, options: BuildFileOptions = {}): Promise<FileResponse> {
     const user = this.ctx.user;
-    const path = await this.pathOf(file);
+    const path = options.precomputedPath ?? (await this.pathOf(file));
     // 用户视角的 URI：
     //   - 回收站项固定是 `cloudreve://trash/<随机名>`（原版 trash_navigator.go:94-95）；
     //   - 其余情况以调用方给的 `options.uri` 为准 —— 分享空间下它是
@@ -719,27 +752,45 @@ export class FileSystemService {
 
     // 这两个查询都依赖上面的 files，彼此独立 —— 并行发出，省掉一次串行等待
     // （Neon HTTP 驱动每次查询是一次 fetch，串行会线性叠加延迟）。
+    //
+    // 关于 `parentPath`：只有当所有条目**确实是同一个目录的直接子节点**时，
+    // 才能把祖先链算一次复用。两种文件系统不满足这个前提，必须逐个算：
+    //   - trash：`pathOf()` 对回收站项恒返回 '/'（file_children 为 null），
+    //     且显示名来自 sys:restore_uri，路径本身没有意义 —— 直接不算；
+    //   - sharedWithMe：是一条**扁平**列表（原版 childFileQuery 不带 parentId），
+    //     条目散落在不同目录，没有公共祖先。
+    // 其余情况（my / share）都是标准的父子层级，可安全复用。
+    const flatList =
+      isTrashRoot || uri.fsType === FileSystemType.SharedWithMe;
+
     const [metadataMap, sharedIds] = await Promise.all([
       this.loadMetadata(files, uri.fsType === FileSystemType.My),
       this.ctx.shares.sharedFileIds(files.map((f) => f.id)),
     ]);
 
-    const fileResponses: FileResponse[] = [];
-    for (const f of files) {
-      const meta = metadataMap.get(f.id);
-      const res = await this.buildFileResponse(f, {
-        shared: sharedIds.has(f.id),
-        owned: viewer !== undefined && f.owner_id === viewer.id,
-        // 子节点在调用方视角下的 URI —— 分享空间下要带上 share hashid 与密码
-        uri: this.childUri(uri, f),
-        // 回收站里的 name 是随机串，显示名要回落到 sys:restore_uri 的最后一段
-        displayName: isTrashRoot ? this.displayNameOf(f, meta) : undefined,
-      });
-      if (meta) {
-        for (const m of meta) res.metadata[m.name] = m.value;
-      }
-      fileResponses.push(res);
-    }
+    const parentPath = flatList ? null : await this.parentPathOf(dir);
+
+    // 逐项构造响应。这里可以并行：buildFileResponse 在传了 precomputedPath
+    // 之后不再打数据库（除非开了 extended/folderSummary，列表接口都不开）。
+    const fileResponses: FileResponse[] = await Promise.all(
+      files.map(async (f) => {
+        const meta = metadataMap.get(f.id);
+        const res = await this.buildFileResponse(f, {
+          shared: sharedIds.has(f.id),
+          owned: viewer !== undefined && f.owner_id === viewer.id,
+          // 子节点在调用方视角下的 URI —— 分享空间下要带上 share hashid 与密码
+          uri: this.childUri(uri, f),
+          // 回收站里的 name 是随机串，显示名要回落到 sys:restore_uri 的最后一段
+          displayName: isTrashRoot ? this.displayNameOf(f, meta) : undefined,
+          // 有公共父路径时直接拼；否则交给 pathOf 逐项算（trash / sharedWithMe）
+          precomputedPath: parentPath === null ? undefined : joinPath(parentPath, f.name),
+        });
+        if (meta) {
+          for (const m of meta) res.metadata[m.name] = m.value;
+        }
+        return res;
+      }),
+    );
 
     const response: ListResponse = {
       files: fileResponses,

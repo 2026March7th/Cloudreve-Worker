@@ -59,6 +59,19 @@ const BOOTSTRAP_FLAG = 'bootstrap:done:v6';
 const BOOTSTRAP_COOLDOWN = 'bootstrap:cooldown:v1';
 /** 同一 isolate 内的并发请求共享一次自举。 */
 let bootstrapPromise: Promise<void> | null = null;
+/**
+ * 自举完成标记的 isolate 级内存缓存。
+ *
+ * `BOOTSTRAP_FLAG` 是**一次性**的开关：站点起来之后这个键永远是 1。
+ * 原实现每个请求都要 `KV.get(BOOTSTRAP_FLAG)` 确认一次 —— 实测单次 KV
+ * get 180~560ms，等于给**所有**请求（包括静态资源与 API）永久加了一道
+ * 半秒级的税。而 KV 全球最终一致，本来也没人能保证跨 isolate 立刻可见，
+ * 所以这里缓存进内存，语义上没有任何损失：
+ *   - `false` 表示「本 isolate 还没确认过」，仍走 KV + 自举流程；
+ *   - `true` 表示本 isolate 已确认，后续请求直接跳过。
+ * 部署新版本会换掉 isolate，标记自然重新读取（这正是需要的时机）。
+ */
+let bootstrapConfirmed = false;
 /** 环境变量管理员检查每个 isolate 只跑一次（KV 标记去重，见 services/envAdmin.ts）。 */
 let envAdminPromise: Promise<void> | null = null;
 
@@ -86,39 +99,44 @@ app.use('*', async (c, next) => {
   //
   // KV / 数据库不可用时不能让异常逃出去（平台层回 520，用户看不懂也
   // 没法重试）。这里统一转成 503 + 明确文案，前端刷新即可恢复。
-  let bootstrapped: string | null;
-  try {
-    bootstrapped = await c.env.KV.get(BOOTSTRAP_FLAG);
-    if (!bootstrapped) {
-      if (await c.env.KV.get(BOOTSTRAP_COOLDOWN)) {
-        return c.json(
-          { code: 50006, msg: '站点正在初始化（刚部署或数据库暂时不可用），请几秒后刷新重试' },
-          503,
-        ) as never;
+  //
+  // 已确认过的 isolate 直接短路 —— 这一条是**热路径**上的关键优化，
+  // 见 `bootstrapConfirmed` 的注释。
+  if (!bootstrapConfirmed) {
+    try {
+      const bootstrapped = await c.env.KV.get(BOOTSTRAP_FLAG);
+      if (!bootstrapped) {
+        if (await c.env.KV.get(BOOTSTRAP_COOLDOWN)) {
+          return c.json(
+            { code: 50006, msg: '站点正在初始化（刚部署或数据库暂时不可用），请几秒后刷新重试' },
+            503,
+          ) as never;
+        }
+        if (!bootstrapPromise) {
+          bootstrapPromise = (async () => {
+            await provision(c.env);
+            await ensureSettings(c.env);
+            await c.env.KV.put(BOOTSTRAP_FLAG, '1');
+          })().catch(async (err) => {
+            bootstrapPromise = null;
+            try {
+              await c.env.KV.put(BOOTSTRAP_COOLDOWN, '1', { expirationTtl: 20 });
+            } catch {
+              /* KV 也不可用时只能让下一个请求再试 */
+            }
+            throw err;
+          });
+        }
+        await bootstrapPromise;
       }
-      if (!bootstrapPromise) {
-        bootstrapPromise = (async () => {
-          await provision(c.env);
-          await ensureSettings(c.env);
-          await c.env.KV.put(BOOTSTRAP_FLAG, '1');
-        })().catch(async (err) => {
-          bootstrapPromise = null;
-          try {
-            await c.env.KV.put(BOOTSTRAP_COOLDOWN, '1', { expirationTtl: 20 });
-          } catch {
-            /* KV 也不可用时只能让下一个请求再试 */
-          }
-          throw err;
-        });
-      }
-      await bootstrapPromise;
+      bootstrapConfirmed = true;
+    } catch (e) {
+      console.error('bootstrap failed', describeError(e));
+      return c.json(
+        { code: 50006, msg: '站点正在初始化（数据库暂时不可用），请几秒后刷新重试' },
+        503,
+      ) as never;
     }
-  } catch (e) {
-    console.error('bootstrap failed', describeError(e));
-    return c.json(
-      { code: 50006, msg: '站点正在初始化（数据库暂时不可用），请几秒后刷新重试' },
-      503,
-    ) as never;
   }
   // 兜底管理员（ADMIN_EMAIL / ADMIN_PASSWORD，可选）——放在自举之外，
   // 后配的环境变量也能在下一个冷启动 isolate 里生效。

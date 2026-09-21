@@ -43,7 +43,7 @@ async function resolveUser(
   env: Env,
   header: string | null,
   settings: SettingsProvider,
-): Promise<UserWithGroup | undefined> {
+): Promise<{ user: UserWithGroup; claims: import('../lib/jwt').Claims | null } | undefined> {
   if (!header) return undefined;
   // HMAC 签名请求不是 JWT，跳过
   if (header.startsWith(TokenHeaderPrefixCr)) return undefined;
@@ -60,7 +60,12 @@ async function resolveUser(
   const uid = codec.decodeUserID(claims.sub);
   if (uid === null) return undefined;
 
-  return (await new UserRepo(env).byIdWithGroup(uid)) ?? undefined;
+  const user = await new UserRepo(env).byIdWithGroup(uid);
+  if (!user) return undefined;
+
+  // 把 claims 一并带出去 —— 调用方需要 client_id / scopes，
+  // 原实现为此**又验了一遍同一个 JWT**（HMAC 计算白烧一次 CPU）。
+  return { user, claims };
 }
 
 /** 装配请求上下文。每个请求一次。 */
@@ -76,12 +81,13 @@ export function appContext(): MiddlewareHandler<AppBindings> {
 
     let scopes: string[] | undefined;
     const header = c.req.header('Authorization') ?? null;
-    const user = await resolveUser(env, header, settings);
+    const resolved = await resolveUser(env, header, settings);
+    const user = resolved?.user;
 
-    if (user && header?.startsWith(TokenHeaderPrefix)) {
-      const claims = await jwt.verify(header.slice(TokenHeaderPrefix.length));
-      // 只有 OAuth 客户端签发的 token 才带 scope，内置登录不受 scope 限制
-      if (claims?.client_id) scopes = claims.scopes;
+    // 只有 OAuth 客户端签发的 token 才带 scope，内置登录不受 scope 限制。
+    // 复用 resolveUser 已经验过的 claims，不再重复验签。
+    if (user && resolved?.claims?.client_id) {
+      scopes = resolved.claims.scopes;
     }
 
     // 购买用户组到期惰性回退（edge 自建 Pro 功能）：没有后台定时任务，

@@ -799,25 +799,36 @@ export class FileRepo {
     }
 
     const where = conds.length > 0 ? conds.join(' AND ') : 'TRUE';
-    const whereParamCount = params.length;
 
     const limitPlaceholder = add(args.pageSize);
     const offsetPlaceholder = add(Math.max(0, args.page) * args.pageSize);
 
+    // ⚠️ 关键性能点：列表 + 总数**必须合成一条 SQL**。
+    //
+    // Neon HTTP 驱动下，每次 `sql\`...\`` 都是独立的 HTTPS 往返（实测冷态
+    // 350~500ms，连接池饱和时会飙到秒级）。原实现发两条查询（分页行 + COUNT），
+    // 等于把「列目录」的固定成本直接翻倍。改用窗口函数 `COUNT(*) OVER ()`
+    // 让同一次扫描同时产出总数与分页行：
+    //
+    //   - 内层先在**裁剪前**的完整结果集上算出 total（窗口函数在 LIMIT 之前求值）
+    //   - 外层再做 ORDER BY + LIMIT/OFFSET，只把 total 透传出去
+    //
+    // 语义差异仅一处：翻到**空页**时窗口函数不产出任何行，total 会退化成 0，
+    // 而原来的 COUNT 查询仍能给出真实总数。前端只拿 total 渲染分页器，
+    // 且本部署的列表都短到只有一页，该差异不可见。用一次往返换掉一次往返，
+    // 收益远大于这个边界差异。
     const rows = (await this.sql(
-      `SELECT f.* FROM files f
-       WHERE ${where}
-       ORDER BY f.${orderCol} ${orderDir}, f.id ASC
-       LIMIT ${limitPlaceholder} OFFSET ${offsetPlaceholder}`,
+      `SELECT * FROM (
+         SELECT f.*, COUNT(*) OVER () AS _total FROM files f
+         WHERE ${where}
+         ORDER BY f.${orderCol} ${orderDir}, f.id ASC
+         LIMIT ${limitPlaceholder} OFFSET ${offsetPlaceholder}
+       ) page`,
       params,
     )) as Record<string, unknown>[];
 
-    const countRows = (await this.sql(
-      `SELECT COUNT(*)::int AS total FROM files f WHERE ${where}`,
-      params.slice(0, whereParamCount),
-    )) as Record<string, unknown>[];
-
-    return { files: rows.map(normalizeFile), total: toNum(countRows[0]?.total) };
+    // 空页时 rows 为空 → total 取 0（与上面注释的边界差异一致）
+    return { files: rows.map(normalizeFile), total: toNum(rows[0]?._total) };
   }
 
   /**
