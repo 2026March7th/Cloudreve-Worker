@@ -32,6 +32,7 @@ import {
   CodeOwnerOnly,
   CodePolicyNotAllowed,
   CodeRootProtected,
+  CodeStaleVersion,
   CodeUploadSessionExpired,
   Err,
 } from '../lib/errors';
@@ -546,7 +547,7 @@ export class UploadService {
     body: ReadableStream,
     length: number,
     mimeType: string,
-    options: { ignoreMaxEdit?: boolean } = {},
+    options: { ignoreMaxEdit?: boolean; previous?: string } = {},
   ): Promise<void> {
     const user = this.ctx.requireUser();
     const file = await this.fs.mustResolve(uri);
@@ -555,6 +556,17 @@ export class UploadService {
     }
     if (file.owner_id !== user.id && !this.ctx.isAdmin) {
       throw new AppError(CodeOwnerOnly, 'Only owner or administrator can perform this action');
+    }
+
+    // 乐观锁（原版 UpdateContent 的 previous 参数）：编辑器保存时带上打开时的
+    // 实体 hashid，与当前 primary_entity 不一致说明文件已被别人/别的窗口改过
+    // → StaleVersion(40076)，前端据此弹「文件已被修改」冲突对话框。
+    // 没有这一步，两处同时编辑会静默互相覆盖（后保存者赢）。
+    if (options.previous) {
+      const prevId = this.ctx.codec.decodeEntityID(options.previous);
+      if (prevId === null || prevId !== file.primary_entity) {
+        throw new AppError(CodeStaleVersion, 'File has been modified by others');
+      }
     }
 
     // WebDAV 的 PUT 也是覆盖写，但它不该受「在线编辑」的体积限制（上游 WebDAV

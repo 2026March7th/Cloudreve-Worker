@@ -422,13 +422,15 @@ fileRoutes.put('/content', async (c) => {
     const service = new FileSystemService(ctx);
     const upload = new UploadService(ctx, service);
     upload.onUploadFinished = (file) => hookFtsIndex(c, ctx, file);
-    await upload.overwriteContent(
-      URI.parse(rawUri),
-      body,
-      Number(c.req.header('Content-Length') ?? 0),
-      c.req.header('Content-Type') ?? '',
-    );
-    return ok(c);
+    await upload.overwriteContent(URI.parse(rawUri), body, Number(c.req.header('Content-Length') ?? 0), c.req.header('Content-Type') ?? '', {
+      previous: c.req.query('previous') ?? undefined,
+    });
+    // 前端 sendUpdateFile 期望拿到保存后的文件对象（FileResponse）：
+    // savedFile.primary_entity 驱动编辑器版本号与列表刷新，返回空体会让
+    // 「已保存」提示与版本更新全部失效（上游 UpdateContent 返回文件）。
+    // 注意 mustResolve 重取一次 —— 上面刚换过 primary_entity，旧行是脏的。
+    const fresh = await service.mustResolve(URI.parse(rawUri));
+    return ok(c, await service.buildFileResponse(fresh));
   } catch (e) {
     return fail(c, e);
   }
