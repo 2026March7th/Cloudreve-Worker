@@ -27,6 +27,7 @@ import type { GroupRow, StoragePolicyRow, UserRow, UserWithGroup } from '../db/t
 import { AppError, CodeGroupNotAllowed, CodeNoPermissionErr } from '../lib/errors';
 import { BooleanSet, GroupPermission } from '../lib/boolset';
 import { getStorageDriver, isPolicyTypeSupported } from '../storage';
+import { isLoadBalancePolicy, pickSlavePolicy } from '../storage/loadBalance';
 import type { StorageDriver } from '../storage/types';
 
 /**
@@ -176,6 +177,8 @@ export class AppContext {
       if (!policy) {
         throw new AppError(40035, 'Storage policy not found');
       }
+      // 负载均衡虚拟策略：展开并按算法挑一个实际 slave，落盘记录 slave。
+      if (isLoadBalancePolicy(policy)) return pickSlavePolicy(this, policy);
       if (!isPolicyTypeSupported(policy.type)) {
         throw new AppError(40006, `Storage policy type "${policy.type}" is not supported`);
       }
@@ -186,13 +189,17 @@ export class AppContext {
     const groupPolicyId = user.group.storage_policy_id;
     if (groupPolicyId) {
       const policy = await this.policies.byId(groupPolicyId);
-      if (policy && isPolicyTypeSupported(policy.type)) return policy;
+      if (policy) {
+        if (isLoadBalancePolicy(policy)) return pickSlavePolicy(this, policy);
+        if (isPolicyTypeSupported(policy.type)) return policy;
+      }
     }
 
     const fallback = await this.policies.defaultPolicy();
     if (!fallback) {
       throw new AppError(40035, 'No storage policy is configured');
     }
+    if (isLoadBalancePolicy(fallback)) return pickSlavePolicy(this, fallback);
     if (!isPolicyTypeSupported(fallback.type)) {
       throw new AppError(40006, `Storage policy type "${fallback.type}" is not supported`);
     }
@@ -211,9 +218,24 @@ export class AppContext {
   async groupPolicies(user?: UserRow): Promise<StoragePolicyRow[]> {
     const u = user ?? this.requireUser();
     const ids = await this.groups.listPolicyIds(u.group_users);
-    const policies = (await this.policies.byIds(ids)).filter((p) =>
-      isPolicyTypeSupported(p.type),
-    );
+    const rows = (await this.policies.byIds(ids)) as StoragePolicyRow[];
+    // 负载均衡虚拟策略不下发：展开成 slave 并集（去重、过滤无驱动的类型），
+    // 用户上传器看到的永远是具体策略；assertPolicyAllowed 基于本方法，
+    // 所以 slave id 也被自动放行。
+    const out = new Map<number, StoragePolicyRow>();
+    for (const p of rows) {
+      if (isLoadBalancePolicy(p)) {
+        const slaves = await this.policies.byIds(
+          p.settings?.slave_policy_ids?.map(Number).filter((n) => Number.isInteger(n) && n > 0) ?? [],
+        );
+        for (const s of slaves) {
+          if (isPolicyTypeSupported(s.type)) out.set(s.id, s);
+        }
+      } else if (isPolicyTypeSupported(p.type)) {
+        out.set(p.id, p);
+      }
+    }
+    const policies = Array.from(out.values());
     if (policies.length > 0) return policies;
     if (!user) return [await this.resolvePolicy(null)];
     return policies;

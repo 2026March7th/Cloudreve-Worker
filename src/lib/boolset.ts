@@ -123,6 +123,11 @@ export const PolicyType = {
   OneDrive: 'onedrive',
   Remote: 'remote',
   Obs: 'obs',
+  // 负载均衡是「虚拟策略」：没有自己的驱动，在策略解析层
+  // （context.resolvePolicy / groupPolicies）展开成实际 slave 策略。
+  // 前端 PolicyType 枚举有这个值（StoragePolicyCard 按 type 查
+  // PolicyPropsMap 渲染），库里出现它不会让前端崩。
+  LoadBalance: 'load_balance',
   // 注意：不引入自造类型。R2 走 S3 兼容 API，对内对外都用 's3'
   //（上游前端 PolicyType 枚举没有 'r2'，出现未知 type 会让
   // StoragePolicyCard 的 PolicyPropsMap[type].img 直接抛 undefined）。

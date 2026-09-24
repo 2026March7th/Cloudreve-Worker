@@ -54,7 +54,8 @@ import {
 } from '../lib/errors';
 import { invalidateSettings } from '../settings/provider';
 import { AuditRepo } from '../db/audit';
-import { SUPPORTED_POLICY_TYPES, getStorageDriver, isPolicyTypeSupported } from '../storage';
+import { SUPPORTED_POLICY_TYPES, getStorageDriver, isPolicyTypeSupported, isSelectablePolicyType } from '../storage';
+import { validateLoadBalanceSettings } from '../storage/loadBalance';
 import { BACKEND_VERSION } from './site';
 import { adminContentRoutes } from './admin-content';
 import { numericId, paginationArgs, paginationOf, unwrapBody } from './shared';
@@ -702,7 +703,9 @@ function policyToResponse(
     file_name_rule: policy.file_name_rule ?? '',
     settings: policy.settings ?? {},
     node_id: policy.node_id ?? 0,
-    supported: isPolicyTypeSupported(normalizePolicyType(policy.type)),
+    // 可选类型（有驱动 + 负载均衡虚拟策略）：否则管理页卡片会被标成
+    // 「不支持」，负载均衡行显示异常
+    supported: isSelectablePolicyType(normalizePolicyType(policy.type)),
     edges: {
       groups: extras.groups ?? [],
       users: [],
@@ -810,8 +813,11 @@ adminRoutes.put('/policy', async (c) => {
     return fail(c, Err.param('name and type are required'));
   }
   const type = String(body.type);
-  if (!isPolicyTypeSupported(type)) {
+  if (!isSelectablePolicyType(type)) {
     return fail(c, new AppError(40006, `Policy type "${type}" is not supported by the edge build`));
+  }
+  if (type === PolicyType.LoadBalance) {
+    await validateLoadBalanceSettings(ctx.policies, body.settings as Record<string, unknown> | undefined);
   }
   try {
     const policy = await ctx.policies.create(policyCreateArgs(body, type));
@@ -830,8 +836,15 @@ adminRoutes.put('/policy/:id', async (c) => {
 
   const raw = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
   const body = unwrapBody<Record<string, unknown>>(raw, 'policy');
-  if (body.type !== undefined && !isPolicyTypeSupported(String(body.type))) {
+  if (body.type !== undefined && !isSelectablePolicyType(String(body.type))) {
     return fail(c, new AppError(40006, `Policy type "${body.type}" is not supported`));
+  }
+  if (
+    (String(body.type) === PolicyType.LoadBalance ||
+      (body.type === undefined && policy.type === PolicyType.LoadBalance)) &&
+    body.settings !== undefined
+  ) {
+    await validateLoadBalanceSettings(ctx.policies, body.settings as Record<string, unknown>);
   }
 
   try {

@@ -235,6 +235,10 @@ export interface PolicySetting {
   encryption?: boolean;
   /** 边缘版专属：中转下载与缩略图缓存到 Cloudflare 边缘 CDN（Cache API） */
   edge_cache?: boolean;
+  /** 边缘版专属（load_balance 虚拟策略）：参与负载均衡的 slave 策略 id 列表 */
+  slave_policy_ids?: number[];
+  /** 边缘版专属（load_balance 虚拟策略）：选路算法，默认 random */
+  load_balance_mode?: 'random' | 'round_robin';
 }
 
 export interface ExplorerView {

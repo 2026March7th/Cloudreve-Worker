@@ -62,6 +62,14 @@ export function isPolicyTypeSupported(type: string): boolean {
   return (SUPPORTED_POLICY_TYPES as readonly string[]).includes(type);
 }
 
+/**
+ * 可被创建/绑定/展示的策略类型 = 有驱动的 + 虚拟的 load_balance
+ * （它没有驱动，但在策略解析层展开，见 storage/loadBalance.ts）。
+ */
+export function isSelectablePolicyType(type: string): boolean {
+  return type === PolicyType.LoadBalance || isPolicyTypeSupported(type);
+}
+
 export * from './types';
 export { R2Driver } from './r2';
 export { OneDriveDriver } from './onedrive';

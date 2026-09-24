@@ -1,0 +1,50 @@
+import { Alert, Box, Link, Stack } from "@mui/material";
+import { useContext } from "react";
+import { Trans, useTranslation } from "react-i18next";
+import { Link as RouterLink } from "react-router-dom";
+import {
+  BasicInfoSection,
+  DownloadSection,
+  EncryptionSection,
+  LoadBalanceSection,
+  MediaMetadataSection,
+  StorageAndUploadSection,
+  ThumbnailsSection,
+} from "./FormSections";
+import { StoragePolicySettingContext } from "./StoragePolicySettingWrapper";
+
+const StoragePolicyForm = () => {
+  const { t } = useTranslation("dashboard");
+  const { formRef, values } = useContext(StoragePolicySettingContext);
+
+  return (
+    <Box component={"form"} ref={formRef} onSubmit={(e) => e.preventDefault()}>
+      {!values.edges?.groups?.length && (
+        <Alert severity="warning" sx={{ mb: 3 }}>
+          <Trans
+            i18nKey="policy.noBindedGroupWarning"
+            ns="dashboard"
+            components={[<Link component={RouterLink} to="/admin/group" />]}
+          />
+        </Alert>
+      )}
+      <Stack spacing={5}>
+        {values.type === "load_balance" ? (
+          // 负载均衡是虚拟策略：只有名称与 slave 配置，其余存储段不适用
+          <LoadBalanceSection />
+        ) : (
+          <>
+            <BasicInfoSection />
+            <StorageAndUploadSection />
+            <DownloadSection />
+            <ThumbnailsSection />
+            <MediaMetadataSection />
+            <EncryptionSection />
+          </>
+        )}
+      </Stack>
+    </Box>
+  );
+};
+
+export default StoragePolicyForm;
