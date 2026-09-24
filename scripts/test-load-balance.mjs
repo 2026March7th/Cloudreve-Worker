@@ -121,6 +121,32 @@ const ctx = (rows) => ({
   ok(cyclic, `pick: round_robin 严格轮流（起点 ${start}，序列 ${seq.join(',')}, expected tail ${expected.join(',')}）`);
 }
 
+// ---- 权重（对齐官方 Pro 语义：权重越大概率越高，0 不参与）----
+{
+  const weightedPolicy = mkPolicy(9, 'load_balance', {
+    slave_policy_ids: [1, 2, 3],
+    slave_policy_weights: { 1: 1, 2: 0, 3: 1 },
+  });
+  const counts = { 1: 0, 2: 0, 3: 0 };
+  for (let i = 0; i < 300; i++) {
+    const p = await lb.pickSlavePolicy(ctx([S3(1), S3(2), S3(3)]), weightedPolicy);
+    counts[p.id] = (counts[p.id] ?? 0) + 1;
+  }
+  ok(counts[2] === 0, `weights: 权重 0 的策略永不被选（counts=${JSON.stringify(counts)}）`);
+  ok(
+    counts[1] > 100 && counts[3] > 100 && counts[1] < 200 && counts[3] < 200,
+    `weights: 权重 1 的两家大致均分（1→${counts[1]}, 3→${counts[3]}）`,
+  );
+
+  // 全 0 权重 → 兜底等概率
+  const allZero = mkPolicy(9, 'load_balance', {
+    slave_policy_ids: [1, 2],
+    slave_policy_weights: { 1: 0, 2: 0 },
+  });
+  const p = await lb.pickSlavePolicy(ctx([S3(1), S3(2)]), allZero);
+  ok(p.id === 1 || p.id === 2, 'weights: 全 0 权重兜底等概率');
+}
+
 // ---- validateLoadBalanceSettings ----
 {
   const repo = ctx([S3(1), mkPolicy(4, 'local'), mkPolicy(5, 'load_balance')]).policies;

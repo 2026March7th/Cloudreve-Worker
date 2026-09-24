@@ -250,6 +250,8 @@ export interface PolicySetting {
   slave_policy_ids?: number[];
   /** 边缘版专属（负载均衡虚拟策略）：选路算法，默认 random */
   load_balance_mode?: "random" | "round_robin";
+  /** 边缘版专属（负载均衡虚拟策略）：子策略权重（键=策略 id，0 不参与） */
+  slave_policy_weights?: Record<string, number>;
 }
 
 export interface User extends CommonMixin {

@@ -6,7 +6,7 @@ import { DenseFilledTextField } from "../../../../Common/StyledComponents";
 import SettingForm from "../../../../Pages/Setting/SettingForm";
 import { NoMarginHelperText } from "../../../Settings/Settings";
 import { AddWizardProps } from "../../AddWizardDialog";
-import { SlavePolicySelect } from "../../EditStoragePolicy/FormSections/LoadBalanceSection";
+import { SlavePolicySelect, SlaveWeightInputs } from "../../EditStoragePolicy/FormSections/LoadBalanceSection";
 
 /**
  * 负载均衡创建向导。边缘版将 load_balance 实现为虚拟策略：
@@ -64,6 +64,21 @@ const LoadBalanceWizard = ({ onSubmit }: AddWizardProps) => {
             </NoMarginHelperText>
           </FormControl>
         </SettingForm>
+        <SettingForm title="子策略权重" lgWidth={12}>
+          <SlaveWeightInputs
+            ids={slaves}
+            weights={policy.settings?.slave_policy_weights}
+            onChange={(w) =>
+              setPolicy((p) => ({
+                ...p,
+                settings: { ...p.settings, slave_policy_weights: w },
+              }))
+            }
+          />
+          <NoMarginHelperText>
+            权重越大，新文件被分配到该策略的概率越高；权重为 0 的策略不参与分配。
+          </NoMarginHelperText>
+        </SettingForm>
         <SettingForm title="分配算法" lgWidth={12}>
           <FormControl fullWidth>
             <Select
@@ -75,7 +90,7 @@ const LoadBalanceWizard = ({ onSubmit }: AddWizardProps) => {
                 }))
               }
             >
-              <MenuItem value="random">随机分配（每次上传随机挑选）</MenuItem>
+              <MenuItem value="random">按权重随机分配</MenuItem>
               <MenuItem value="round_robin">轮询分配（按顺序轮流）</MenuItem>
             </Select>
             <NoMarginHelperText>

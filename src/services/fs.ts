@@ -639,6 +639,8 @@ export class FileSystemService {
       // settings 里没有 relay 标志时上传必炸。
       relay:
         policy.settings?.relay === true ||
+        // 又拍云驱动无直传能力（自有 REST 协议），恒走中转
+        policy.type === PolicyType.Upyun ||
         (policy.type === PolicyType.S3 && !policy.access_key),
       chunk_concurrency: policy.settings?.chunk_concurrency,
       encryption: policy.settings?.encryption,

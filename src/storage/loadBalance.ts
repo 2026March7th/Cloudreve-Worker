@@ -40,6 +40,23 @@ export function loadBalanceMode(policy: StoragePolicyRow): LoadBalanceMode {
   return policy.settings?.load_balance_mode === 'round_robin' ? 'round_robin' : 'random';
 }
 
+/**
+ * 子策略权重（对齐官方 Pro 文档：权重越大被选概率越高，0 不参与选路）。
+ * 键为 slave 策略 id 的字符串形式；未配置权重的 slave 默认权重 1。
+ */
+export function slaveWeights(policy: StoragePolicyRow): Record<number, number> {
+  const raw = policy.settings?.slave_policy_weights;
+  const out: Record<number, number> = {};
+  if (raw && typeof raw === 'object') {
+    for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+      const id = Number(k);
+      const w = Number(v);
+      if (Number.isInteger(id) && id > 0 && Number.isFinite(w) && w >= 0) out[id] = w;
+    }
+  }
+  return out;
+}
+
 export function isLoadBalancePolicy(policy: StoragePolicyRow): boolean {
   return policy.type === PolicyType.LoadBalance;
 }
@@ -65,19 +82,34 @@ export async function expandLoadBalance(
   return usable;
 }
 
-/** 展开 + 按算法挑出一个实际 slave 策略（上传/解析策略时的主入口）。 */
+/** 展开 + 按权重/算法挑出一个实际 slave 策略（上传/解析策略时的主入口）。 */
 export async function pickSlavePolicy(
   ctx: Pick<AppContext, 'policies'>,
   policy: StoragePolicyRow,
 ): Promise<StoragePolicyRow> {
   const slaves = await expandLoadBalance(ctx, policy);
   if (slaves.length === 1) return slaves[0]!;
-  if (loadBalanceMode(policy) === 'round_robin') {
-    const next = (roundRobinCounters.get(policy.id) ?? Math.floor(Math.random() * slaves.length)) % slaves.length;
+
+  // 官方权重语义：权重越大被选概率越高，权重 0 不参与；全部为 0（配置
+  // 错误）时兜底等概率，避免上传直接失败。
+  const weights = slaveWeights(policy);
+  const candidates = slaves.filter((s) => (weights[s.id] ?? 1) > 0);
+  const pool = candidates.length > 0 ? candidates : slaves;
+
+  if (loadBalanceMode(policy) === 'round_robin' && candidates.length === pool.length) {
+    // 轮询只在「未被权重过滤」时有明确语义
+    const next = (roundRobinCounters.get(policy.id) ?? Math.floor(Math.random() * pool.length)) % pool.length;
     roundRobinCounters.set(policy.id, next + 1);
-    return slaves[next]!;
+    return pool[next]!;
   }
-  return slaves[Math.floor(Math.random() * slaves.length)]!;
+  // 加权随机
+  const total = pool.reduce((sum, s) => sum + (weights[s.id] ?? 1), 0);
+  let r = Math.random() * total;
+  for (const s of pool) {
+    r -= weights[s.id] ?? 1;
+    if (r < 0) return s;
+  }
+  return pool[pool.length - 1]!;
 }
 
 /**
@@ -109,5 +141,17 @@ export async function validateLoadBalanceSettings(
   const mode = settings?.load_balance_mode;
   if (mode !== undefined && mode !== 'random' && mode !== 'round_robin') {
     throw new AppError(40006, 'load_balance_mode 仅支持 random / round_robin');
+  }
+  const rawWeights = settings?.slave_policy_weights;
+  if (rawWeights !== undefined) {
+    if (rawWeights === null || typeof rawWeights !== 'object' || Array.isArray(rawWeights)) {
+      throw new AppError(40006, 'slave_policy_weights 必须是 {策略id: 权重} 对象');
+    }
+    for (const [, v] of Object.entries(rawWeights as Record<string, unknown>)) {
+      const w = Number(v);
+      if (!Number.isFinite(w) || w < 0 || w > 10000) {
+        throw new AppError(40006, '权重必须是 0-10000 之间的数字');
+      }
+    }
   }
 }

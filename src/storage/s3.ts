@@ -45,6 +45,12 @@ async function sha256Hex(data: string): Promise<string> {
   return hex(digest);
 }
 
+/** 二进制版（上传分片物化后算真实 payload hash 用）。 */
+async function sha256HexBytes(data: Uint8Array): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', data as unknown as ArrayBuffer);
+  return hex(digest);
+}
+
 function hex(buf: ArrayBuffer | Uint8Array): string {
   const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
   return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
@@ -314,18 +320,29 @@ export class S3CompatibleDriver implements StorageDriver {
     return `${url.origin}${url.pathname}?${canonicalQuery}&X-Amz-Signature=${signature}`;
   }
 
-  /** 发起签名请求。`body` 为 ReadableStream 时用 UNSIGNED-PAYLOAD。 */
+  /** 发起签名请求。流式 body 先物化成字节（见下方说明），哈希精确计算。 */
   private async signedFetch(
     method: string,
     url: URL,
     opts: { body?: ReadableStream | string; headers?: Record<string, string>; raw?: boolean } = {},
   ): Promise<Response> {
-    const payloadHash =
-      typeof opts.body === 'string'
-        ? await sha256Hex(opts.body)
-        : opts.body
-          ? 'UNSIGNED-PAYLOAD'
-          : await sha256Hex('');
+    let bodyData: Uint8Array | string | undefined;
+    let payloadHash: string;
+    if (typeof opts.body === 'string') {
+      bodyData = opts.body;
+      payloadHash = await sha256Hex(opts.body);
+    } else if (opts.body) {
+      // 把分片物化成 Uint8Array：① 拿到精确 Content-Length，避免传输层
+      // 退化成 chunked —— 阿里云官方《使用 AWS SDK 访问 OSS》明确 OSS 的
+      // SigV4 兼容层**不支持 chunked 传输编码**（AWS S3 默认分块传输）；
+      // ② 精确计算 payload hash 参与签名。分片 ≤ chunkSize（默认 25MB），
+      // 物化在内存里是可接受的。
+      const buf = new Uint8Array(await new Response(opts.body).arrayBuffer());
+      bodyData = buf;
+      payloadHash = await sha256HexBytes(buf);
+    } else {
+      payloadHash = await sha256Hex('');
+    }
 
     const signable: Record<string, string> = {};
     for (const [k, v] of Object.entries(opts.headers ?? {})) {
@@ -336,13 +353,20 @@ export class S3CompatibleDriver implements StorageDriver {
       ...(await this.signedHeaders(method, url, payloadHash, signable)),
       ...opts.headers,
     };
+    // 阿里云 OSS 的 SigV4 兼容层额外要求带 x-oss-content-sha256 头（官方
+    // 文档原文要求值为 UNSIGNED-PAYLOAD 或真实哈希）。这是厂商自定义头，
+    // 不进 AWS 签名（SigV4 只签 x-amz-*），对其他厂商是普通可忽略头。
+    if (this.type === 'oss') {
+      headers['x-oss-content-sha256'] = payloadHash;
+    }
+    if (bodyData instanceof Uint8Array) {
+      headers['content-length'] = String(bodyData.length);
+    }
 
     const res = await fetch(url.toString(), {
       method,
       headers,
-      body: opts.body ?? undefined,
-      // @ts-expect-error — Workers 专属选项，流式上传必须
-      duplex: opts.body instanceof ReadableStream ? 'half' : undefined,
+      body: bodyData as BodyInit | undefined,
     });
     if (!res.ok && !opts.raw) {
       const text = await res.text().catch(() => '');
