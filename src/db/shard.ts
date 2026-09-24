@@ -232,12 +232,22 @@ export function resolveDomainHandle(env: Env, domain: DomainName): DbHandle {
   if (!url || Date.now() < (domainDownUntil.get(domain) ?? 0)) {
     return { sql: getSql(env), index: 0, source: SOURCE_NAMES[0], degraded: url !== null };
   }
-  return {
-    sql: sqlForUrl(url),
-    index: domain === 'audit' ? 1 : 2,
-    source: DOMAIN_SOURCE[domain],
-    degraded: false,
-  };
+
+  // 域库客户端创建是同步的：连接串畸形时 neon() 直接抛异常，而本函数在
+  // AppContext 构造里 —— 不兜住就是「全站每个请求 500」。抛错即视为该域
+  // 短期不可用，回退主库（30s 后重试；连接串修好后自然恢复）。
+  try {
+    return {
+      sql: sqlForUrl(url),
+      index: domain === 'audit' ? 1 : 2,
+      source: DOMAIN_SOURCE[domain],
+      degraded: false,
+    };
+  } catch (e) {
+    noteDomainFailure(domain);
+    console.error(`domain "${domain}" client init failed, falling back to primary:`, e instanceof Error ? e.message : String(e));
+    return { sql: getSql(env), index: 0, source: SOURCE_NAMES[0], degraded: true };
+  }
 }
 
 /**

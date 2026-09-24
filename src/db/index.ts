@@ -79,6 +79,14 @@ export function primaryDatabaseUrl(env: Env): string | undefined {
 function domainUrlByName(env: Env, name: string): string | null {
   const v = (env as unknown as Record<string, string | undefined>)[name]?.trim();
   if (!v) return null;
+  // 连接串格式校验：管理后台手填容易带空格/引号/缺协议，坏串不能让它
+  // 流进 neon()（构造时同步抛异常会把整个 AppContext 打挂，全站 500）
+  try {
+    const u = new URL(v.includes('://') ? v : `postgres://${v}`);
+    if (!u.hostname) return null;
+  } catch {
+    return null;
+  }
   // 与主库相同连接串 → 不算独立域（避免同库自同步/自引用）
   return v === primaryDatabaseUrl(env) ? null : v;
 }

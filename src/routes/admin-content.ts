@@ -31,6 +31,7 @@ import { BACKEND_VERSION } from './site';
 import { digestPassword, randomString } from '../lib/crypto';
 import { logAudit } from '../services/audit';
 import { getSql, type Sql } from '../db';
+import { resolveDomainHandle } from '../db/shard';
 import type { HashIDCodec } from '../lib/hashid';
 import { numericId, paginationArgs, paginationOf, unwrapBody } from './shared';
 
@@ -449,6 +450,25 @@ adminContentRoutes.post('/file', async (c) => {
   const orderCol = orderColumn(body.order_by, ['id', 'name', 'size', 'created_at', 'updated_at']);
   const orderDir = orderDirection(body.order_direction);
 
+  // 「按元数据筛选」：metadata 在分域库（DATABASE_URL_3）时不能跨库
+  // EXISTS 子查询 —— 先在元数据域里解析出命中的 file_id 集合，再以
+  // `f.id = ANY(...)` 参与主库查询。域不可用/未启用时该条件按空集处理。
+  let metadataFileIds: number[] | null = null;
+  if (metadata !== '') {
+    try {
+      const metaSql = resolveDomainHandle(c.env, 'metadata').sql;
+      const hits = (await metaSql`SELECT file_id FROM metadata WHERE deleted_at IS NULL AND name = ${metadata} LIMIT 10000`) as Array<{ file_id: number }>;
+      metadataFileIds = hits.map((h) => Number(h.file_id));
+      if (metadataFileIds.length === 0) {
+        // 无命中：直接返回空页，避免下面 ANY(空数组) 语义歧义
+        return ok(c, { files: [], pagination: paginationOf(page, pageSize, 0) });
+      }
+    } catch {
+      // 元数据域不可用：筛选条件按「无命中」处理，不让整个列表接口挂掉
+      return ok(c, { files: [], pagination: paginationOf(page, pageSize, 0) });
+    }
+  }
+
   // files 表没有 deleted_at 列（回收站按 entities 软删，见 migrations/0001 注释）
   const where = `f.type = 0
       AND ($1::text = '' OR f.name ILIKE '%' || $1 || '%')
@@ -458,10 +478,8 @@ adminContentRoutes.post('/file', async (c) => {
             SELECT 1 FROM shares s WHERE s.file_shares = f.id AND s.deleted_at IS NULL))
       AND ($5 = false OR EXISTS (
             SELECT 1 FROM direct_links d WHERE d.file_id = f.id AND d.deleted_at IS NULL))
-      AND ($6::text = '' OR EXISTS (
-            SELECT 1 FROM metadata m
-            WHERE m.file_id = f.id AND m.deleted_at IS NULL AND m.name = $6))`;
-  const params = [name, userId, policyId, shared, hasDirectLink, metadata];
+      AND ($6::int[] IS NULL OR f.id = ANY($6::int[]))`;
+  const params = [name, userId, policyId, shared, hasDirectLink, metadataFileIds];
 
   const rows = (await sql(
     `SELECT f.* FROM files f WHERE ${where}
@@ -489,10 +507,13 @@ adminContentRoutes.get('/file/:id', async (c) => {
   ])) as Record<string, unknown>[];
   if (!rows[0]) return fail(c, Err.fileNotFound());
 
-  const meta = (await sql(
-    'SELECT * FROM metadata WHERE file_id = $1 AND deleted_at IS NULL ORDER BY id ASC',
-    [id],
-  )) as Record<string, unknown>[];
+  // metadata 分域后不在主库：走 ctx.metadata（分域感知 + 失败自动降级）
+  const meta = (await ctx.metadata.listByFile(id, true)).map((m) => ({
+    id: m.id,
+    name: m.name,
+    value: m.value,
+    is_public: m.is_public,
+  }));
   const entities = (await sql(
     `SELECT e.* FROM entities e
      JOIN file_entities fe ON fe.entity_id = e.id
