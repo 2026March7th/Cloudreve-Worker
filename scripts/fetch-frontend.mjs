@@ -139,18 +139,24 @@ if (!existsSync(src)) {
 applyFrontendPatches(src);
 
 console.log('  安装前端依赖（首次约 1-3 分钟）…');
+const installStart = Date.now();
+// --network-timeout：CF 构建机到 npm registry 偶发抖动时，默认超时会直接
+// 失败（曾出现 12 分钟后构建失败）。yarn 1 的时间戳网络错误靠它兜底。
 runOrDie(
   NPX,
-  npxArgs(['yarn@1.22.22', 'install', '--frozen-lockfile']),
+  npxArgs(['yarn@1.22.22', 'install', '--frozen-lockfile', '--network-timeout', '600000']),
   'yarn install',
   { cwd: src, env: { HUSKY: '0', NODE_OPTIONS: '--max-old-space-size=6144' } },
 );
+console.log(`  yarn install 完成，耗时 ${Math.round((Date.now() - installStart) / 1000)}s`);
 
 console.log('  构建前端（vite build，约 1-4 分钟）…');
+const buildStart = Date.now();
 runOrDie(NPX, npxArgs(['yarn@1.22.22', 'run', 'build']), 'yarn build', {
   cwd: src,
   env: { HUSKY: '0', NODE_OPTIONS: '--max-old-space-size=6144' },
 });
+console.log(`  vite build 完成，耗时 ${Math.round((Date.now() - buildStart) / 1000)}s`);
 
 const built = path.join(src, 'build');
 if (!existsSync(path.join(built, 'index.html'))) {
