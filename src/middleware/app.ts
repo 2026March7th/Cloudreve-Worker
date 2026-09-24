@@ -19,6 +19,7 @@ import { UserRepo } from '../db/repo';
 import { resolveDb, type DbHandle } from '../db/shard';
 import { kvFor } from '../lib/kvRouter';
 import { getCachedUser, invalidateUser, rememberEnv } from '../services/userCache';
+import { rememberPolicyEnv } from '../services/policyCache';
 
 export interface AppBindings {
   Bindings: Env;
@@ -84,6 +85,8 @@ export function appContext(): MiddlewareHandler<AppBindings> {
 
     // 记下本 isolate 的 env，供仓储层写用户后清缓存用（见 userCache.ts）。
     rememberEnv(env);
+    // 策略缓存同样需要 env 做 KV 回填/失效（见 policyCache.ts）。
+    rememberPolicyEnv(env);
 
     // 数据库句柄：本请求**唯一**的库引用。整个请求生命周期内不再重解析，
     // 保证 11 个 repo 与所有裸 SQL 都落在同一个库上（多库模型的硬约束，

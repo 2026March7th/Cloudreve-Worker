@@ -610,10 +610,10 @@ export class PolicyRepo {
   }
 
   async byId(id: number): Promise<StoragePolicyRow | null> {
-    const rows = (await this.sql`
-      SELECT * FROM storage_policies WHERE id = ${id} AND deleted_at IS NULL LIMIT 1
-    `) as Record<string, unknown>[];
-    return rows[0] ? normalizePolicy(rows[0]) : null;
+    // 策略行读极多写极少（每次列表/上传/下载/缩略图都读），统一走缓存：
+    // L1 命中 0 往返，L2(KV) / DB 兜底。失效收口在本类写方法的 touchPolicyCache。
+    const { getCachedPolicy } = await import('../services/policyCache');
+    return getCachedPolicy(this.sql, id);
   }
 
   /**
@@ -623,20 +623,14 @@ export class PolicyRepo {
    * Neon HTTP 往返（每次 300ms 量级），列表接口因此明显变慢。
    * 返回顺序与入参一致（调用方按 `upload_policy_id` 匹配时要稳定顺序），
    * 且自动丢弃不存在 / 已软删的行。
+   *
+   * 现在走 L1 缓存：命中的直接返回，缺失项合并成一次 SQL —— 组绑定的
+   * 策略集在热路径上 0 往返。**不接 KV**：KV 没有批量接口，N 条缺失
+   * 就是 N 次往返，比一次批量 SQL 更贵（见 policyCache.ts 文件头）。
    */
   async byIds(ids: number[]): Promise<StoragePolicyRow[]> {
-    if (ids.length === 0) return [];
-    const rows = (await this.sql(
-      `SELECT * FROM storage_policies
-       WHERE deleted_at IS NULL AND id = ANY($1::int[])`,
-      [ids],
-    )) as Record<string, unknown>[];
-    const byId = new Map<number, StoragePolicyRow>();
-    for (const r of rows) {
-      const p = normalizePolicy(r);
-      byId.set(p.id, p);
-    }
-    return ids.map((id) => byId.get(id)).filter((p): p is StoragePolicyRow => p !== undefined);
+    const { getCachedPoliciesByIds } = await import('../services/policyCache');
+    return getCachedPoliciesByIds(this.sql, ids);
   }
 
   async list(): Promise<StoragePolicyRow[]> {
@@ -680,6 +674,20 @@ export class PolicyRepo {
     return normalizePolicy(rows[0]!);
   }
 
+  /**
+   * 策略缓存失效收口（与 UserRepo.touchCache 同一模式）：所有改动
+   * 策略行的写路径都必须经过它，靠自觉一定会漏 —— 漏掉的后果是
+   * 「改了配置但用户侧最长 10s / 300s 不生效」。
+   */
+  private async touchPolicyCache(id: number): Promise<void> {
+    try {
+      const { evictPolicyCache } = await import('../services/policyCache');
+      await evictPolicyCache(id);
+    } catch {
+      // 缓存失效失败不该让写操作失败：TTL 会兜底
+    }
+  }
+
   async update(id: number, patchFields: Record<string, unknown>, encrypted: {
     accessKey?: string | null;
     secretKey?: string | null;
@@ -720,10 +728,12 @@ export class PolicyRepo {
     if (encrypted.secretKey !== undefined) {
       await this.sql`UPDATE storage_policies SET secret_key = ${encrypted.secretKey}, updated_at = now() WHERE id = ${id}`;
     }
+    await this.touchPolicyCache(id);
   }
 
   async softDelete(id: number): Promise<void> {
     await this.sql`UPDATE storage_policies SET deleted_at = now(), updated_at = now() WHERE id = ${id}`;
+    await this.touchPolicyCache(id);
   }
 
   async countFiles(id: number): Promise<number> {

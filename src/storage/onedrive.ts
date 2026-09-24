@@ -268,9 +268,17 @@ export class OneDriveDriver implements StorageDriver {
             UPDATE storage_policies SET access_key = ${credential.refresh_token}, updated_at = now()
             WHERE id = ${this.policy.id}
           `
-            .then(() => {
+            .then(async () => {
               // 同步内存快照，同一驱动实例的后续刷新据此判重，避免重复写回
               this.policy.access_key = credential.refresh_token;
+              // 这条 UPDATE 绕过了 PolicyRepo（裸 SQL），必须手动失效策略缓存，
+              // 否则缓存里的旧 refresh_token 最长滞留 L1/L2 TTL
+              try {
+                const { evictPolicyCache } = await import('../services/policyCache');
+                await evictPolicyCache(this.policy.id);
+              } catch {
+                // TTL 兜底
+              }
             })
             .catch((e) => {
               // 数据库写回失败只告警：KV 里已有新令牌，下一轮刷新会再试
