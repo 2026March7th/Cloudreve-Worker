@@ -165,14 +165,62 @@ const DOMAIN_SOURCE: Record<DomainName, string> = {
   metadata: 'DATABASE_URL_3',
 };
 
-/** 记录某分域库一次失败：30s 内该域回退主库。 */
-export function noteDomainFailure(domain: DomainName): void {
-  domainDownUntil.set(domain, Date.now() + DOMAIN_DOWN_TTL_MS);
+/**
+ * 记录某分域库一次失败：TTL 内该域回退主库。
+ * 运行时查询失败用短 TTL（30s，自愈快）；建表/搬迁失败用长 TTL
+ * （persistDomainDown 落 KV，1h，等 cron 修好）。
+ */
+export function noteDomainFailure(domain: DomainName, ttlMs = DOMAIN_DOWN_TTL_MS): void {
+  domainDownUntil.set(domain, Date.now() + ttlMs);
 }
 
 /** 某分域库恢复成功：取消降级窗口。 */
 export function noteDomainSuccess(domain: DomainName): void {
   domainDownUntil.delete(domain);
+}
+
+/**
+ * 把「域不可用」持久化到 KV（TTL 秒）——跨 isolate 生效。
+ * 冷启动/自举时用 `applyDomainDownFromKv` 装回内存。
+ */
+export async function persistDomainDown(env: Env, domain: DomainName, ttlSeconds: number): Promise<void> {
+  domainDownUntil.set(domain, Date.now() + ttlSeconds * 1000);
+  try {
+    const { kvFor } = await import('../lib/kvRouter');
+    await kvFor(env, 'flag').put(`shard:down:${domain}`, '1', { expirationTtl: ttlSeconds });
+  } catch {
+    // KV 不可用时内存降级仍生效
+  }
+}
+
+/** 清除 KV 里的持久降级（域库修好后 cron 调用）。 */
+export async function clearDomainDown(env: Env, domain: DomainName): Promise<void> {
+  domainDownUntil.delete(domain);
+  try {
+    const { kvFor } = await import('../lib/kvRouter');
+    await kvFor(env, 'flag').delete(`shard:down:${domain}`);
+  } catch {
+    // ignore
+  }
+}
+
+/**
+ * 冷启动时把 KV 里的持久降级装回内存。resolveDomainHandle 是同步热路径
+ * （不能每请求读 KV），所以在自举/cron 里调用一次即可覆盖整个 isolate。
+ */
+export async function applyDomainDownFromKv(env: Env): Promise<void> {
+  try {
+    const { kvFor } = await import('../lib/kvRouter');
+    const kv = kvFor(env, 'flag');
+    for (const domain of ['audit', 'metadata'] as const) {
+      if (await kv.get(`shard:down:${domain}`)) {
+        // 具体剩余 TTL 拿不到，给足一个保守窗口；cron 每小时会重新评估
+        domainDownUntil.set(domain, Date.now() + 60 * 60 * 1000);
+      }
+    }
+  } catch {
+    // KV 不可用就不装，靠运行时查询失败触发短降级
+  }
 }
 
 /** 解析分域库句柄：`DATABASE_URL_2`/`_3` 存在且健康 → 域库；否则回退主库。 */

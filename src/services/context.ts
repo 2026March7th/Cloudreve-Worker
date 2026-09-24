@@ -20,7 +20,7 @@ import {
   DavAccountRepo,
   PasskeyRepo,
 } from '../db/repo';
-import { resolveDb, resolveDomainHandle, type DbHandle } from '../db/shard';
+import { resolveDb, resolveDomainHandle, noteDomainFailure, type DbHandle } from '../db/shard';
 import type { Sql } from '../db/index';
 import { defaultKvBundle, type KvBundle } from '../lib/kvRouter';
 import type { GroupRow, StoragePolicyRow, UserRow, UserWithGroup } from '../db/types';
@@ -89,7 +89,24 @@ export class AppContext {
     this.shares = new ShareRepo(sql);
     // 元数据域：配了 DATABASE_URL_3 时 metadata 落在独立库（分摊主库读写，
     // 见 db/shard.ts resolveDomainHandle）；未配置回退主库，零行为差异。
-    this.metadata = new MetadataRepo(resolveDomainHandle(env, 'metadata').sql);
+    // 查询失败且当前在域库上 → 触发 30s 降级回主库（表 schema 永远保留），
+    // 否则「域库缺表/不可达」会让列表持续报错。
+    const metaHandle = resolveDomainHandle(env, 'metadata');
+    const metadataRepo = new MetadataRepo(metaHandle.sql);
+    this.metadata = new Proxy(metadataRepo, {
+      get(target, prop) {
+        const value = Reflect.get(target, prop);
+        if (typeof value !== 'function' || metaHandle.degraded) return value;
+        return async (...args: unknown[]) => {
+          try {
+            return await (value as (...a: unknown[]) => unknown).apply(target, args);
+          } catch (e) {
+            noteDomainFailure('metadata');
+            throw e;
+          }
+        };
+      },
+    });
     this.directLinks = new DirectLinkRepo(sql);
     this.tasks = new TaskRepo(sql);
     this.davAccounts = new DavAccountRepo(sql);

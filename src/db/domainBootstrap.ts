@@ -28,6 +28,7 @@
 import type { Env } from '../env';
 import { kvFor } from '../lib/kvRouter';
 import { auditDomainUrl, metadataDomainUrl, sqlForUrl } from './index';
+import { clearDomainDown, persistDomainDown } from './shard';
 import type { Sql } from './index';
 
 // DDL 逐条执行（Neon HTTP 单请求不保证多语句，provision 的教训）
@@ -71,34 +72,39 @@ async function ensureDomainDdl(env: Env, domain: 'audit' | 'metadata', url: stri
   await kv.put(flag, '1');
 }
 
-/** 把主库一张表的全量行搬到域库，搬完删主库侧。返回是否执行了搬迁。 */
-async function migrateTable(
+/**
+ * 把主库一张表复制到域库（幂等，可断点续跑），全部复制完成后才清空主库侧。
+ *
+ * 两阶段的原因（v1 的教训）：「插一批删一批」中途失败会把数据劈成两半，
+ * 任何一侧都不完整。改成「先复制到空、再统一清空」：复制用显式 id +
+ * ON CONFLICT 幂等，失败重跑自动续；清空只在复制完成（SELECT 已为空）后
+ * 执行。清空后又有新写入主库（降级窗口内的请求）也没关系——下次重跑
+ * 会把这些行补搬过去。
+ */
+async function copyAndPurge(
   primary: Sql,
   domain: Sql,
   table: 'audit_logs' | 'metadata',
   insertRows: (rows: Record<string, unknown>[]) => Promise<void>,
 ): Promise<void> {
-  for (let round = 0; round < 1000; round++) {
+  // phase 1：复制。按 id 游标推进；失败重跑从主库剩余行继续（幂等）。
+  let lastId = 0;
+  for (let round = 0; round < 10000; round++) {
     const rows =
       table === 'audit_logs'
-        ? ((await primary`SELECT id, created_at, user_id, type, meta FROM audit_logs ORDER BY id LIMIT ${BATCH}`) as Record<string, unknown>[])
-        : ((await primary`SELECT id, created_at, updated_at, deleted_at, name, value, file_id, is_public FROM metadata ORDER BY id LIMIT ${BATCH}`) as Record<string, unknown>[]);
+        ? ((await primary`SELECT id, created_at, user_id, type, meta FROM audit_logs WHERE id > ${lastId} ORDER BY id LIMIT ${BATCH}`) as Record<string, unknown>[])
+        : ((await primary`SELECT id, created_at, updated_at, deleted_at, name, value, file_id, is_public FROM metadata WHERE id > ${lastId} ORDER BY id LIMIT ${BATCH}`) as Record<string, unknown>[]);
     if (rows.length === 0) break;
-
     await insertRows(rows);
-    const maxId = Math.max(...rows.map((r) => Number(r.id)));
-    if (table === 'audit_logs') {
-      await primary`DELETE FROM audit_logs WHERE id <= ${maxId}`;
-    } else {
-      await primary`DELETE FROM metadata WHERE id <= ${maxId}`;
-    }
-    if (rows.length < BATCH) break;
+    lastId = Math.max(...rows.map((r) => Number(r.id)));
   }
 
-  // 序列对齐：显式带 id 插入后，把域库序列拨到最大 id 之后
+  // phase 2：主库已无剩余行（或本品牌上轮已复制完）→ 清空主库侧并校准序列。
   if (table === 'audit_logs') {
+    await primary`DELETE FROM audit_logs`;
     await domain`SELECT setval(pg_get_serial_sequence('audit_logs','id'), GREATEST((SELECT COALESCE(MAX(id),1) FROM audit_logs), 1))`;
   } else {
+    await primary`DELETE FROM metadata`;
     await domain`SELECT setval(pg_get_serial_sequence('metadata','id'), GREATEST((SELECT COALESCE(MAX(id),1) FROM metadata), 1))`;
   }
 }
@@ -111,38 +117,49 @@ async function ensureDomain(
 ): Promise<void> {
   const kv = kvFor(env, 'flag');
   const migratedFlag = `shard:migrated:${domain}`;
-  if (await kv.get(migratedFlag)) return;
-
-  await ensureDomainDdl(env, domain, url);
-  const domainSql = sqlForUrl(url);
-
-  // 主库句柄：域迁移只读/删主库侧的这两张表
-  const primary = sqlForUrl(primaryUrlOf(env));
-
-  if (domain === 'audit') {
-    await migrateTable(primary, domainSql, 'audit_logs', async (rows) => {
-      for (const r of rows) {
-        await domainSql`
-          INSERT INTO audit_logs (id, created_at, user_id, type, meta)
-          VALUES (${Number(r.id)}, ${r.created_at}, ${r.user_id}, ${Number(r.type)}, ${JSON.stringify(r.meta ?? {})}::jsonb)
-          ON CONFLICT (id) DO NOTHING
-        `;
-      }
-    });
-  } else {
-    await migrateTable(primary, domainSql, 'metadata', async (rows) => {
-      for (const r of rows) {
-        await domainSql`
-          INSERT INTO metadata (id, created_at, updated_at, deleted_at, name, value, file_id, is_public)
-          VALUES (${Number(r.id)}, ${r.created_at}, ${r.updated_at}, ${r.deleted_at}, ${r.name}, ${r.value},
-                  ${Number(r.file_id)}, ${r.is_public === true})
-          ON CONFLICT (file_id, name) DO NOTHING
-        `;
-      }
-    });
+  if (await kv.get(migratedFlag)) {
+    await clearDomainDown(env, domain);
+    return;
   }
 
-  await kv.put(migratedFlag, '1');
+  try {
+    await ensureDomainDdl(env, domain, url);
+    const domainSql = sqlForUrl(url);
+
+    // 主库句柄：域迁移只读/删主库侧的这两张表
+    const primary = sqlForUrl(primaryUrlOf(env));
+
+    if (domain === 'audit') {
+      await copyAndPurge(primary, domainSql, 'audit_logs', async (rows) => {
+        for (const r of rows) {
+          await domainSql`
+            INSERT INTO audit_logs (id, created_at, user_id, type, meta)
+            VALUES (${Number(r.id)}, ${r.created_at}, ${r.user_id}, ${Number(r.type)}, ${JSON.stringify(r.meta ?? {})}::jsonb)
+            ON CONFLICT (id) DO NOTHING
+          `;
+        }
+      });
+    } else {
+      await copyAndPurge(primary, domainSql, 'metadata', async (rows) => {
+        for (const r of rows) {
+          await domainSql`
+            INSERT INTO metadata (id, created_at, updated_at, deleted_at, name, value, file_id, is_public)
+            VALUES (${Number(r.id)}, ${r.created_at}, ${r.updated_at}, ${r.deleted_at}, ${r.name}, ${r.value},
+                    ${Number(r.file_id)}, ${r.is_public === true})
+            ON CONFLICT (file_id, name) DO NOTHING
+          `;
+        }
+      });
+    }
+
+    await kv.put(migratedFlag, '1');
+    await clearDomainDown(env, domain);
+  } catch (e) {
+    // 建表/搬迁失败：该域长 TTL 降级回主库（主库表 schema 永远在，搬迁
+    // 语义保证主库侧数据完整直到全部复制成功），cron 每小时重试。
+    await persistDomainDown(env, domain, 60 * 60);
+    throw e;
+  }
 }
 
 function primaryUrlOf(env: Env): string {
@@ -168,8 +185,7 @@ export async function ensureDomainShards(env: Env): Promise<void> {
       await ensureDomain(env, domain, url);
       console.log(`domain shard ready: ${name} (own database)`);
     } catch (e) {
-      // 失败不阻断：cron 每小时重试；期间该域的查询仍打域库，若域库本身
-      // 不可用会由 resolveDomainHandle 的降级窗口回退主库。
+      // 失败已在 ensureDomain 内做了长 TTL 降级（该域回退主库），cron 每小时重试
       console.error(`domain shard bootstrap failed for ${name}:`, e instanceof Error ? e.message : String(e));
     }
   }

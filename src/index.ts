@@ -27,7 +27,8 @@ import { provision } from './db/provision';
 import { resolveDb } from './db/shard';
 import { kvFor } from './lib/kvRouter';
 import { warmAllCaches } from './services/cacheWarmer';
-import { ensureDomainShards } from './db/domainBootstrap';
+import { ensureDomainShards, } from './db/domainBootstrap';
+import { applyDomainDownFromKv } from './db/shard';
 import { warmPolicyCache } from './services/policyCache';
 import { ensureEnvAdmin } from './services/envAdmin';
 import { HashIDCodec } from './lib/hashid';
@@ -70,8 +71,11 @@ import { isSocialMediaBot, renderSharePreview } from './services/share-preview';
  *     空集且不等于 '[]'，躲过 0011；读取层 parseFileViewers 同步兜底）。
  * v12：新增分域自举 ensureDomainShards（DATABASE_URL_2=审计日志域、
  *     _3=元数据域：建表 + 搬迁存量；未配置的域自动跳过）。
+ * v13：分域失败防御补全——建表/搬迁失败落 KV 长 TTL 降级（跨 isolate）、
+ *     自举时装回内存、运行时查询失败自动 30s 短降级、搬迁改两阶段
+ *     （先复制到空再清主库，杜绝数据劈半）。
  */
-const BOOTSTRAP_FLAG = 'bootstrap:done:v12';
+const BOOTSTRAP_FLAG = 'bootstrap:done:v13';
 /** 自举失败后的冷却键（20 秒 TTL）：期间请求直接快速失败，不再重放自举。 */
 const BOOTSTRAP_COOLDOWN = 'bootstrap:cooldown:v1';
 /** 同一 isolate 内的并发请求共享一次自举。 */
@@ -134,6 +138,10 @@ app.use('*', async (c, next) => {
             const db = resolveDb(c.env);
             await provision(c.env, db);
             await ensureSettings(c.env, db);
+            // 域降级状态先装回内存（KV 持久的那份），再跑分域自举：
+            // 保证「上次建表/搬迁失败」的域在本 isolate 里直接回退主库，
+            // 而不是等一次查询失败才开始降级。
+            await applyDomainDownFromKv(c.env);
             // 分域自举：配了 DATABASE_URL_2/_3 时在对应库建表并搬迁存量
             // 审计/元数据（幂等，KV 标记短路）；失败不阻断自举，cron 兜底重试。
             await ensureDomainShards(c.env);
@@ -459,6 +467,7 @@ export default {
     // 1.5 分域自举兜底（幂等，自举时域库恰好不可用的话这里补上）
     //     + 策略行预热进 L1/KV（读极多的热数据，空闲后首个请求直接命中缓存）。
     try {
+      await applyDomainDownFromKv(env);
       await ensureDomainShards(env);
     } catch (e) {
       console.error('cron: domain shard bootstrap failed', describeError(e));
