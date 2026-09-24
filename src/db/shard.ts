@@ -134,6 +134,64 @@ export function isDegraded(): boolean {
   return Date.now() < primaryDownUntil;
 }
 
+// ---------------------------------------------------------------------------
+// 分域库（多库分摊：_2=日志域，_3=元数据域）
+// ---------------------------------------------------------------------------
+
+/**
+ * 「分域」与上面 failover 的关系：
+ *
+ *   - `DATABASE_URL_2` / `DATABASE_URL_3` 是**干活域**：分别承载
+ *     `audit_logs`（写极多的审计日志）与 `metadata`（列表热路径的文件
+ *     元数据），把这两类与核心表（users/files/entities/shares…）天然
+ *     无 JOIN、无同库事务的数据从主库分走 —— 主库往返减少，单库限流
+ *     压力直接下降。
+ *   - `DATABASE_URL_4` / `_5` 维持**冷备**语义（构建期全量同步 + 主库
+ *     故障切换），不参与分域。
+ *   - 域库独立于主库的 failover：主库挂了切备库，但审计/元数据继续打
+ *     各自的域库（数据都在那边），互不影响。
+ *   - **只配主库时域解析回退主库**，绝不往不存在的库写一行。
+ *
+ * 健康降级：域库失败过（cron 探活 or 查询报错）后，30s 内该域回退主库
+ * —— 主库上对应表的 schema 永远保留（迁移只搬数据不删表），回退可用。
+ */
+const DOMAIN_DOWN_TTL_MS = 30_000;
+const domainDownUntil = new Map<string, number>();
+
+export type DomainName = 'audit' | 'metadata';
+
+const DOMAIN_SOURCE: Record<DomainName, string> = {
+  audit: 'DATABASE_URL_2',
+  metadata: 'DATABASE_URL_3',
+};
+
+/** 记录某分域库一次失败：30s 内该域回退主库。 */
+export function noteDomainFailure(domain: DomainName): void {
+  domainDownUntil.set(domain, Date.now() + DOMAIN_DOWN_TTL_MS);
+}
+
+/** 某分域库恢复成功：取消降级窗口。 */
+export function noteDomainSuccess(domain: DomainName): void {
+  domainDownUntil.delete(domain);
+}
+
+/** 解析分域库句柄：`DATABASE_URL_2`/`_3` 存在且健康 → 域库；否则回退主库。 */
+export function resolveDomainHandle(env: Env, domain: DomainName): DbHandle {
+  const raw = (env as unknown as Record<string, string | undefined>)[DOMAIN_SOURCE[domain]]?.trim();
+  const primary = primaryDatabaseUrl(env);
+  const url = raw && raw !== primary ? raw : null;
+
+  if (!url || Date.now() < (domainDownUntil.get(domain) ?? 0)) {
+    return { sql: getSql(env), index: 0, source: SOURCE_NAMES[0], degraded: url !== null };
+  }
+  return {
+    sql: sqlForUrl(url),
+    index: domain === 'audit' ? 1 : 2,
+    source: DOMAIN_SOURCE[domain],
+    degraded: false,
+  };
+}
+
 /**
  * 在指定数据库上执行一段操作，并在成功 / 失败时更新健康状态。
  *

@@ -186,6 +186,25 @@ export function policyCacheSize(): number {
 }
 
 /**
+ * 定时任务用：把全部策略行预热进 L1 + KV。
+ *
+ * 策略是每次列表/上传/下载/缩略图都要读的热数据，cron 每小时刷一次，
+ * 让长时间空闲后的第一个请求也能命中缓存（否则要吃一次 DB 回源）。
+ * 返回预热的行数，失败抛给调用方记日志。
+ */
+export async function warmPolicyCache(env: Env): Promise<number> {
+  const { PolicyRepo } = await import('../db/repo');
+  const { getSql } = await import('../db');
+  const rows = await new PolicyRepo(getSql(env)).list();
+  const kv = kvFor(env, 'session');
+  for (const row of rows) {
+    l1Set(row.id, row);
+    await kv.put(KEY(row.id), JSON.stringify(row), { expirationTtl: L2_TTL_S }).catch(() => {});
+  }
+  return rows.length;
+}
+
+/**
  * repo 层没有 env（只持有 Sql），KV 回填/失效借请求装配时记下的
  * env（与 userCache.rememberEnv 同一模式，见 app.ts 装配点）。
  */

@@ -3,8 +3,12 @@
  *
  * 写入方 services/audit.ts（waitUntil fire-and-forget）；
  * 读取方 routes/admin.ts 的 GET /admin/audit/log（管理端「事件」页查看器）。
+ *
+ * 分域：配了 `DATABASE_URL_2` 时 audit_logs 落在独立「日志域」库（写极多
+ * 的审计日志从主库分走）；未配置回退主库，零行为差异。见 db/shard.ts。
  */
-import { getSql, toDate, toJson, toNum, toNumOrNull, type Sql } from './index';
+import { toDate, toJson, toNum, toNumOrNull, type Sql } from './index';
+import { resolveDomainHandle } from './shard';
 import type { AuditLogRow } from './types';
 
 function normalizeAuditLog(r: Record<string, unknown>): AuditLogRow {
@@ -21,7 +25,7 @@ export class AuditRepo {
   private readonly sql: Sql;
 
   constructor(env: import('../env').Env) {
-    this.sql = getSql(env);
+    this.sql = resolveDomainHandle(env, 'audit').sql;
   }
 
   async create(row: { user_id: number | null; type: number; meta: unknown }): Promise<void> {

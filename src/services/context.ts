@@ -20,7 +20,7 @@ import {
   DavAccountRepo,
   PasskeyRepo,
 } from '../db/repo';
-import { resolveDb, type DbHandle } from '../db/shard';
+import { resolveDb, resolveDomainHandle, type DbHandle } from '../db/shard';
 import type { Sql } from '../db/index';
 import { defaultKvBundle, type KvBundle } from '../lib/kvRouter';
 import type { GroupRow, StoragePolicyRow, UserRow, UserWithGroup } from '../db/types';
@@ -87,7 +87,9 @@ export class AppContext {
     this.files = new FileRepo(sql);
     this.entities = new EntityRepo(sql);
     this.shares = new ShareRepo(sql);
-    this.metadata = new MetadataRepo(sql);
+    // 元数据域：配了 DATABASE_URL_3 时 metadata 落在独立库（分摊主库读写，
+    // 见 db/shard.ts resolveDomainHandle）；未配置回退主库，零行为差异。
+    this.metadata = new MetadataRepo(resolveDomainHandle(env, 'metadata').sql);
     this.directLinks = new DirectLinkRepo(sql);
     this.tasks = new TaskRepo(sql);
     this.davAccounts = new DavAccountRepo(sql);

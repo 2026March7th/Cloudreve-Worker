@@ -75,6 +75,24 @@ export function primaryDatabaseUrl(env: Env): string | undefined {
   return databaseUrls(env)[0];
 }
 
+/** 分域库连接串（按环境变量名取，不做压缩对齐——_2 就是日志域，_3 就是元数据域）。 */
+function domainUrlByName(env: Env, name: string): string | null {
+  const v = (env as unknown as Record<string, string | undefined>)[name]?.trim();
+  if (!v) return null;
+  // 与主库相同连接串 → 不算独立域（避免同库自同步/自引用）
+  return v === primaryDatabaseUrl(env) ? null : v;
+}
+
+/** 日志域（audit_logs）。配了 `DATABASE_URL_2` 且不同于主库时返回其连接串。 */
+export function auditDomainUrl(env: Env): string | null {
+  return domainUrlByName(env, 'DATABASE_URL_2');
+}
+
+/** 元数据域（metadata）。配了 `DATABASE_URL_3` 且不同于主库时返回其连接串。 */
+export function metadataDomainUrl(env: Env): string | null {
+  return domainUrlByName(env, 'DATABASE_URL_3');
+}
+
 /** 冷备连接串（不含主库）。用于全量同步的写入端与故障切换的候选。 */
 export function backupDatabaseUrls(env: Env): string[] {
   return databaseUrls(env).slice(1);
