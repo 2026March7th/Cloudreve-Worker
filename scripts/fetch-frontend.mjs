@@ -99,7 +99,10 @@ try {
     const res = await fetch(url, { redirect: 'follow' });
     if (res.ok) {
       writeFileSync(TARBALL_PATH, Buffer.from(await res.arrayBuffer()));
-      runOrDie('tar', ['-xzf', TARBALL_PATH, '-C', ROOT], '解压前端产物');
+      // tar 的路径参数一律用**相对名 + cwd**：Windows 自带的 bsdtar 会把
+      // `F:\path` 里的冒号当成「远程主机 user@host:path」语法（报
+      // "Cannot connect to F:"），绝对路径连 `-C` 也会踩。Linux 无此问题。
+      runOrDie('tar', ['-xzf', '_frontend.tar.gz'], '解压前端产物', { cwd: ROOT });
       const inner = path.join(SRC_DIR, RELEASE_ASSET.replace('.tar.gz', ''));
       rmSync(TARGET, { recursive: true, force: true });
       cpSync(inner, TARGET, { recursive: true });
@@ -127,10 +130,10 @@ if (!res.ok) {
   console.error(`✘ 源码下载失败：HTTP ${res.status}（${UPSTREAM_TARBALL}）`);
   process.exit(1);
 }
-writeFileSync(TARBALL_PATH, Buffer.from(await res.arrayBuffer()));
-
 mkdirSync(SRC_DIR, { recursive: true });
-runOrDie('tar', ['-xzf', TARBALL_PATH, '-C', SRC_DIR], '解压源码');
+// 包放进 SRC_DIR 里再解压，让 tar 的参数是纯文件名（见上面冒号问题的注释）
+writeFileSync(path.join(SRC_DIR, '_frontend.tar.gz'), Buffer.from(await res.arrayBuffer()));
+runOrDie('tar', ['-xzf', '_frontend.tar.gz'], '解压源码', { cwd: SRC_DIR });
 const src = path.join(SRC_DIR, `frontend-${COMMIT}`);
 if (!existsSync(src)) {
   console.error(`✘ 解压后找不到源码目录：${src}`);

@@ -125,7 +125,17 @@ app.use('*', async (c, next) => {
   // 见 `bootstrapConfirmed` 的注释。
   if (!bootstrapConfirmed) {
     try {
-      const bootstrapped = await kvFor(c.env, 'flag').get(BOOTSTRAP_FLAG);
+      // 自举标记与「分域降级」状态并行读出（都在 flag 命名空间，一次并发
+      // 往返拿全）。分域降级状态**必须每个 isolate 冷启动都装一遍**：
+      // BOOTSTRAP_FLAG 已设置时下面的自举分支整体跳过，而 Workers 会不断
+      // 滚动出新的 isolate —— 新 isolate 不装这份状态就会去打已知不可用
+      // 的域库，直到一次查询失败才开始 30s 降级，用户侧就是「偶发数据库
+      // 操作失败」。放在并行读里，冷启动多花的只是一次并发 KV 往返，
+      // 热路径（bootstrapConfirmed=true）完全不受影响。
+      const [bootstrapped] = await Promise.all([
+        kvFor(c.env, 'flag').get(BOOTSTRAP_FLAG),
+        applyDomainDownFromKv(c.env),
+      ]);
       if (!bootstrapped) {
         if (await kvFor(c.env, 'flag').get(BOOTSTRAP_COOLDOWN)) {
           return c.json(
@@ -138,12 +148,9 @@ app.use('*', async (c, next) => {
             const db = resolveDb(c.env);
             await provision(c.env, db);
             await ensureSettings(c.env, db);
-            // 域降级状态先装回内存（KV 持久的那份），再跑分域自举：
-            // 保证「上次建表/搬迁失败」的域在本 isolate 里直接回退主库，
-            // 而不是等一次查询失败才开始降级。
-            await applyDomainDownFromKv(c.env);
             // 分域自举：配了 DATABASE_URL_2/_3 时在对应库建表并搬迁存量
             // 审计/元数据（幂等，KV 标记短路）；失败不阻断自举，cron 兜底重试。
+            // （域降级状态已在上面与自举标记并行装回内存，这里直接用。）
             await ensureDomainShards(c.env);
             await kvFor(c.env, 'flag').put(BOOTSTRAP_FLAG, '1');
           })().catch(async (err) => {

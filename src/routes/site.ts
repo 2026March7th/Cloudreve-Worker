@@ -119,7 +119,7 @@ function listKvBindings(env: unknown): string[] {
  *   要让运行时看到 N 个库，必须在**面板**里配齐 DATABASE_URL_2..5
  *   （或走 deploy.mjs 的 `wrangler secret put`，它写的也是运行时机密）。
  */
-siteRoutes.get('/db-status', (c) => {
+siteRoutes.get('/db-status', async (c) => {
   c.header('Cache-Control', 'no-cache');
   const env = c.env as unknown as Record<string, string | undefined>;
   const names = ['DATABASE_URL', 'DATABASE_URL_2', 'DATABASE_URL_3', 'DATABASE_URL_4', 'DATABASE_URL_5'] as const;
@@ -150,6 +150,11 @@ siteRoutes.get('/db-status', (c) => {
     // 主库是不是唯一可写：这里是恒定 true（设计如此），写出来是为了让人
     // 一眼看懂「备库不接流量」不是配置错误。
     single_writer: true,
+    // 分域库的真实状态：运行时实际在用哪个库、表建没建好、数据搬没搬完。
+    // 这一段专门用来回答「配了 _2/_3 但页面还报数据库操作失败」的排查 ——
+    // 分域自举只在 BOOTSTRAP_FLAG 变更时跑一次，建表/搬迁失败后从外面
+    // 完全看不出区别，只能靠这里探一次库。
+    domains: await domainStatus(c.env as never),
     hint:
       urls.length <= 1
         ? 'Worker 运行时只看到 1 个数据库。面板「变量和机密」里需要同时配 DATABASE_URL_2..5（构建期变量运行时读不到）。'
@@ -158,6 +163,61 @@ siteRoutes.get('/db-status', (c) => {
           : `运行时看到 ${urls.length} 个库（1 主 + ${backups.length} 备）。备库平时不接流量，每次构建由 CI 全量同步；主库挂了要临时接管需设 DB_FAILOVER=1。`,
   });
 });
+
+/**
+ * 探测两个分域库（_2=审计日志、_3=元数据）的运行时状态。
+ *
+ * 每个 domain 报告：解析到的句柄指向哪个库、是否已降级回主库、表是否存在、
+ * 行数、以及建表/搬迁的 KV 标记。任一步出错只把错误字符串写进结果，
+ * 不让这个诊断端点自己 500。
+ */
+async function domainStatus(env: import('../env').Env): Promise<unknown[]> {
+  const { resolveDomainHandle } = await import('../db/shard');
+  const out: unknown[] = [];
+  // 表名来自这份固定清单（不是用户输入），直接拼进 SQL 是安全的。
+  for (const [domain, table, source] of [
+    ['audit', 'audit_logs', 'DATABASE_URL_2'],
+    ['metadata', 'metadata', 'DATABASE_URL_3'],
+  ] as const) {
+    const raw = (env as unknown as Record<string, string | undefined>)[source]?.trim();
+    if (!raw) {
+      out.push({ domain, configured: false });
+      continue;
+    }
+    const handle = resolveDomainHandle(env, domain);
+    const entry: Record<string, unknown> = {
+      domain,
+      configured: true,
+      source: handle.source,
+      // degraded=true 表示运行时已回退主库（域库被标记为不可用）
+      degraded: handle.degraded,
+    };
+    try {
+      const probe = (await handle.sql('SELECT to_regclass($1) IS NOT NULL AS exists', [
+        `public.${table}`,
+      ])) as Array<{ exists: boolean }>;
+      entry.table = probe[0]?.exists ? 'exists' : 'MISSING';
+      if (probe[0]?.exists) {
+        const rows = (await handle.sql(`SELECT count(*)::int AS count FROM ${table}`, [])) as Array<{
+          count: number;
+        }>;
+        entry.rows = rows[0]?.count;
+      }
+    } catch (e) {
+      entry.probe_error = e instanceof Error ? e.message : String(e);
+    }
+    try {
+      const kv = kvFor(env, 'flag');
+      entry.ddl_done = !!(await kv.get(`shard:ddl:${domain}`));
+      entry.migrated = !!(await kv.get(`shard:migrated:${domain}`));
+      entry.down_flag = !!(await kv.get(`shard:down:${domain}`));
+    } catch {
+      /* KV 不可用时省略标记部分 */
+    }
+    out.push(entry);
+  }
+  return out;
+}
 
 /** 从连接串里取 host（去掉账号密码）。解析失败返回 '(无法解析)'。 */
 function safeHost(url: string): string {

@@ -89,10 +89,13 @@ export class AppContext {
     this.shares = new ShareRepo(sql);
     // 元数据域：配了 DATABASE_URL_3 时 metadata 落在独立库（分摊主库读写，
     // 见 db/shard.ts resolveDomainHandle）；未配置回退主库，零行为差异。
-    // 查询失败且当前在域库上 → 触发 30s 降级回主库（表 schema 永远保留），
-    // 否则「域库缺表/不可达」会让列表持续报错。
+    // 查询失败且当前在域库上 → 记 30s 降级（本 isolate 后续直接走主库），
+    // 并**立即落主库重跑一次**：主库的 metadata 表 schema 永远保留（迁移
+    // 只搬数据不删表），搬迁未完成时主库仍有全量数据；即使搬迁已完成、
+    // 主库侧被清空，回退也只是「元数据不显示」，而不是让用户看到一个 500。
     const metaHandle = resolveDomainHandle(env, 'metadata');
     const metadataRepo = new MetadataRepo(metaHandle.sql);
+    const primaryMetadata = new MetadataRepo(sql);
     this.metadata = new Proxy(metadataRepo, {
       get(target, prop) {
         const value = Reflect.get(target, prop);
@@ -102,6 +105,11 @@ export class AppContext {
             return await (value as (...a: unknown[]) => unknown).apply(target, args);
           } catch (e) {
             noteDomainFailure('metadata');
+            console.error('metadata domain query failed, falling back to primary:', e instanceof Error ? e.message : String(e));
+            const fallback = Reflect.get(primaryMetadata, prop);
+            if (typeof fallback === 'function') {
+              return await (fallback as (...a: unknown[]) => unknown).apply(primaryMetadata, args);
+            }
             throw e;
           }
         };
