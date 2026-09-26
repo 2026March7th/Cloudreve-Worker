@@ -80,10 +80,31 @@ function patchIndexHtml() {
   if (patched !== html) writeFileSync(file, patched);
 }
 
+/**
+ * 给静态资源目录注入 _headers：内容哈希命名的 /assets/*（JS/CSS/字体/图片）
+ * 设 `immutable` 永久缓存，让重复访问直接命中浏览器缓存、跳过 1.5MB 主包的
+ * 重新下载/校验（原 Workers Assets 默认是 max-age=0，每次访问都向 CF 边缘发
+ * 条件请求）。HTML 与未哈希资源保持默认 max-age=0，部署后即时更新。
+ *
+ * 写入位置是 assets 目录根（frontend/_headers），Workers Assets 部署时会解析
+ * 它并套用到静态响应。frontend/ 不入库、由本脚本生成，所以在这里注入最稳。
+ */
+function writeHeaders() {
+  const file = path.join(TARGET, '_headers');
+  const content = [
+    '# Cloudreve edge：内容哈希资源永久缓存，HTML 保持默认 max-age=0 以便即时更新',
+    '/assets/*',
+    '  Cache-Control: public, max-age=31536000, immutable',
+    '',
+  ].join('\n');
+  writeFileSync(file, content);
+}
+
 // --- 1. 已有产物 ---
 if (existsSync(path.join(TARGET, 'index.html'))) {
   console.log('  frontend/ 已存在，补一遍占位符填充后直接复用。');
   patchIndexHtml();
+  writeHeaders();
   process.exit(0);
 }
 console.log('  未发现 frontend/，开始获取官方前端…');
@@ -109,6 +130,7 @@ try {
       cleanup();
       if (existsSync(path.join(TARGET, 'index.html'))) {
         patchIndexHtml();
+        writeHeaders();
         console.log('✅ 前端就绪（Release 预构建包）。');
         process.exit(0);
       }
@@ -184,5 +206,6 @@ rmSync(TARGET, { recursive: true, force: true });
 cpSync(built, TARGET, { recursive: true });
 cleanup();
 patchIndexHtml();
+writeHeaders();
 
 console.log(`✅ 官方前端就绪：${TARGET}`);
