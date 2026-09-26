@@ -20,15 +20,18 @@ import { edgeCacheMatch, edgeCachePut } from '../lib/edgeCache';
 
 type Bindings = { Bindings: Env };
 
-/** 仅这些匿名 GET 走缓存：ping 与 site/config/*。 */
-const CACHEABLE = [/^\/api\/v4\/site\/ping$/, /^\/api\/v4\/site\/config\//];
-
 function isCacheable(c: Context<Bindings>): boolean {
   if (c.req.method !== 'GET') return false;
-  if (c.req.header('Authorization')) return false; // 仅匿名
   const p = c.req.path;
-  return CACHEABLE.some((re) => re.test(p));
+  // 站点配置是公开数据，匿名/登录共用同一份缓存（键不含 Authorization）。
+  if (CONFIG_RE.test(p)) return true;
+  // 其余（ping）仅匿名：带登录态的请求交给 cacheAuthed 处理用户相关端点。
+  if (c.req.header('Authorization')) return false;
+  return PING_RE.test(p);
 }
+
+const CONFIG_RE = /^\/api\/v4\/site\/config\//;
+const PING_RE = /^\/api\/v4\/site\/ping$/;
 
 /** 前置：命中边缘缓存则直接返回，跳过 appContext（省 KV / 冷启动）。 */
 export function cachePublicAnon(): MiddlewareHandler<Bindings> {

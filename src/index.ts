@@ -21,6 +21,7 @@ import type { Context } from 'hono';
 import type { Env } from './env';
 import { appContext, ctxOf, type AppBindings } from './middleware/app';
 import { cachePublicAnon, cachePublicAnonStore } from './middleware/cachePublic';
+import { cacheAuthed } from './middleware/cacheAuthed';
 import { fail, ok } from './lib/response';
 import { AppError, CodeNotFound, describeError } from './lib/errors';
 import { ensureSettings, loadSettings } from './settings/provider';
@@ -209,6 +210,9 @@ app.use('/api/*', cors({
 // 公共匿名接口（ping / site/config/*）的边缘缓存：命中即短路，跳过 appContext
 // 的 KV 读与冷启动。必须在 appContext 之前注册，否则缓存命中也要先跑一通中间件。
 app.use('*', cachePublicAnon());
+// 登录态只读接口（/me、GET /file 列目录）的边缘缓存：命中即短路，跳过
+// appContext 的 KV 读与数据库往返。必须在 appContext 之前注册。
+app.use('*', cacheAuthed());
 app.use('*', appContext());
 // 后置：miss 时把 200 响应写回 CF 边缘缓存（跨 isolate 共享）。
 app.use('*', cachePublicAnonStore());
