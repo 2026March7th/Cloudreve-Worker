@@ -37,6 +37,34 @@ const AUTH_CODE_TTL = 600; // 秒，上游同款
  */
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+/**
+ * 拒绝危险的 redirect_uri：明文 http（非 localhost 回环）、javascript:/data:/file:
+ * 等协议。授权码经 redirect 回传，发到明文 http 会被中间人截获，发到 javascript:
+ * 等则直接执行。仅放行 https://、自定义协议（cloudreve:// 等）、localhost 回环。
+ *
+ * 该函数只用于无法预登记白名单的 auto_provisioned 客户端（官方闭源端 URI 未知），
+ * 作为「接受任意回调」之上的最小安全闸门。
+ */
+function assertSafeRedirectUri(uri: string): void {
+  let u: URL;
+  try {
+    u = new URL(uri);
+  } catch {
+    throw new AppError(CodeParamErr, 'Invalid redirect URI');
+  }
+  const scheme = u.protocol;
+  if (scheme === 'javascript:' || scheme === 'data:' || scheme === 'file:') {
+    throw new AppError(CodeParamErr, 'Invalid redirect URI scheme');
+  }
+  if (scheme === 'http:') {
+    const host = u.hostname;
+    const isLocal = host === 'localhost' || host === '127.0.0.1' || host === '[::1]';
+    if (!isLocal) {
+      throw new AppError(CodeParamErr, 'Plaintext http redirect URI is not allowed');
+    }
+  }
+}
+
 /** 自动注册的新客户端默认放开的 scope（私有部署策略：宽松）。 */
 const AUTO_SCOPES = [
   'openid',
@@ -185,14 +213,30 @@ export class OAuthService {
     }
     const app = await this.clientByGUID(args.client_id, true);
     if (!app || !app.is_enabled) throw new AppError(CodeNotFound, 'App not found');
-    // 自动注册的客户端 redirect 白名单为空 —— 接受任意回调（含 cloudreve://
-    // 自定义协议与 localhost 回环）；管理员手工登记的应用仍要求精确匹配。
-    if (app.redirect_uris.length > 0 && !app.redirect_uris.includes(args.redirect_uri)) {
-      throw new AppError(CodeParamErr, 'Invalid redirect URI');
+
+    // 强制 PKCE（RFC 7636）：所有授权码流程必须携带 S256 挑战，否则授权码一旦在
+    // redirect 链路泄露即可被冒用。Cloudreve v4 官方客户端（web / 桌面端）均发送
+    // code_challenge，故此强制不破坏现有登录；旧的 / 非标准客户端若不发 PKCE 将被拒绝。
+    if (!args.code_challenge) {
+      throw new AppError(CodeParamErr, 'code_challenge is required (PKCE)');
     }
-    const method = args.code_challenge ? (args.code_challenge_method || 'S256') : '';
-    if (method && method !== 'S256') {
+    const method = args.code_challenge_method || 'S256';
+    if (method !== 'S256') {
       throw new AppError(CodeParamErr, 'Only S256 code_challenge_method is supported');
+    }
+
+    // redirect_uri 校验：
+    // - 已登记白名单的客户端（管理员手工登记）必须精确匹配；
+    // - auto_provisioned 客户端（官方闭源端，URI 无法预登记）接受任意，但必须是安全
+    //   scheme（拒绝明文 http 非 localhost、javascript:/data: 等），避免授权码泄露到
+    //   明文链路或被发往危险协议；
+    // - 其余（手动创建却未登记白名单）保持原语义：不校验。
+    if (app.redirect_uris.length > 0) {
+      if (!app.redirect_uris.includes(args.redirect_uri)) {
+        throw new AppError(CodeParamErr, 'Invalid redirect URI');
+      }
+    } else if (app.props.auto_provisioned) {
+      assertSafeRedirectUri(args.redirect_uri);
     }
 
     const requestedScopes = args.scope.split(' ').filter(Boolean);
@@ -255,16 +299,21 @@ export class OAuthService {
       throw new AppError(CodeCredentialInvalid, 'Client ID mismatch');
     }
 
-    // PKCE（S256）：sha256(verifier) 与挑战比对
-    if (authCode.code_challenge) {
-      const digest = await crypto.subtle.digest(
-        'SHA-256',
-        new TextEncoder().encode(args.code_verifier ?? ''),
-      );
-      const expected = b64url(new Uint8Array(digest));
-      if (!timingSafeEqual(expected, authCode.code_challenge)) {
-        throw new AppError(CodeCredentialInvalid, 'Invalid code verifier');
-      }
+    // PKCE（S256）：授权码必须带挑战，且 verifier 必须匹配（consent 已强制挑战，
+    // 此处再兜底，杜绝任何未经 PKCE 保护的授权码被换走 token）。
+    if (!authCode.code_challenge) {
+      throw new AppError(CodeCredentialInvalid, 'Missing code challenge');
+    }
+    if (!args.code_verifier) {
+      throw new AppError(CodeCredentialInvalid, 'Missing code verifier');
+    }
+    const digest = await crypto.subtle.digest(
+      'SHA-256',
+      new TextEncoder().encode(args.code_verifier),
+    );
+    const expected = b64url(new Uint8Array(digest));
+    if (!timingSafeEqual(expected, authCode.code_challenge)) {
+      throw new AppError(CodeCredentialInvalid, 'Invalid code verifier');
     }
 
     const app = await this.clientByGUID(args.client_id);
