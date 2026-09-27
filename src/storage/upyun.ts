@@ -243,7 +243,7 @@ export class UpyunDriver implements StorageDriver {
   }
 
   async cancelToken(session: UploadSession): Promise<void> {
-    if (session.newFileCreated === false) return;
+    // 无论是不是覆盖上传，savePath 都是本次会话新生成的占位对象键，取消时必须清掉。
     try {
       await this.fetchUpyun('DELETE', this.objectUrl(session.savePath), { raw: true });
     } catch {

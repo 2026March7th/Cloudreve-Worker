@@ -133,7 +133,7 @@ export class OrderRepo {
 
   async markFailed(id: number, error: string): Promise<void> {
     await this.sql`
-      UPDATE orders SET status = 'failed', error = ${error.slice(0, 500)}, updated_at = now()
+      UPDATE orders SET status = 'failed', error = ${String(error ?? '').slice(0, 500)}, updated_at = now()
       WHERE id = ${id} AND status = 'pending'
     `;
   }

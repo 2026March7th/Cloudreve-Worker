@@ -1078,6 +1078,11 @@ export class FileSystemService {
       if (nameError) throw new AppError(CodeIllegalObjectName, nameError);
 
       if (copy) {
+        // 防止把目录复制到自己内部（与 move 分支一致），否则 copyRecursive 会无限
+        // 递归复制子树直到打爆配额 / 内存。
+        if (dstFolder && (await this.isDescendant(dstFolder.id, src.id))) {
+          throw new AppError(CodeGroupNotAllowed, 'Cannot copy a folder into itself');
+        }
         // files 表有 (file_children, name) 唯一索引，不预检同名会把原始
         // DB 冲突裸抛成 500（move 分支同样道理，见下方 conflict 检查）
         const conflict = await this.ctx.files.childByName(dstFolder!.id, src.name);
@@ -1195,8 +1200,8 @@ export class FileSystemService {
       }
     }
 
-    if (errors.length > 0 && errors.length === uris.length) {
-      throw new AppError(40081, 'One or more operation failed');
+    if (errors.length > 0) {
+      throw new AppError(40081, `One or more operation(s) failed: ${errors.join(', ')}`);
     }
   }
 
@@ -1270,6 +1275,9 @@ export class FileSystemService {
     await this.ctx.entities.hardDelete(garbage.map((e) => e.id));
     // 先删直链（外键约束：direct_links.file_id → files.id）
     await this.ctx.directLinks.deleteByFileIds(ids);
+    // 软删这些文件关联的分享（shares.file_shares → files.id 是 ON DELETE SET NULL：
+    // 不删会留下 file_shares=NULL 的孤儿分享，用户点开即 500）
+    await this.ctx.shares.softDeleteByFileIds(ids);
     await this.ctx.files.deleteMany(ids);
 
     // 彻底删除的文件从全文索引剔除
@@ -1386,10 +1394,11 @@ export class FileSystemService {
         continue;
       }
 
-      // 目标目录 = 原路径的父目录。原目录也已被删的话，这里会解析不到。
-      const dstDir = await this.resolve(original.parent());
+      // 目标目录 = 原路径的父目录。原目录也已被删的话，兜底还原到根目录，
+      // 而不是把文件永久卡在回收站里。
+      let dstDir = await this.resolve(original.parent());
       if (!dstDir) {
-        throw new AppError(CodeParentNotExist, 'Path not exist');
+        dstDir = await this.ctx.files.ensureRoot(user.id);
       }
 
       // 回收站里 name 是随机串，恢复时还原成原始文件名
@@ -1434,11 +1443,19 @@ export class FileSystemService {
    */
   async purgeExpiredTrash(): Promise<number> {
     const now = Math.floor(Date.now() / 1000);
-    const expired = await this.ctx.files.listExpiredTrash(now);
-    for (const file of expired) {
+    // expected_collect_time 元数据落在元数据域（可能不在主库），由 metadata 仓储按所在域
+    // 查询，避免跨库 JOIN（原 listExpiredTrash 的 files JOIN metadata 在分域部署下恒为空，
+    // 回收站永不自动清理）。
+    const expiredIds = await this.ctx.metadata.listExpiredCollectTime(now);
+    let removed = 0;
+    for (const id of expiredIds) {
+      const file = await this.ctx.files.byId(id);
+      // 只处理叶子文件（file_children IS NULL）且非根占位（name <> ''），与原 SQL 选择一致
+      if (!file || file.file_children !== null || file.name === '') continue;
       await this.purge(file);
+      removed++;
     }
-    return expired.length;
+    return removed;
   }
 
   /** 文件数上限校验（原版对单目录文件数有限制，这里按用户总量限制）。 */

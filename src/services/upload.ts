@@ -397,6 +397,16 @@ export class UploadService {
   // -------------------------------------------------------------------------
 
   private async finishUpload(session: UploadSession): Promise<void> {
+    // 防重入：并发/晚到的分片请求可能重建 KV 会话并再次触发收尾，导致重复容量
+    // 记账、重复转正。用一把 KV 完成标记拦截 —— 已完成过的直接跳过。
+    const doneKey = `upload:done:${session.id}`;
+    const uploadKv = kvFor(this.ctx.env, 'upload');
+    try {
+      if (await uploadKv.get(doneKey)) return;
+    } catch {
+      // 标记读不到就当没完成，照常收尾（不阻断上传）
+    }
+
     const driver = this.ctx.driverFor(session.policy);
 
     // 是否覆盖已有内容（用于事件类型判定：create vs modify）
@@ -471,6 +481,13 @@ export class UploadService {
       } catch {
         // 事件推送失败不影响上传结果
       }
+    }
+
+    // 收尾成功，打上完成标记（防重入）。TTL 10 分钟足够覆盖一次上传的并发窗口。
+    try {
+      await uploadKv.put(doneKey, '1', { expirationTtl: 600 });
+    } catch {
+      // 标记写失败不阻断上传
     }
   }
 

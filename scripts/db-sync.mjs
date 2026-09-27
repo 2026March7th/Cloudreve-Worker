@@ -277,7 +277,7 @@ for (const [i, b] of backups.entries()) {
         continue;
       }
       const colList = cols.map(ident).join(', ');
-      await b.sql(`TRUNCATE TABLE ${ident(t)}`);
+      await b.sql(`TRUNCATE TABLE ${ident(t)} CASCADE`);
 
       let offset = 0;
       let total = 0;

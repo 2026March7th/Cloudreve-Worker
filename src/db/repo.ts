@@ -1422,6 +1422,22 @@ export class ShareRepo {
       `;
     }
   }
+
+  /**
+   * 彻底删除文件前，按 `file_shares` 批量软删这些文件关联的分享。
+   *
+   * `shares.file_shares → files.id` 是 `ON DELETE SET NULL`：删文件只会把
+   * 外键置空而**不删除分享行**，留下 `file_shares = NULL` 的孤儿分享 —— 用户在
+   * 分享列表点开它会因解析不到文件而 500。`purge()` 必须在 `files.deleteMany`
+   * 之前先软删这些分享。
+   */
+  async softDeleteByFileIds(fileIds: number[]): Promise<void> {
+    if (fileIds.length === 0) return;
+    await this.sql`
+      UPDATE shares SET deleted_at = now(), updated_at = now()
+      WHERE file_shares = ANY(${fileIds}::int[]) AND deleted_at IS NULL
+    `;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1474,6 +1490,23 @@ export class MetadataRepo {
 
   async removeAllForFile(fileId: number): Promise<void> {
     await this.sql`DELETE FROM metadata WHERE file_id = ${fileId}`;
+  }
+
+  /**
+   * 列出已到期（sys:expected_collect_time <= now）的回收站文件 id。
+   * 落在元数据域（分域部署下 metadata 不在主库），由本仓储按所在域查询，
+   * 避免 `files JOIN metadata` 的跨库 JOIN（原 listExpiredTrash 在分域部署下恒为空，
+   * 回收站永不自动清理）。
+   */
+  async listExpiredCollectTime(nowSeconds: number, limit = 200): Promise<number[]> {
+    const rows = (await this.sql(
+      `SELECT file_id FROM metadata
+       WHERE name = $1 AND deleted_at IS NULL
+         AND value ~ '^[0-9]+$' AND value::bigint <= $2::bigint
+       LIMIT $3`,
+      [MetadataExpectedCollectTime, nowSeconds, limit],
+    )) as Record<string, unknown>[];
+    return rows.map((r) => toNum(r.file_id));
   }
 }
 

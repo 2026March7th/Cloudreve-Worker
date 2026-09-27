@@ -23,8 +23,11 @@ type Bindings = { Bindings: Env };
 function isCacheable(c: Context<Bindings>): boolean {
   if (c.req.method !== 'GET') return false;
   const p = c.req.path;
-  // 站点配置是公开数据，匿名/登录共用同一份缓存（键不含 Authorization）。
-  if (CONFIG_RE.test(p)) return true;
+  // 站点配置里含登录态用户的私有信息（email/组权限/容量/个人设置），绝不能
+  // 进跨用户的 public 边缘缓存，否则用户 A 的隐私会被用户 B 命中、登录/匿名
+  // 态也会互相错乱。只缓存匿名版（未带 Authorization）；登录版由 cacheAuthed
+  // 或回源处理。
+  if (CONFIG_RE.test(p)) return !c.req.header('Authorization');
   // 其余（ping）仅匿名：带登录态的请求交给 cacheAuthed 处理用户相关端点。
   if (c.req.header('Authorization')) return false;
   return PING_RE.test(p);

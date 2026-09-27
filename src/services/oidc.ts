@@ -182,7 +182,9 @@ export async function handleCallback(
   }
 
   // --- 5. 未绑定：按邮箱找已有账号 ---
-  if (email) {
+  // ⚠️ 仅当 IdP 明确标记邮箱已验证时才允许按邮箱关联，避免未验证的邮箱字段
+  // 被冒用、把攻击者的 OIDC 身份绑定到任意已存在（含管理员）账号。
+  if (email && (userinfo as { email_verified?: unknown }).email_verified === true) {
     const existing = await ctx.users.byEmail(email);
     if (existing) {
       if (existing.status !== 'active') throw new AppError(40084, 'Account is not active');

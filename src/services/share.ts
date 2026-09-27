@@ -23,6 +23,7 @@ import {
   CodeInsufficientCredit,
   CodeNoPermissionErr,
   CodeNotFound,
+  CodePurchaseRequired,
   CodeSaveOwnShare,
   CodeGroupNotAllowed,
   Err,
@@ -163,6 +164,10 @@ export class ShareService {
     if (shareId === null) throw Err.shareNotFound();
     const share = await this.ctx.shares.byId(shareId);
     if (!share) throw Err.shareNotFound();
+    // 显式校验归属，与 delete 保持一致：只能编辑自己创建的分享。
+    if (share.user_shares !== user.id && !this.ctx.isAdmin) {
+      throw new AppError(CodeNoPermissionErr, 'permission denied');
+    }
 
     // 原版 `EditShare` 走的是同一个 `Upsert(c, existedID)`（`share/manage.go:63-100`），
     // 也就是说编辑和创建共用全部前置校验：按 `params.uri` 重新解析源文件 → 校验属主 →
@@ -604,6 +609,19 @@ export class ShareService {
   async saveToMyFiles(shareHashId: string, password: string, dstUri: string): Promise<void> {
     const user = this.ctx.requireUser();
     const { share, file } = await this.resolveShareSource(shareHashId, password);
+
+    // 付费分享的「转存」同样要走购买闸门（与下载一致）：owner 免购；匿名先登录；
+    // 已登录未购则拒绝。否则付费分享可被「转存到我的网盘」免费搬走。
+    const isOwner = this.ctx.user !== undefined && this.ctx.user.id === share.user_shares;
+    if (share.score > 0 && !isOwner) {
+      if (this.ctx.isAnonymous || !this.ctx.user) {
+        throw new AppError(CodePurchaseRequired, 'Login required to purchase this share');
+      }
+      const purchased = await this.ctx.shares.hasPurchased(share.id, this.ctx.user.id);
+      if (!purchased) {
+        throw new AppError(CodePurchaseRequired, 'Purchase required to access this share');
+      }
+    }
 
     if (file!.owner_id === user.id) {
       throw new AppError(CodeSaveOwnShare, 'Cannot save your own share');

@@ -152,8 +152,9 @@ export class R2Driver implements StorageDriver {
         // 会话可能已过期，忽略
       }
     }
-    if (session.newFileCreated === false) return;
-    // 清理可能已写入的占位对象
+    // 无论是不是覆盖上传，savePath 都是本次会话新生成的占位对象键
+    // （generateSavePath 每次都出新键，不会等于原文件的实体源）。取消时必须
+    // 清掉它，否则会留下孤立对象、永久占用存储。
     try {
       await this.bucket.delete(session.savePath);
     } catch {

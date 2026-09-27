@@ -236,7 +236,21 @@ export class WorkflowService {
       // 先 HEAD 拿长度；拿不到就按流式未知长度处理（上传会话必须要一个确定长度，
       // 所以这里退化为「先取到内存上限内」——超过上限直接报太大）
       const head = await fetch(args.url, { method: 'HEAD' }).catch(() => null);
-      const declared = Number(head?.headers.get('content-length') ?? 0);
+      let declared = Number(head?.headers.get('content-length') ?? 0);
+      // HEAD 拿不到长度时（常见，尤其 CDN/对象存储不回 content-length）再用一次
+      // Range 探测 GET 取总大小；仍拿不到就明确报错 —— Worker 上传需要明确大小，
+      // 不能默默以 0 字节落地成空文件，也绝不能绕过 MAX_WORKFLOW_BYTES 上限拉取超大文件。
+      if (!declared) {
+        const probe = await fetch(args.url, { method: 'GET', headers: { Range: 'bytes=0-0' } }).catch(() => null);
+        const rangeTotal = probe?.headers.get('Content-Range')?.split('/')[1];
+        declared = Number(rangeTotal ?? probe?.headers.get('content-length') ?? 0);
+      }
+      if (!declared || Number.isNaN(declared)) {
+        throw new AppError(
+          CodeFeatureNotEnabled,
+          'Remote file size is unknown and cannot be downloaded',
+        );
+      }
       if (declared > MAX_WORKFLOW_BYTES) {
         throw new AppError(
           CodeFeatureNotEnabled,

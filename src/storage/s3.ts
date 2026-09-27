@@ -517,7 +517,7 @@ export class S3CompatibleDriver implements StorageDriver {
         // 会话可能已过期，忽略
       }
     }
-    if (session.newFileCreated === false) return;
+    // 无论是不是覆盖上传，savePath 都是本次会话新生成的占位对象键，取消时必须清掉。
     try {
       await this.signedFetch('DELETE', this.objectUrl(session.savePath), { raw: true });
     } catch {

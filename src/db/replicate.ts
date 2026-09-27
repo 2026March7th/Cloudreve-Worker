@@ -147,8 +147,12 @@ async function syncTable(
     return { table, rows: 0, chunks: 0, skipped: '读不到列定义' };
   }
 
-  // 目标表先清空。`CASCADE` 不用 —— 表间没有声明式外键（见 0001 注释）。
-  await withRetry(() => to(`TRUNCATE TABLE ${ident(table)}`));
+  // 目标表先清空。`CASCADE` 必需：0001_init.sql 里真的建了外键
+  // （storage_policies→files/groups、files→metadata/shares/direct_links 等），
+  // 不带 CASCADE 的 TRUNCATE 会在第一张被引用的父表上直接报
+  // "cannot truncate a table referenced by a foreign key constraint"。反正后面会
+  // 重新 COPY 灌入全部表，级联清空子表是安全的。
+  await withRetry(() => to(`TRUNCATE TABLE ${ident(table)} CASCADE`));
 
   const colList = columns.map(ident).join(', ');
   let offset = 0;

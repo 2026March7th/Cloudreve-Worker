@@ -614,6 +614,9 @@ export class UserService {
     const user = await this.ctx.users.byId(uid);
     if (!user || user.status !== 'active') throw new AppError(40021, 'User not found');
 
+    if (newPassword.length < 6 || newPassword.length > 128) {
+      throw new AppError(CodeParamErr, 'Password must be between 6 and 128 characters');
+    }
     await this.ctx.users.updatePassword(uid, await digestPassword(newPassword));
     logAudit(this.ctx, 'change_password', uid, { via: 'reset' });
 
@@ -701,6 +704,9 @@ export class UserService {
     }
 
     if (patch.new_password) {
+      if (patch.new_password.length < 6 || patch.new_password.length > 128) {
+        throw new AppError(CodeParamErr, 'Password must be between 6 and 128 characters');
+      }
       const pwCheck = await checkPassword(user.password, patch.current_password ?? '');
       if (!pwCheck.ok) throw new AppError(CodeIncorrectPassword, 'Incorrect password');
       if (pwCheck.upgradeToV4) {

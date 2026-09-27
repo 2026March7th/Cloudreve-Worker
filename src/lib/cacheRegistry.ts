@@ -105,6 +105,16 @@ export const CACHE_ENTRIES: readonly CacheEntry[] = [
     warm: async () => true,
   },
   {
+    id: 'policy-cache',
+    label: '存储策略缓存（policy:v1:*）',
+    role: 'session',
+    prefix: 'policy:v1:',
+    purge: true,
+    // 策略缓存放 session 命名空间，但键前缀是 policy:v1:，不在 session: 前缀下，
+    // 必须单独登记，否则「清空缓存」按前缀匹配不到它，管理员改了策略要等 TTL 才生效。
+    warm: async () => true,
+  },
+  {
     id: 'captcha',
     label: '验证码（captcha:*，一次性、短 TTL）',
     role: 'session',

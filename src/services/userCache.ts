@@ -42,6 +42,17 @@ const L1_MAX = 200;
 
 const USER_KEY = (id: number) => `user:v2:${id}`;
 
+/**
+ * 写入 L2(KV) 前剥离密码哈希等敏感字段。L1 内存缓存保留完整对象（仅用于本请求
+ * 鉴权），但 KV 是跨 isolate 共享、可能被导出/日志/分析管道捕获，绝不能把密码哈希
+ * 持久化进去，否则一旦泄露可被离线爆破。
+ */
+function sanitizeUserForKv(u: UserWithGroup): UserWithGroup {
+  const { password, ...safe } = u as UserWithGroup & { password?: unknown };
+  void password;
+  return safe as UserWithGroup;
+}
+
 /** L1 条目。 */
 const l1 = new Map<number, { at: number; user: UserWithGroup }>();
 
@@ -109,7 +120,7 @@ export async function getCachedUser(
 
   if (kv) {
     try {
-      await kv.put(USER_KEY(id), JSON.stringify(user), { expirationTtl: L2_TTL_S });
+      await kv.put(USER_KEY(id), JSON.stringify(sanitizeUserForKv(user)), { expirationTtl: L2_TTL_S });
     } catch {
       // 回填失败无所谓，下次请求会再试
     }
@@ -145,7 +156,7 @@ export async function warmUserCache(env: Env, user: UserWithGroup): Promise<void
   if (!user || !user.id) return;
   l1Set(user.id, user);
   try {
-    await kvFor(env, 'session').put(USER_KEY(user.id), JSON.stringify(user), {
+    await kvFor(env, 'session').put(USER_KEY(user.id), JSON.stringify(sanitizeUserForKv(user)), {
       expirationTtl: L2_TTL_S,
     });
   } catch {

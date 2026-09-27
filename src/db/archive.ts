@@ -152,9 +152,11 @@ export async function archiveAcrossDatabases(
     try {
       const inserted = await new ArchiveRepo(sql).putOnce({ ...args, source: i + 1 });
       // 重复（已存在）也算这个库「有这条归档」，计入成功。
-      if (inserted || true) ok += 1;
-    } catch {
-      // 单库失败不影响其他库；归档不是业务必需路径。
+      ok += 1;
+    } catch (e) {
+      // 单库失败不影响其他库；归档不是业务必需路径。但记一下，便于排障
+      // —— 归档是「只增不改」的凭证，静默丢失比报错更危险。
+      console.error(`archiveAcrossDatabases: write to db #${i + 1} failed`, e);
     }
   }
   return ok;
