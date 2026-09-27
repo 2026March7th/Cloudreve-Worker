@@ -39,13 +39,24 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 
 /**
  * 拒绝危险的 redirect_uri：明文 http（非 localhost 回环）、javascript:/data:/file:
- * 等协议。授权码经 redirect 回传，发到明文 http 会被中间人截获，发到 javascript:
- * 等则直接执行。仅放行 https://、自定义协议（cloudreve:// 等）、localhost 回环。
+ * 等协议、以及 `//host` 协议相对 URL。授权码经 redirect 回传，发到明文 http 会被
+ * 中间人截获，发到 javascript: 等则直接执行。
+ *
+ * 放行：同源相对路径（最安全）、https://、自定义协议（cloudreve:// 等）、localhost 回环。
+ * ⚠️ 同源相对路径必须放行 —— 官方桌面/移动端用的就是 `/callback/desktop` 这种相对回调
+ * （%2Fcallback%2Fdesktop）。注意 `new URL('/callback/desktop')` 因缺少 base 会抛异常，
+ * 若直接拿它做校验会把官方客户端全挡掉（曾导致桌面端报「输入参数有误」）。
  *
  * 该函数只用于无法预登记白名单的 auto_provisioned 客户端（官方闭源端 URI 未知），
  * 作为「接受任意回调」之上的最小安全闸门。
  */
 function assertSafeRedirectUri(uri: string): void {
+  // 同源相对路径：永远跳不出本站，比任何绝对 URL 都安全。
+  if (uri.startsWith('/') && !uri.startsWith('//')) return;
+  // `//host/path` 协议相对：会跳到别的主机（且可能是明文 http），明确拒绝。
+  if (uri.startsWith('//')) {
+    throw new AppError(CodeParamErr, 'Protocol-relative redirect URI is not allowed');
+  }
   let u: URL;
   try {
     u = new URL(uri);
