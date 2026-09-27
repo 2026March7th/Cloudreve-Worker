@@ -311,17 +311,13 @@ export class ShareService {
     const inserted = await this.ctx.shares.addPurchase(shareId, user.id, score);
     if (!inserted) return; // 并发下已被同用户插入，不再转账
 
-    // 积分转移：扣购买者、加分享者
-    const buyerSettings = { ...(buyer.settings ?? {}) };
-    buyerSettings.credit = buyerCredit - score;
-    await this.ctx.users.updateSettings(buyer.id, buyerSettings as Record<string, unknown>);
+    // 积分转移：扣购买者、加分享者。必须用原子增减（并发购买导致的读-改-写覆盖会丢账）。
+    await this.ctx.users.adjustCredit(buyer.id, -score);
 
     if (share.user_shares) {
       const seller = await this.ctx.users.byId(share.user_shares);
       if (seller) {
-        const sellerSettings = { ...(seller.settings ?? {}) };
-        sellerSettings.credit = Number(sellerSettings.credit ?? 0) + score;
-        await this.ctx.users.updateSettings(seller.id, sellerSettings as Record<string, unknown>);
+        await this.ctx.users.adjustCredit(seller.id, score);
       }
     }
 

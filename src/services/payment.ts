@@ -315,12 +315,10 @@ export class PaymentService {
       const size = Math.max(0, Number(snapshot.size ?? 0));
       if (!size) throw Err.param('Invalid storage size');
       const duration = Number(snapshot.duration ?? 0);
-      const packs = Array.isArray(settings.quota_packs) ? [...settings.quota_packs] : [];
-      // 顺带清掉已过期的包，避免 settings 无限膨胀
-      const alive = packs.filter((p) => !p.expire_at || new Date(p.expire_at).getTime() > now);
-      alive.push({ size, expire_at: duration > 0 ? new Date(now + duration * 86400000).toISOString() : null });
-      settings.quota_packs = alive;
-      await users.updateSettings(userId, settings as Record<string, unknown>);
+      const expireAt = duration > 0 ? new Date(now + duration * 86400000).toISOString() : null;
+      // 原子追加：并发兑换两张礼品卡时，旧的「读整份 settings → 改 → 整行覆盖写」
+      // 会让第二笔覆盖第一笔，用户付了钱却丢包。这里走 JSONB 数组追加，天然幂等。
+      await this.ctx.users.addQuotaPack(userId, { size, expire_at: expireAt });
       logAudit(this.ctx, 'storage_added', userId, { size });
       return;
     }
@@ -345,11 +343,10 @@ export class PaymentService {
       return;
     }
 
-    // credit
+    // credit：同样必须原子累加（见上 storage 分支的并发覆盖说明）
     const credit = Math.max(0, Number(snapshot.credit ?? 0));
     if (!credit) throw Err.param('Invalid credit amount');
-    settings.credit = Number(settings.credit ?? 0) + credit;
-    await users.updateSettings(userId, settings as Record<string, unknown>);
+    await this.ctx.users.adjustCredit(userId, credit);
     logAudit(this.ctx, 'points_change', userId, { credit, reason: 'purchase' });
   }
 

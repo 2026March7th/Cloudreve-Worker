@@ -117,7 +117,10 @@ sessionRoutes.get('/prepare', async (c) => {
 /** OIDC 登录：生成 state/PKCE 后 302 跳转到 IdP。 */
 sessionRoutes.get('/oidc/login', async (c) => {
   const ctx = ctxOf(c);
-  const returnTo = c.req.query('redirect') ?? '/home';
+  // return_to 会被存进登录态并最终决定登录后跳去哪：必须是同源相对路径。
+  // 拒绝 `//host`（协议相对）、绝对 URL 与 `javascript:` 等，防开放重定向。
+  const rawRedirect = c.req.query('redirect') ?? '/home';
+  const returnTo = rawRedirect.startsWith('/') && !rawRedirect.startsWith('//') ? rawRedirect : '/home';
   try {
     const url = await buildAuthorizeUrl(ctx, returnTo);
     return c.redirect(url, 302);

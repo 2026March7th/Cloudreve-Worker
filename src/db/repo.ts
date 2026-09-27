@@ -377,6 +377,34 @@ export class UserRepo {
     await this.touchCache(id);
   }
 
+  /** 原子给某用户追加一个容量包（JSONB 数组追加，避免并发读写覆盖导致丢包）。 */
+  async addQuotaPack(
+    userId: number,
+    pack: { size: number; expire_at: string | null },
+  ): Promise<void> {
+    await this.sql`
+      UPDATE users SET settings = jsonb_set(
+        COALESCE(settings, '{}'::jsonb),
+        '{quota_packs}',
+        COALESCE(settings->'quota_packs', '[]'::jsonb) || ${JSON.stringify([pack])}::jsonb,
+        true
+      ), updated_at = now() WHERE id = ${userId}
+    `;
+    await this.touchCache(userId);
+  }
+
+  /** 原子增减积分（并发购买/兑换不会互相覆盖）。delta 为负即扣减。 */
+  async adjustCredit(userId: number, delta: number): Promise<void> {
+    await this.sql`
+      UPDATE users SET settings = jsonb_set(
+        COALESCE(settings, '{}'::jsonb),
+        '{credit}',
+        to_jsonb(COALESCE((settings->>'credit')::numeric, 0) + ${delta})
+      ), updated_at = now() WHERE id = ${userId}
+    `;
+    await this.touchCache(userId);
+  }
+
   /** 按已归属实体的实际大小重算容量（用于校正漂移）。 */
   async recalcStorage(id: number): Promise<number> {
     const rows = (await this.sql`
@@ -1201,6 +1229,20 @@ export class EntityRepo {
     await this.sql`
       UPDATE entities SET upload_session_id = NULL, updated_at = now() WHERE id = ${id}
     `;
+  }
+
+  /**
+   * 原子抢占上传会话：仅当 entities.upload_session_id 仍等于本次会话时才清零并返回，
+   * 否则（已被并发/重试的另一次收尾清零）返回 false。这是收尾防重入的权威锁，
+   * 比 KV 完成标记可靠（KV 写是弱一致、存在竞态窗口，check-then-set 会漏）。
+   */
+  async claimUploadSession(id: number, sessionId: string): Promise<boolean> {
+    const rows = (await this.sql`
+      UPDATE entities SET upload_session_id = NULL, updated_at = now()
+      WHERE id = ${id} AND upload_session_id = ${sessionId}::uuid
+      RETURNING id
+    `) as { id: number }[];
+    return rows.length > 0;
   }
 
   /** 增加引用计数（多个文件共用同一份内容时）。 */

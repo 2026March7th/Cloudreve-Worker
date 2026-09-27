@@ -397,8 +397,9 @@ export class UploadService {
   // -------------------------------------------------------------------------
 
   private async finishUpload(session: UploadSession): Promise<void> {
-    // 防重入：并发/晚到的分片请求可能重建 KV 会话并再次触发收尾，导致重复容量
-    // 记账、重复转正。用一把 KV 完成标记拦截 —— 已完成过的直接跳过。
+    // 快速重试拦截：已完成过的会话直接跳过（省掉一次远端 completeUpload）。
+    // 注意 KV 写是弱一致、且这里是 check-then-set，单独靠它挡不住真并发 ——
+    // 防重复容量记账由下面「记账前的 DB 原子抢占」兜底。
     const doneKey = `upload:done:${session.id}`;
     const uploadKv = kvFor(this.ctx.env, 'upload');
     try {
@@ -433,12 +434,21 @@ export class UploadService {
       // 校验本身失败（网络问题等）不阻断上传
     }
 
-    // 实体转正：清掉 upload_session_id，标记为可用
-    await this.ctx.entities.clearUploadSession(session.entityId);
+    // 实体转正：补全大小并挂到文件上。
+    // 注意别在这里提前调用 clearUploadSession —— 它会无条件把 upload_session_id
+    // 清零，导致下面「记账前的原子抢占」永远抢不到（条件就是它仍等于本会话），
+    // 结果是容量永远不记账。清零由 claimUploadSession 一并完成。
     await this.ctx.entities.updateSize(session.entityId, session.size);
     await this.ctx.entities.linkFile(session.fileId, session.entityId);
     await this.ctx.files.updatePrimaryEntity(session.fileId, session.entityId);
     await this.ctx.files.updateSize(session.fileId, session.size);
+
+    // 容量记账必须且只能记一次 —— 重复记账等于白扣用户空间，是最危险的一步。
+    // KV 标记是弱一致 + check-then-set，并发下两者都会通过检查；这里用 DB 行锁做
+    // 原子抢占：只有第一个请求能把 entities.upload_session_id 清零并继续记账。
+    // 放在记账前而不是函数开头，是为了保留「收尾中途失败后可重试」的能力。
+    const claimed = await this.ctx.entities.claimUploadSession(session.entityId, session.id);
+    if (!claimed) return; // 已被并发/重试的另一次收尾记账（其上的转正操作都是幂等的）
 
     // 容量记账
     await this.ctx.users.addStorage(session.uid, session.size);
@@ -483,7 +493,7 @@ export class UploadService {
       }
     }
 
-    // 收尾成功，打上完成标记（防重入）。TTL 10 分钟足够覆盖一次上传的并发窗口。
+    // 收尾成功，打上完成标记（后续重复请求可快速跳过）。TTL 10 分钟足够覆盖一次上传的并发窗口。
     try {
       await uploadKv.put(doneKey, '1', { expirationTtl: 600 });
     } catch {

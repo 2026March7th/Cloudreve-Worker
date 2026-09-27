@@ -42,6 +42,9 @@ const DAV_PREFIX = '/dav';
 /** 锁的默认时长（秒），客户端没给 Timeout 时用。 */
 const LOCK_DEFAULT_TTL = 600;
 
+/** PROPFIND 单目录最多枚举的子项数，超出则截断（防超大目录把响应体撑爆 Worker 内存）。 */
+const PROPFIND_MAX = 5000;
+
 /** 只读账号禁用的位号（DavAccountReadOnly）。 */
 const DAV_OPT_READONLY = 0;
 
@@ -159,9 +162,13 @@ function davResponseXml(args: {
   modifiedAt: Date;
   contentType?: string;
 }): string {
+  // getetag：Windows 的 WebClient(MRxDAV) 依赖它做资源身份/缓存判定，缺失会导致
+  // 文件打不开、列表显示陈旧内容，甚至挂载后无法进入目录。
+  const etag = `"${args.size}-${Math.floor(args.modifiedAt.getTime() / 1000)}"`;
   const props = [
     `<D:displayname>${escapeXml(args.displayName)}</D:displayname>`,
     `<D:getlastmodified>${httpDate(args.modifiedAt)}</D:getlastmodified>`,
+    `<D:getetag>${etag}</D:getetag>`,
     args.isCollection ? '<D:resourcetype><D:collection/></D:resourcetype>' : '<D:resourcetype/>',
     args.isCollection ? '' : `<D:getcontentlength>${args.size}</D:getcontentlength>`,
     args.isCollection
@@ -215,7 +222,12 @@ function hrefFor(target: URI, isDir: boolean): string {
     .split('/')
     .map((seg) => (seg === '' ? '' : encodeURIComponent(seg)))
     .join('/');
-  return `${DAV_PREFIX}${encoded === '' ? '' : encoded}${isDir && !encoded.endsWith('/') ? '/' : ''}`;
+  // 集合资源（目录）的 href 必须以 / 结尾。Windows 的 WebClient 会拿响应里的
+  // <D:href> 与请求 URL 逐字节比对，若不一致（比如请求 /dav/ 却回 /dav）就报
+  // “找不到网络路径”，导致映射网络驱动器直接失败。根目录同样给 /dav/ 而非 /dav。
+  const withSlash = isDir && !encoded.endsWith('/') ? `${encoded}/` : encoded;
+  const full = `${DAV_PREFIX}${withSlash}`;
+  return full === DAV_PREFIX ? `${DAV_PREFIX}/` : full;
 }
 
 davRoutes.on('OPTIONS', '*', (c) => {
@@ -259,7 +271,7 @@ davRoutes.on('PROPFIND', '*', async (c) => {
   if (isDir && depth === 1) {
     const list = await fs.list(uri, {
       page: 0,
-      pageSize: 100000,
+      pageSize: PROPFIND_MAX,
       orderBy: 'name',
       orderDirection: 'asc',
     });
@@ -278,8 +290,12 @@ davRoutes.on('PROPFIND', '*', async (c) => {
     }
   }
 
-  return c.body(multistatus(responses), 207, {
+  const xml = multistatus(responses);
+  // Windows WebClient 拒绝分块（Transfer-Encoding: chunked）的 WebDAV 响应，
+  // 必须带显式 Content-Length；Workers 对字符串体通常会自动算，这里再显式保底。
+  return c.body(xml, 207, {
     'Content-Type': 'application/xml; charset=utf-8',
+    'Content-Length': String(new TextEncoder().encode(xml).length),
   });
 });
 
@@ -316,6 +332,7 @@ davRoutes.on(['GET', 'HEAD'], '*', async (c) => {
   c.header('Content-Type', content.contentType ?? 'application/octet-stream');
   c.header('Accept-Ranges', 'bytes');
   c.header('Last-Modified', httpDate(file.updated_at ?? new Date()));
+  c.header('ETag', `"${Number(file.size ?? 0)}-${Math.floor((file.updated_at ?? new Date()).getTime() / 1000)}"`);
 
   if (content.contentRange && c.req.header('Range')) {
     // 上游存储按 206 语义应答（content-range 已带），这里同样回 206
