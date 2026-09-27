@@ -1545,12 +1545,20 @@ export class DirectLinkRepo {
     `;
   }
 
-  /** 按文件 ID 批量软删直链（彻底删除文件前调用，避免外键约束阻止）。 */
+  /**
+   * 按文件 ID 批量**硬删**直链（彻底删除文件前调用，解除外键约束）。
+   *
+   * ⓵ 必须硬删、不能软删：`direct_links_file_id_fkey` 是 `ON DELETE NO ACTION`，
+   *    软删只在 `deleted_at` 打标、物理行仍在，删 `files` 时外键照样挡（报
+   *    `update or delete on table "files" violates foreign key constraint
+   *    "direct_links_file_id_fkey"`）。只有物理删除直链行才能让文件被删掉。
+   * ⓶ 本方法只被 `FileSystemService.purge()` 调用（删文件前先清掉它的直链），
+   *    文件都要没了，直链无需保留，硬删是正确的语义。
+   */
   async deleteByFileIds(fileIds: number[]): Promise<void> {
     if (fileIds.length === 0) return;
     await this.sql`
-      UPDATE direct_links SET deleted_at = now(), updated_at = now()
-      WHERE file_id = ANY(${fileIds}::int[]) AND deleted_at IS NULL
+      DELETE FROM direct_links WHERE file_id = ANY(${fileIds}::int[])
     `;
   }
 }

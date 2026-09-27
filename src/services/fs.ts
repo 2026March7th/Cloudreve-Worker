@@ -1216,12 +1216,16 @@ export class FileSystemService {
     const path = await this.pathOf(file);
     const restoreUri = URI.my(path).toString();
 
+    // 先写 restore_uri（最早做）。进回收站的文件必须有它，否则后续任一步
+    // 抛错都会留下「在回收站却无法还原」的孤儿；一旦先 moveToTrash 再在索引
+    // 删除那步失败，恢复标记就没机会写，还原时会 403 卡死。
+    await this.ctx.metadata.upsert(file.id, MetadataRestoreUri, restoreUri, true);
+
     await this.ctx.files.moveToTrash([file.id]);
 
-    // 进回收站的文件不该再被搜到：从全文索引剔除，恢复时重建
-    await new SearchService(this.ctx).deleteByFileIds([file.id]);
-
-    await this.ctx.metadata.upsert(file.id, MetadataRestoreUri, restoreUri, true);
+    // 进回收站的文件不该再被搜到：从全文索引剔除，恢复时重建。
+    // 索引服务异常（如 Meilisearch 抖动）绝不应阻断回收站逻辑，吞掉即可。
+    await new SearchService(this.ctx).deleteByFileIds([file.id]).catch(() => undefined);
 
     const retention = this.ctx.user?.group.settings?.trash_retention ?? 0;
     if (retention > 0) {
@@ -1368,7 +1372,18 @@ export class FileSystemService {
       const mark = marks.find((m) => m.name === MetadataRestoreUri);
       const original = mark ? URI.tryParse(mark.value) : null;
       if (!original) {
-        throw new AppError(CodeNoPermissionErr, 'Not supported action');
+        // 兜底：兼容早期版本 / 异常遗留的脏数据 —— 没有 restore_uri 也能还原
+        // （落到根目录），避免用户被 403 永远卡在回收站里。正常路径不会走到这里。
+        const root = await this.ctx.files.ensureRoot(user.id);
+        await this.ctx.files.rename(file.id, file.name);
+        await this.ctx.files.updateParent(file.id, root.id);
+        await this.ctx.metadata.remove(file.id, MetadataRestoreUri).catch(() => undefined);
+        await this.ctx.metadata.remove(file.id, MetadataExpectedCollectTime).catch(() => undefined);
+        const restored = await this.ctx.files.byId(file.id);
+        if (restored) {
+          await new SearchService(this.ctx).indexFile(restored).catch(() => undefined);
+        }
+        continue;
       }
 
       // 目标目录 = 原路径的父目录。原目录也已被删的话，这里会解析不到。
