@@ -64,6 +64,18 @@ export interface ServeEntityResult {
 /** 直链 URL 的路径前缀（原版是 /f/:id/:name，签名后可见）。 */
 export const DIRECT_LINK_PREFIX = '/f';
 
+/**
+ * 「空文件」预览用的地址。
+ *
+ * 新建文件（`POST /file/create`）只写 files 行、不建 entity，所以这类文件在
+ * 写入首个内容前没有可下载的实体。前端查看器拿到 `/file/url` 的结果后会直接
+ * `fetch(url)` 取内容：这里若抛错，`MarkdownViewer` 的 catch 会立刻
+ * `closeViewer()` —— 表现就是「新建的 .md 点开就没了」。返回一个空内容的
+ * data URL，查看器就以空白打开；用户编辑后保存会经 `overwriteContent` 建出
+ * 首个 entity。下载请求不走这条（没有内容可下，照旧报错）。
+ */
+const EMPTY_CONTENT_URL = 'data:text/plain;charset=utf-8,';
+
 export class DownloadService {
   constructor(
     private readonly ctx: AppContext,
@@ -95,7 +107,22 @@ export class DownloadService {
         if (shareId !== null) await this.ctx.shares.incrementDownloads(shareId);
       }
 
-      const entity = await this.primaryEntityOf(file, options.entity);
+      let entity: EntityRow;
+      try {
+        entity = await this.primaryEntityOf(file, options.entity);
+      } catch (e) {
+        // 新建但还没写过内容的文件没有 entity（见 EMPTY_CONTENT_URL 注释）。
+        // 只有「预览」需要容错；下载仍按原逻辑报错。
+        if (
+          options.download !== true &&
+          e instanceof AppError &&
+          e.code === CodeEntityNotExist
+        ) {
+          urls.push({ url: EMPTY_CONTENT_URL });
+          continue;
+        }
+        throw e;
+      }
       const name = file.name;
 
       const policy = await this.ctx.policies.byId(entity.storage_policy_entities);
