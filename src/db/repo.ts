@@ -885,7 +885,16 @@ export class FileRepo {
       conds.push(`f.file_children = ${add(args.parentId)}`);
     }
 
-    if (args.ownerId !== null && args.ownerId !== undefined) {
+    // 与官方 `childFileQuery`（inventory/file_utils.go:118-141）对齐：
+    //   查「**指定父目录**的子项」时官方走 `QueryChildren(root)`，只看
+    //   `file_children`，**不加 owner 过滤**；owner 只用于「按属主划范围」的
+    //   查询（根/孤儿 parentId=null、回收站、分享给我）。
+    //
+    // 之前对所有查询都叠 `owner_id`：只要子项属主与目录属主不一致（历史数据、
+    // 跨账号写入等），整个目录就会被列成空 —— 分享链接因此看起来「失效」。
+    const ownerScoped =
+      args.parentId === null || args.trash === true || args.sharedWithMe === true;
+    if (ownerScoped && args.ownerId !== null && args.ownerId !== undefined) {
       conds.push(`f.owner_id = ${add(args.ownerId)}`);
     }
     if (args.typeFilter !== null && args.typeFilter !== undefined) {
