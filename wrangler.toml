@@ -116,6 +116,12 @@ preview_id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID_PREVIEW"
 directory = "./frontend"
 binding = "ASSETS"
 not_found_handling = "single-page-application"
+# 关掉「自动去 .html 后缀」的重定向。
+# 默认的 auto-trailing-slash 会把 /index.html 307 到 /、/pdfviewer.html 307 到
+# /pdfviewer：前端 Service Worker 预缓存这两个文件时拿到的是 307，workbox 判为
+# 坏响应，Chrome 直接 ERR_FAILED（Firefox 会回退网络所以看不出来）。
+# 设 none 后 .html 原样 200，其余未知路径仍交给 not_found_handling 回退 index.html。
+html_handling = "none"
 run_worker_first = ["/api/*", "/s/*", "/f/*", "/dav/*", "/manifest.json"]
 
 # ---------------------------------------------------------------------------
