@@ -126,7 +126,18 @@ fileRoutes.get('/info', async (c) => {
     } else {
       return fail(c, Err.param('uri or id is required'));
     }
-    return ok(c, await service.buildFileResponse(file, { extended, folderSummary: wantSummary }));
+    // 必须把「请求视角」传进响应构造：分享 URI 要走分享视图的 path 与
+    // capability。不传的话 buildFileResponse 会回落到属主视角
+    // （`cloudreve://my/<path>` + my 的能力位），前端拿这个 path 导航会跳到
+    // 「我的文件」（匿名访客进不去），表现就是分享链接「点开就失效」。
+    return ok(
+      c,
+      await service.buildFileResponse(file, {
+        extended,
+        folderSummary: wantSummary,
+        uri: rawUri ? URI.parse(rawUri) : undefined,
+      }),
+    );
   } catch (e) {
     return fail(c, e);
   }
