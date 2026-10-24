@@ -43,9 +43,15 @@ function isCacheable(c: Context<Bindings>): boolean {
   return PING_RE.test(p);
 }
 
-/** 各类响应的缓存时长（秒）。列表变化快，给短一点。 */
+/**
+ * 各类响应的缓存时长（秒）。
+ *
+ * 分享目录列表 60s：内容只在属主上传/删除时变，属主自己看分享会带
+ * Authorization（走另一条路，不吃这份缓存），所以访客看到几十秒前的目录
+ * 完全可接受；换成 10s 的话命中率太低，等于白缓存。
+ */
 function ttlOf(c: Context<Bindings>): number {
-  return c.req.path === '/api/v4/file' ? 10 : 60;
+  return 60;
 }
 
 const CONFIG_RE = /^\/api\/v4\/site\/config\//;
