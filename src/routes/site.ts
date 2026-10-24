@@ -109,7 +109,15 @@ siteRoutes.get('/edge-cache-status', async (c) => {
 
   const origin = new URL(c.req.url).origin;
   const key = `${origin}/__edge_cache_probe__`;
-  const out: Record<string, unknown> = { available: true, key };
+  const mode = new URL(c.req.url).searchParams.get('mode') ?? 'roundtrip';
+  const out: Record<string, unknown> = { available: true, key, mode };
+
+  // mode=check：只读，不写 —— 用来验证「上一次别的请求写进去的还在不在」。
+  if (mode === 'check') {
+    const hit = await cache.match(new Request(key, { method: 'GET' }));
+    out.match = hit ? `ok (${await hit.text()})` : 'miss';
+    return ok(c, out);
+  }
 
   try {
     const req = new Request(key, { method: 'GET' });
