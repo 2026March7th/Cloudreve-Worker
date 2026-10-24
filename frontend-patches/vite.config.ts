@@ -42,8 +42,13 @@ export default defineConfig({
           "**/html.worker-*",
           "**/json.worker-*",
           "**/editor.worker-*",
+          // 大小写都要写：rollup 的 chunk 名有时是 `MonacoEditor-`、`Excalidraw-`
+          // （大驼峰来自组件名），glob 在 Linux 上区分大小写
           "**/monaco-*",
+          "**/MonacoEditor-*",
           "**/excalidraw-*",
+          "**/Excalidraw-*",
+          "**/ImageEditor-*",
           "**/mermaid-*",
           "**/codemirror-*",
           "**/Lightbox-*",

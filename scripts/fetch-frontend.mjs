@@ -60,7 +60,9 @@ function patchFingerprint() {
   const h = createHash('sha256');
   for (const f of files) {
     h.update(path.relative(dir, f).replaceAll('\\', '/'));
-    h.update(readFileSync(f));
+    // 统一换行再哈希：Windows 工作区是 CRLF、CI 检出是 LF，不统一的话同一份
+    // 补丁在两个平台算出不同包名，本机会永远下载不到 CI 发的包。
+    h.update(readFileSync(f, 'utf8').replaceAll('\r\n', '\n'));
   }
   return h.digest('hex').slice(0, 8);
 }
