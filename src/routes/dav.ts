@@ -18,7 +18,9 @@
  * 已知取舍（写在明处，别装没看见）：
  *   - `share://` 账号在挂载时按 403 处理：上游要 walk 分享树逐层校验，边缘版
  *     第一版只做 `my://`，有真实需求再补；
- *   - LOCK 是 KV 简化锁（够 Windows/RaiDrive 走完写流程），不是完整的 RFC 4918 锁系统。
+ *   - LOCK 实现了 RFC 4918 的写锁：exclusive / shared、Depth 0 / infinity、
+ *     Timeout 续期、UNLOCK，并在 PUT / MKCOL / DELETE / COPY / MOVE / PROPPATCH
+ *     上校验 If 头里的 lock token（缺 token → 423 Locked）。
  */
 import { Hono } from 'hono';
 import type { AppBindings, AppRequest } from '../middleware/app';
@@ -44,6 +46,13 @@ const LOCK_DEFAULT_TTL = 600;
 
 /** PROPFIND 单目录最多枚举的子项数，超出则截断（防超大目录把响应体撑爆 Worker 内存）。 */
 const PROPFIND_MAX = 5000;
+
+/** LOCK 能力声明（RFC 4918 §15.10）：exclusive 与 shared 都支持。 */
+const SUPPORTED_LOCK_XML =
+  '<D:supportedlock>' +
+  '<D:lockentry><D:lockscope><D:exclusive/></D:lockscope><D:locktype><D:write/></D:locktype></D:lockentry>' +
+  '<D:lockentry><D:lockscope><D:shared/></D:lockscope><D:locktype><D:write/></D:locktype></D:lockentry>' +
+  '</D:supportedlock>';
 
 /** 只读账号禁用的位号（DavAccountReadOnly）。 */
 const DAV_OPT_READONLY = 0;
@@ -161,6 +170,8 @@ function davResponseXml(args: {
   size: number;
   modifiedAt: Date;
   contentType?: string;
+  /** 已序列化的 <D:lockdiscovery>（RFC 4918 §15.8），没有活动锁时给空元素。 */
+  lockDiscovery?: string;
 }): string {
   // getetag：Windows 的 WebClient(MRxDAV) 依赖它做资源身份/缓存判定，缺失会导致
   // 文件打不开、列表显示陈旧内容，甚至挂载后无法进入目录。
@@ -175,7 +186,8 @@ function davResponseXml(args: {
       ? ''
       : `<D:getcontenttype>${escapeXml(args.contentType ?? 'application/octet-stream')}</D:getcontenttype>`,
     `<D:creationdate>${args.modifiedAt.toISOString()}</D:creationdate>`,
-    `<D:supportedlock><D:lockentry><D:lockscope><D:exclusive/></D:lockscope><D:locktype><D:write/></D:locktype></D:lockentry></D:supportedlock>`,
+    SUPPORTED_LOCK_XML,
+    args.lockDiscovery ?? '<D:lockdiscovery/>',
   ]
     .filter(Boolean)
     .join('');
@@ -258,6 +270,29 @@ davRoutes.on('PROPFIND', '*', async (c) => {
 
   const responses: string[] = [];
   const isDir = isFolderRow(fs, file);
+
+  // 活动锁一次性取出（锁数量很少），每个资源按「覆盖关系」挂自己的 lockdiscovery：
+  // 上级目录的 Depth:infinity 锁也会出现在子项的 lockdiscovery 里（RFC 4918 §6.1）。
+  const kv = kvFor(ctx.env, 'upload');
+  const activeLocks = await loadLocks(kv);
+  const recordCache = new Map<string, DavLock>();
+  const lockDiscoveryFor = async (path: string): Promise<string> => {
+    const covering = activeLocks.filter((l) => lockCovers(l.path, l.depth, path));
+    if (covering.length === 0) return '<D:lockdiscovery/>';
+    const records: DavLock[] = [];
+    for (const l of covering) {
+      let record = recordCache.get(l.token);
+      if (!record) {
+        const raw = await kv.get(lockKey(l.token));
+        if (!raw) continue;
+        record = JSON.parse(raw) as DavLock;
+        recordCache.set(l.token, record);
+      }
+      records.push(record);
+    }
+    return lockDiscoveryXml(records);
+  };
+
   responses.push(
     davResponseXml({
       href: hrefFor(uri, isDir),
@@ -265,6 +300,7 @@ davRoutes.on('PROPFIND', '*', async (c) => {
       isCollection: isDir,
       size: Number(file.size ?? 0),
       modifiedAt: file.updated_at ?? new Date(),
+      lockDiscovery: await lockDiscoveryFor(decodedPath(uri)),
     }),
   );
 
@@ -285,6 +321,7 @@ davRoutes.on('PROPFIND', '*', async (c) => {
           isCollection: childIsDir,
           size: Number(item.size ?? 0),
           modifiedAt: new Date(item.updated_at ?? Date.now()),
+          lockDiscovery: await lockDiscoveryFor(decodedPath(childUri)),
         }),
       );
     }
@@ -367,6 +404,9 @@ davRoutes.on('PUT', '*', async (c) => {
     return c.body(null, 405); // 目标是目录
   }
 
+  const blocked = await lockedWriteResponse(c, [uri]);
+  if (blocked) return blocked;
+
   try {
     if (!existing) {
       // 先建文件行（父目录不存在会抛 CodeParentNotExist → 409）
@@ -393,6 +433,8 @@ davRoutes.on('MKCOL', '*', async (c) => {
   if (!uri.elements.length) return c.body(null, 405);
 
   const fs = new FileSystemService(ctx);
+  const blocked = await lockedWriteResponse(c, [uri]);
+  if (blocked) return blocked;
   try {
     await fs.create(uri, 'folder', { errOnConflict: true });
     return c.body(null, 201);
@@ -408,6 +450,9 @@ davRoutes.on('DELETE', '*', async (c) => {
   if (!uri || !uri.elements.length) return c.body(null, 403); // 不能删根
 
   const fs = new FileSystemService(ctx);
+  // 删目录时，树内子孙上的锁同样要求携带 token（RFC 4918 §7.5）
+  const blocked = await lockedWriteResponse(c, [uri], { includeDescendants: true });
+  if (blocked) return blocked;
   try {
     await fs.delete([uri], { skipSoftDelete: true });
     return c.body(null, 204);
@@ -448,6 +493,14 @@ davRoutes.on(['COPY', 'MOVE'], '*', async (c) => {
   const isCopy = c.req.method === 'COPY';
   const overwrite = (c.req.header('Overwrite') ?? 'T').toUpperCase() !== 'F';
 
+  // MOVE 会改动源，COPY 只读源；目标两者都要写 —— 两侧都过锁校验
+  const blocked = await lockedWriteResponse(
+    c,
+    isCopy ? [dstUri] : [srcUri, dstUri],
+    { includeDescendants: !isCopy },
+  );
+  if (blocked) return blocked;
+
   try {
     const src = await fs.mustResolve(srcUri);
     const dst = await fs.resolve(dstUri);
@@ -477,6 +530,8 @@ davRoutes.on(['COPY', 'MOVE'], '*', async (c) => {
     // 落在该目录里），必须走 rename 直改；rename 自带同名冲突校验。
     if (!isCopy && targetParent.path === srcUri.parent().path) {
       await fs.rename(srcUri, targetName);
+      // 锁跟着资源走（RFC 4918 §7.5）
+      await moveLockRoots(c, decodedPath(srcUri), decodedPath(targetParent.child(targetName)));
       return c.body(null, 201);
     }
 
@@ -487,6 +542,9 @@ davRoutes.on(['COPY', 'MOVE'], '*', async (c) => {
       const childUri = targetParent.child(srcUri.name);
       await fs.rename(childUri, targetName);
     }
+    if (!isCopy) {
+      await moveLockRoots(c, decodedPath(srcUri), decodedPath(targetParent.child(targetName)));
+    }
     return c.body(null, isCopy ? 204 : 201);
   } catch (e) {
     console.error('webdav copy/move failed', e);
@@ -495,9 +553,12 @@ davRoutes.on(['COPY', 'MOVE'], '*', async (c) => {
 });
 
 davRoutes.on('PROPPATCH', '*', async (c) => {
-  // 属性修改（如修改时间）不支持但也不阻塞客户端 —— 逐属性标 403
+  // 属性修改（如修改时间）不支持但也不阻塞客户端 —— 逐属性标 403。
+  // 但被锁的资源仍要先按 RFC 4918 §9.2 校验 token（否则 423）。
   const uri = targetUri(c);
   if (!uri) return c.body(null, 404);
+  const blocked = await lockedWriteResponse(c, [uri]);
+  if (blocked) return blocked;
   const href = `${DAV_PREFIX}${uri.path}`;
   const xml =
     `<?xml version="1.0" encoding="utf-8"?><D:multistatus xmlns:D="DAV:">` +
@@ -508,11 +569,290 @@ davRoutes.on('PROPPATCH', '*', async (c) => {
 });
 
 // ---------------------------------------------------------------------------
-// 简化锁（KV）
+// RFC 4918 写锁（exclusive / shared，Depth 0 / infinity）
 // ---------------------------------------------------------------------------
+//
+// 存储用 upload 角色的 KV：
+//   dav_lock:<token> → DavLock(JSON)，带 expirationTtl，过期自动回收；
+//   同时在 KV metadata 里放「覆盖判定」需要的字段 —— 一次 list 就能判断
+//   某路径有没有被锁，不必为每个候选锁再 get 一次。
+//
+// 一致性取舍：KV list 是最终一致的（同一 colo 内基本即时）。WebDAV 客户端
+// 都是 LOCK 成功之后才写，同 colo 命中，实测可用；要强一致得把锁表搬进主库，
+// 每次写多一次跨区往返 —— 这里选延迟。
+
+const LOCK_MAX_TTL = 7 * 24 * 3600; // 7 天；Timeout: Infinite 也按它封顶
+const LOCK_KEY_PREFIX = 'dav_lock:';
+
+type LockScope = 'exclusive' | 'shared';
+type LockDepth = '0' | 'infinity';
+
+interface DavLock {
+  token: string;
+  /** 锁根：逐段已解码的账号内路径（如 `/docs/a b.txt`） */
+  path: string;
+  isDir: boolean;
+  depth: LockDepth;
+  scope: LockScope;
+  /** <D:owner> 的内部内容（已是可回写的 XML） */
+  owner: string;
+  /** 属主用户 id：只有本人能续期 / 解锁 */
+  principal: number;
+  createdAt: number;
+  expiresAt: number;
+}
+
+/** KV metadata：覆盖判定只需要这些字段。 */
+interface DavLockMeta {
+  path: string;
+  depth: LockDepth;
+  scope: LockScope;
+  principal: number;
+  expiresAt: number;
+}
 
 function lockKey(token: string): string {
-  return `dav_lock:${token}`;
+  return `${LOCK_KEY_PREFIX}${token}`;
+}
+
+/** 逐段解码的规范路径：URI.path 可能是编码过的（child() 会编码），锁比较统一用它。 */
+function decodedPath(uri: URI): string {
+  return uri.elements.length === 0 ? '/' : `/${uri.elements.join('/')}`;
+}
+
+/** href：逐段编码，目录补尾斜杠（与 hrefFor 保持一致）。 */
+function pathHref(path: string, isDir = false): string {
+  const encoded = path
+    .split('/')
+    .map((seg) => (seg === '' ? '' : encodeURIComponent(seg)))
+    .join('/');
+  const withSlash = isDir && !encoded.endsWith('/') ? `${encoded}/` : encoded;
+  const full = `${DAV_PREFIX}${withSlash}`;
+  return full === DAV_PREFIX ? `${DAV_PREFIX}/` : full;
+}
+
+/** `Timeout: Second-3600, Infinite` → 秒数。缺省 10 分钟，封顶 7 天。 */
+function parseTimeout(header: string | undefined): number {
+  const m = /Second-(\d+)/i.exec(header ?? '');
+  if (m) {
+    const n = Number(m[1]);
+    if (Number.isFinite(n) && n > 0) return Math.min(n, LOCK_MAX_TTL);
+  }
+  if (/Infinite/i.test(header ?? '')) return LOCK_MAX_TTL;
+  return LOCK_DEFAULT_TTL;
+}
+
+/** 解析 <D:lockinfo>；没有 lockinfo 说明是「续期」请求（RFC 4918 §9.10.2）。 */
+function parseLockInfo(xml: string): { scope: LockScope; owner: string } | null {
+  if (!/<(?:\w+:)?lockinfo\b/i.test(xml)) return null;
+  const scope: LockScope = /<(?:\w+:)?shared\b[^>]*>/i.test(xml) ? 'shared' : 'exclusive';
+  const owner = /<(?:\w+:)?owner\b[^>]*>([\s\S]*?)<\/(?:\w+:)?owner>/i.exec(xml);
+  const rawOwner = owner ? owner[1]!.trim() : '';
+  // owner 内部本身是 XML（通常是 <D:href>）就原样回写；纯文本转义后当文本节点
+  return { scope, owner: rawOwner.includes('<') ? rawOwner : escapeXml(rawOwner) };
+}
+
+function parseLockToken(header: string | undefined): string | null {
+  const m = /opaquelocktoken:([^>\s,]+)/i.exec(header ?? '');
+  return m ? m[1]! : null;
+}
+
+interface IfCondition {
+  not: boolean;
+  token?: string;
+  etag?: string;
+}
+
+interface IfList {
+  /** Resource-Tag（可缺省） */
+  tag?: string;
+  conditions: IfCondition[];
+}
+
+/**
+ * 解析 If 头（RFC 4918 §10.4）。只关心状态令牌；ETag 条件保留但暂不求值。
+ * 顶层 `<...>` 一律视为 Resource-Tag —— 状态令牌只会出现在括号列表内部。
+ */
+function parseIfHeader(raw: string | undefined): IfList[] {
+  if (!raw) return [];
+  const lists: IfList[] = [];
+  let tag: string | undefined;
+  let i = 0;
+  while (i < raw.length) {
+    const ch = raw[i]!;
+    if (ch === '(') {
+      const end = raw.indexOf(')', i);
+      if (end < 0) break;
+      const inner = raw.slice(i + 1, end);
+      const conditions: IfCondition[] = [];
+      const re = /(Not\s+)?(?:<([^>]*)>|\[([^\]]*)\])/gi;
+      let m: RegExpExecArray | null;
+      while ((m = re.exec(inner))) {
+        const not = Boolean(m[1]);
+        if (m[2] !== undefined) {
+          const token = parseLockToken(m[2]);
+          if (token) conditions.push({ not, token });
+        } else if (m[3] !== undefined) {
+          conditions.push({ not, etag: m[3].trim() });
+        }
+      }
+      lists.push({ tag, conditions });
+      tag = undefined;
+      i = end + 1;
+      continue;
+    }
+    if (ch === '<') {
+      const end = raw.indexOf('>', i);
+      if (end < 0) break;
+      tag = raw.slice(i + 1, end).trim();
+      i = end + 1;
+      continue;
+    }
+    i += 1;
+  }
+  return lists;
+}
+
+/** If 头里是否有「肯定断言」该 token（被 Not 否定的不算）。 */
+function ifAssertsToken(lists: IfList[], token: string): boolean {
+  for (const list of lists) {
+    if (list.conditions.some((cond) => cond.not && cond.token === token)) continue;
+    if (list.conditions.some((cond) => !cond.not && cond.token === token)) return true;
+  }
+  return false;
+}
+
+/** 读全部活动锁（只读 metadata，不取值）。 */
+async function loadLocks(kv: KVNamespace): Promise<Array<DavLockMeta & { token: string }>> {
+  const now = Date.now();
+  const out: Array<DavLockMeta & { token: string }> = [];
+  let cursor: string | undefined;
+  for (let guard = 0; guard < 10; guard += 1) {
+    const page = await kv.list({ prefix: LOCK_KEY_PREFIX, cursor });
+    for (const key of page.keys) {
+      const meta = key.metadata as DavLockMeta | null;
+      if (!meta || typeof meta.path !== 'string') continue;
+      if (typeof meta.expiresAt === 'number' && meta.expiresAt <= now) continue;
+      out.push({ token: key.name.slice(LOCK_KEY_PREFIX.length), ...meta });
+    }
+    if (page.list_complete) break;
+    cursor = page.cursor;
+  }
+  return out;
+}
+
+/** 锁是否覆盖某个路径：同路径，或 Depth:infinity 且目标在其子树内。 */
+function lockCovers(lockPath: string, depth: LockDepth, targetPath: string): boolean {
+  if (lockPath === targetPath) return true;
+  if (depth !== 'infinity') return false;
+  const prefix = lockPath === '/' ? '/' : `${lockPath}/`;
+  return targetPath.startsWith(prefix);
+}
+
+async function putLock(kv: KVNamespace, lock: DavLock, ttlSeconds: number): Promise<void> {
+  const metadata: DavLockMeta = {
+    path: lock.path,
+    depth: lock.depth,
+    scope: lock.scope,
+    principal: lock.principal,
+    expiresAt: lock.expiresAt,
+  };
+  await kv.put(lockKey(lock.token), JSON.stringify(lock), {
+    expirationTtl: Math.max(60, Math.min(ttlSeconds, LOCK_MAX_TTL)),
+    metadata,
+  });
+}
+
+/** 单个 <D:activelock>（RFC 4918 §14.11）。 */
+function activelockXml(lock: DavLock): string {
+  const remaining = Math.max(0, Math.round((lock.expiresAt - Date.now()) / 1000));
+  return (
+    '<D:activelock>' +
+    '<D:locktype><D:write/></D:locktype>' +
+    `<D:lockscope><D:${lock.scope}/></D:lockscope>` +
+    `<D:depth>${lock.depth === 'infinity' ? 'infinity' : '0'}</D:depth>` +
+    (lock.owner ? `<D:owner>${lock.owner}</D:owner>` : '') +
+    `<D:timeout>Second-${remaining}</D:timeout>` +
+    `<D:locktoken><D:href>opaquelocktoken:${lock.token}</D:href></D:locktoken>` +
+    `<D:lockroot><D:href>${escapeXml(pathHref(lock.path, lock.isDir))}</D:href></D:lockroot>` +
+    '</D:activelock>'
+  );
+}
+
+function lockDiscoveryXml(locks: DavLock[]): string {
+  if (locks.length === 0) return '<D:lockdiscovery/>';
+  return `<D:lockdiscovery>${locks.map(activelockXml).join('')}</D:lockdiscovery>`;
+}
+
+function lockResponse(c: AppRequest, lock: DavLock, status: 200 | 201): Response {
+  const xml =
+    '<?xml version="1.0" encoding="utf-8"?><D:prop xmlns:D="DAV:">' +
+    lockDiscoveryXml([lock]) +
+    '</D:prop>';
+  const remaining = Math.max(0, Math.round((lock.expiresAt - Date.now()) / 1000));
+  return c.body(xml, status, {
+    'Content-Type': 'application/xml; charset=utf-8',
+    'Lock-Token': `<opaquelocktoken:${lock.token}>`,
+    Timeout: `Second-${remaining}`,
+    'Content-Length': String(new TextEncoder().encode(xml).length),
+  });
+}
+
+/**
+ * 写前的锁校验（RFC 4918 §7.2 / §9.10.1）：
+ *   - 目标被锁且请求没在 If 头里给出对应 token → 423 Locked；
+ *   - `includeDescendants`（DELETE / MOVE）时，树内子孙上的锁同样要求 token。
+ *
+ * 属主例外：同一账号自己锁的、且请求**完全没带 If 头**时放行 —— 不少客户端
+ * 只在改「别人锁住的资源」时才补 If；带了 If 但对不上仍然 423。
+ */
+async function lockedWriteResponse(
+  c: AppRequest,
+  targets: URI[],
+  opts: { includeDescendants?: boolean } = {},
+): Promise<Response | null> {
+  const ctx = ctxOf(c);
+  const kv = kvFor(ctx.env, 'upload');
+  const locks = await loadLocks(kv);
+  if (locks.length === 0) return null;
+
+  const ifHeader = c.req.header('If');
+  const lists = parseIfHeader(ifHeader);
+  const principal = ctx.user?.id ?? -1;
+
+  for (const target of targets) {
+    const path = decodedPath(target);
+    const prefix = path === '/' ? '/' : `${path}/`;
+    const related = locks.filter(
+      (lock) =>
+        lockCovers(lock.path, lock.depth, path) ||
+        (opts.includeDescendants === true && lock.path.startsWith(prefix)),
+    );
+    for (const lock of related) {
+      if (lock.principal === principal && !ifHeader) continue;
+      if (ifAssertsToken(lists, lock.token)) continue;
+      return c.body(null, 423);
+    }
+  }
+  return null;
+}
+
+/** MOVE 成功后把源树上的锁根一起挪过去（RFC 4918 §7.5）。 */
+async function moveLockRoots(c: AppRequest, fromPath: string, toPath: string): Promise<void> {
+  if (fromPath === toPath) return;
+  const ctx = ctxOf(c);
+  const kv = kvFor(ctx.env, 'upload');
+  const locks = await loadLocks(kv);
+  const prefix = fromPath === '/' ? '/' : `${fromPath}/`;
+  for (const lock of locks) {
+    if (lock.path !== fromPath && !lock.path.startsWith(prefix)) continue;
+    const raw = await kv.get(lockKey(lock.token));
+    if (!raw) continue;
+    const record = JSON.parse(raw) as DavLock;
+    record.path = `${toPath}${record.path.slice(fromPath.length)}`;
+    const remaining = Math.max(60, Math.round((record.expiresAt - Date.now()) / 1000));
+    await putLock(kv, record, remaining);
+  }
 }
 
 davRoutes.on('LOCK', '*', async (c) => {
@@ -520,42 +860,89 @@ davRoutes.on('LOCK', '*', async (c) => {
   const uri = targetUri(c);
   if (!uri) return c.body(null, 404);
 
-  // Timeout: Second-3600
-  const timeoutHeader = c.req.header('Timeout') ?? '';
-  const m = timeoutHeader.match(/Second-(\d+)/);
-  const ttl = Math.min(3600, m ? Number(m[1]) : LOCK_DEFAULT_TTL);
+  const kv = kvFor(ctx.env, 'upload');
+  const fs = new FileSystemService(ctx);
+  const ttl = parseTimeout(c.req.header('Timeout'));
+  const bodyText = await c.req.text();
+  const info = parseLockInfo(bodyText);
 
-  const token = crypto.randomUUID();
-  await kvFor(ctx.env, 'upload').put(
-    lockKey(token),
-    JSON.stringify({ path: uri.path, owner: ctx.user!.id, created: Date.now() }),
-    { expirationTtl: Math.max(60, ttl) },
+  // —— 续期：无实体，token 在 If 头里 ——
+  if (!info) {
+    const lists = parseIfHeader(c.req.header('If'));
+    const tokens = new Set<string>();
+    for (const list of lists) {
+      for (const cond of list.conditions) if (!cond.not && cond.token) tokens.add(cond.token);
+    }
+    const hit = (await loadLocks(kv)).find(
+      (lock) => tokens.has(lock.token) && lockCovers(lock.path, lock.depth, decodedPath(uri)),
+    );
+    if (!hit) return c.body(null, 412);
+    if (hit.principal !== ctx.user!.id) return c.body(null, 403);
+    const raw = await kv.get(lockKey(hit.token));
+    if (!raw) return c.body(null, 412);
+    const lock = JSON.parse(raw) as DavLock;
+    lock.expiresAt = Date.now() + ttl * 1000;
+    await putLock(kv, lock, ttl);
+    return lockResponse(c, lock, 200);
+  }
+
+  // —— 新建锁 ——
+  const depth: LockDepth = (c.req.header('Depth') ?? 'infinity').trim() === '0' ? '0' : 'infinity';
+
+  let file = await fs.resolve(uri);
+  let created = false;
+  if (!file) {
+    // RFC 4918 §7.3：锁一个还不存在的 URL → 先建一个空资源
+    try {
+      await fs.create(uri, 'file', { errOnConflict: true });
+      file = await fs.mustResolve(uri);
+      created = true;
+    } catch {
+      return c.body(null, 409);
+    }
+  }
+  const isDir = isFolderRow(fs, file);
+
+  const path = decodedPath(uri);
+  const existingLocks = await loadLocks(kv);
+  const overlap = existingLocks.filter(
+    (lock) => lockCovers(lock.path, lock.depth, path) || lockCovers(path, depth, lock.path),
   );
+  // exclusive 与任何锁冲突；shared 只在撞上 exclusive 时冲突（RFC 4918 §6.1）
+  if (overlap.some((lock) => lock.scope === 'exclusive' || info.scope === 'exclusive')) {
+    return c.body(null, 423);
+  }
 
-  const xml =
-    `<?xml version="1.0" encoding="utf-8"?><D:prop xmlns:D="DAV:"><D:lockdiscovery>` +
-    `<D:activelock><D:locktype><D:write/></D:locktype><D:lockscope><D:exclusive/></D:lockscope>` +
-    `<D:depth>0</D:depth><D:owner>${escapeXml(ctx.user!.email ?? '')}</D:owner>` +
-    `<D:timeout>Second-${ttl}</D:timeout>` +
-    `<D:locktoken><D:href>opaquelocktoken:${token}</D:href></D:locktoken>` +
-    `<D:lockroot><D:href>${escapeXml(`${DAV_PREFIX}${uri.path}`)}</D:href></D:lockroot>` +
-    `</D:activelock></D:lockdiscovery></D:prop>`;
-  return c.body(xml, 200, {
-    'Content-Type': 'application/xml; charset=utf-8',
-    'Lock-Token': `<opaquelocktoken:${token}>`,
-  });
+  const now = Date.now();
+  const lock: DavLock = {
+    token: crypto.randomUUID(),
+    path,
+    isDir,
+    depth,
+    scope: info.scope,
+    owner: info.owner,
+    principal: ctx.user!.id,
+    createdAt: now,
+    expiresAt: now + ttl * 1000,
+  };
+  await putLock(kv, lock, ttl);
+  return lockResponse(c, lock, created ? 201 : 200);
 });
 
 davRoutes.on('UNLOCK', '*', async (c) => {
   const ctx = ctxOf(c);
-  const tokenHeader = c.req.header('Lock-Token') ?? '';
-  const token = tokenHeader.replace(/[<>\s]/g, '').replace('opaquelocktoken:', '');
-  if (token) {
-    const raw = await kvFor(ctx.env, 'upload').get(lockKey(token));
-    if (raw) {
-      const info = JSON.parse(raw) as { path: string; owner: number };
-      if (info.owner === ctx.user!.id) await kvFor(ctx.env, 'upload').delete(lockKey(token));
-    }
-  }
+  const uri = targetUri(c);
+  if (!uri) return c.body(null, 404);
+
+  const kv = kvFor(ctx.env, 'upload');
+  const token = parseLockToken(c.req.header('Lock-Token'));
+  if (!token) return c.body(null, 409);
+  const raw = await kv.get(lockKey(token));
+  if (!raw) return c.body(null, 409);
+  const lock = JSON.parse(raw) as DavLock;
+  // Lock-Token 必须指向覆盖该资源的锁（RFC 4918 §9.11）
+  if (!lockCovers(lock.path, lock.depth, decodedPath(uri))) return c.body(null, 409);
+  if (lock.principal !== ctx.user!.id) return c.body(null, 403);
+  await kv.delete(lockKey(token));
   return c.body(null, 204);
 });
