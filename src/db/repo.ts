@@ -203,6 +203,20 @@ export class UserRepo {
     return rows[0] ? normalizeUser(rows[0]) : null;
   }
 
+  /** 批量取用户（分享列表等 N+1 场景用）。 */
+  async byIds(ids: number[]): Promise<Map<number, UserRow>> {
+    const out = new Map<number, UserRow>();
+    if (ids.length === 0) return out;
+    const rows = (await this.sql`
+      SELECT * FROM users WHERE id = ANY(${ids}::int[]) AND deleted_at IS NULL
+    `) as Record<string, unknown>[];
+    for (const r of rows) {
+      const u = normalizeUser(r);
+      out.set(u.id, u);
+    }
+    return out;
+  }
+
   async byEmail(email: string): Promise<UserRow | null> {
     const rows = (await this.sql`
       SELECT * FROM users WHERE lower(email) = lower(${email}) AND deleted_at IS NULL LIMIT 1
@@ -516,6 +530,20 @@ export class GroupRepo {
       SELECT * FROM groups WHERE id = ${id} AND deleted_at IS NULL LIMIT 1
     `) as Record<string, unknown>[];
     return rows[0] ? normalizeGroup(rows[0]) : null;
+  }
+
+  /** 批量取组（分享列表判定属主组权限位时用）。 */
+  async byIds(ids: number[]): Promise<Map<number, GroupRow>> {
+    const out = new Map<number, GroupRow>();
+    if (ids.length === 0) return out;
+    const rows = (await this.sql`
+      SELECT * FROM groups WHERE id = ANY(${ids}::int[]) AND deleted_at IS NULL
+    `) as Record<string, unknown>[];
+    for (const r of rows) {
+      const g = normalizeGroup(r);
+      out.set(g.id, g);
+    }
+    return out;
   }
 
   async list(): Promise<GroupRow[]> {
@@ -842,6 +870,20 @@ export class FileRepo {
       SELECT * FROM files WHERE id = ${id} LIMIT 1
     `) as Record<string, unknown>[];
     return rows[0] ? normalizeFile(rows[0]) : null;
+  }
+
+  /** 批量取文件（分享列表这类「N 行各要一个文件」的场景，避免 N+1 往返）。 */
+  async byIds(ids: number[]): Promise<Map<number, FileRow>> {
+    const out = new Map<number, FileRow>();
+    if (ids.length === 0) return out;
+    const rows = (await this.sql`
+      SELECT * FROM files WHERE id = ANY(${ids}::int[])
+    `) as Record<string, unknown>[];
+    for (const r of rows) {
+      const f = normalizeFile(r);
+      out.set(f.id, f);
+    }
+    return out;
   }
 
   /** 取用户根目录；不存在则创建（首次登录时调用）。 */
@@ -1357,6 +1399,46 @@ export class ShareRepo {
       SELECT * FROM shares WHERE id = ${id} AND deleted_at IS NULL LIMIT 1
     `) as Record<string, unknown>[];
     return rows[0] ? normalizeShare(rows[0]) : null;
+  }
+
+  /**
+   * 一次查询取齐分享页要用的四张表：分享 / 文件 / 属主 / 属主所在组。
+   *
+   * 原来是 share → file → owner → group 四条串行查询，`buildShareResponse` 里
+   * 又查一遍 owner，共 5 次数据库往返。边缘在香港、库在新加坡，一次往返
+   * 200~300ms，分享页光这一个接口就 1.1s。合成一条 JOIN 后只剩 1 次。
+   */
+  async infoBundle(id: number): Promise<{
+    share: ShareRow;
+    file: FileRow | null;
+    owner: UserRow | null;
+    ownerGroup: GroupRow | null;
+  } | null> {
+    const rows = (await this.sql`
+      SELECT row_to_json(s.*) AS __share,
+             row_to_json(f.*) AS __file,
+             row_to_json(u.*) AS __owner,
+             row_to_json(g.*) AS __group
+      FROM shares s
+      LEFT JOIN files  f ON f.id = s.file_shares
+      LEFT JOIN users  u ON u.id = s.user_shares AND u.deleted_at IS NULL
+      LEFT JOIN groups g ON g.id = u.group_users AND g.deleted_at IS NULL
+      WHERE s.id = ${id} AND s.deleted_at IS NULL
+      LIMIT 1
+    `) as Record<string, unknown>[];
+    const row = rows[0];
+    if (!row) return null;
+    const shareRaw = toJson<Record<string, unknown> | null>(row.__share, null);
+    if (!shareRaw) return null;
+    const fileRaw = toJson<Record<string, unknown> | null>(row.__file, null);
+    const ownerRaw = toJson<Record<string, unknown> | null>(row.__owner, null);
+    const groupRaw = toJson<Record<string, unknown> | null>(row.__group, null);
+    return {
+      share: normalizeShare(shareRaw),
+      file: fileRaw ? normalizeFile(fileRaw) : null,
+      owner: ownerRaw ? normalizeUser(ownerRaw) : null,
+      ownerGroup: groupRaw ? normalizeGroup(groupRaw) : null,
+    };
   }
 
   async create(args: {

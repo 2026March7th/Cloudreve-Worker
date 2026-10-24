@@ -15,7 +15,7 @@ import { logAudit } from './audit';
 import { FileSystemService, MetadataRestoreUri } from './fs';
 import { FileSystemType, URI } from './uri';
 import { isShareExpired, isShareInvalid } from './share-rules';
-import type { FileRow, ShareRow, UserRow } from '../db/types';
+import type { FileRow, GroupRow, ShareRow, UserRow } from '../db/types';
 import { FileType, GroupPermission } from '../lib/boolset';
 import {
   AppError,
@@ -226,17 +226,17 @@ export class ShareService {
   async info(shareHashId: string, options: ShareInfoOptions = {}): Promise<ShareResponse> {
     const shareId = this.ctx.codec.decodeShareID(shareHashId);
     if (shareId === null) throw Err.shareNotFound();
-    const share = await this.ctx.shares.byId(shareId);
-    if (!share) throw Err.shareNotFound();
 
-    const file = share.file_shares ? await this.ctx.files.byId(share.file_shares) : null;
+    // 分享页的第一个请求，5 条串行查询会直接吃掉 1 秒以上（边缘在港、库在新加坡）。
+    // 合成一条 JOIN 查询后只剩 1 次往返。
+    const bundle = await this.ctx.shares.infoBundle(shareId);
+    if (!bundle) throw Err.shareNotFound();
+    const { share, file, owner, ownerGroup } = bundle;
     if (!file) throw Err.shareNotFound();
 
     // 原版 `ShareInfoService.Get` 在解锁之前先跑一遍 `IsValidShare`，
     // 失败一律按 404 + "Share link expired" 返回（不区分具体原因，避免探测）。
     // 上游 PR #3524：属主当前所属组失去 Share 权限位时同样判失效。
-    const owner = share.user_shares ? await this.ctx.users.byId(share.user_shares) : null;
-    const ownerGroup = owner?.group_users ? await this.ctx.groups.byId(owner.group_users) : null;
     if (isShareInvalid(share, file, owner, ownerGroup)) {
       throw new AppError(CodeNotFound, 'Share link expired');
     }
@@ -277,6 +277,8 @@ export class ShareService {
       true,
       share.user_shares,
       purchased,
+      // 属主行已经在 infoBundle 里一起取回来了，别再查一次
+      owner,
     );
   }
 
@@ -350,15 +352,36 @@ export class ShareService {
       publicOnly: params.publicOnly,
     });
 
+    // 列表原本是逐行查：文件、属主、属主组各一次，再加上 buildShareResponse
+    // 里重复查的属主 —— 20 条分享就是 60+ 次跨区往返（边缘在港、库在新加坡）。
+    // 改成三条批量查询（文件 / 属主 / 组），并发发出，总往返次数与页大小无关。
+    const fileIds = [
+      ...new Set(shares.map((s) => s.file_shares).filter((v): v is number => v !== null)),
+    ];
+    const ownerIds = [
+      ...new Set(shares.map((s) => s.user_shares).filter((v): v is number => v !== null)),
+    ];
+    const [fileMap, ownerMap] = await Promise.all([
+      this.ctx.files.byIds(fileIds),
+      this.ctx.users.byIds(ownerIds),
+    ]);
+    const groupIds = [
+      ...new Set(
+        [...ownerMap.values()].map((u) => u.group_users).filter((v): v is number => v != null),
+      ),
+    ];
+    const groupMap = await this.ctx.groups.byIds(groupIds);
+
     const out: ShareResponse[] = [];
     for (const share of shares) {
-      const file = share.file_shares ? await this.ctx.files.byId(share.file_shares) : null;
+      const file = share.file_shares ? (fileMap.get(share.file_shares) ?? null) : null;
       if (!file) continue;
 
       // 原版在列表里对回收站中的文件回落到 metadata 里的原始名字
       const shareName = await this.shareDisplayName(file);
-      const owner = share.user_shares ? await this.ctx.users.byId(share.user_shares) : null;
-      const invalid = await this.isShareInvalidListed(share, file, owner);
+      const owner = share.user_shares ? (ownerMap.get(share.user_shares) ?? null) : null;
+      const ownerGroup = owner ? (groupMap.get(owner.group_users) ?? null) : null;
+      const invalid = this.isShareInvalidListed(share, file, owner, ownerGroup);
 
       out.push(
         await this.buildShareResponse(
@@ -373,6 +396,7 @@ export class ShareService {
           share.user_shares,
           // 自己的分享列表里一律视为已购买，避免误显购买按钮
           params.asOwner ? true : undefined,
+          owner,
         ),
       );
     }
@@ -415,8 +439,10 @@ export class ShareService {
     includeSource: boolean,
     ownerId: number | null,
     purchased?: boolean,
+    /** 调用方已经取回的属主行（分享页单次查询里顺带拿到了，别再查一次）。 */
+    ownerRow?: UserRow | null,
   ): Promise<ShareResponse> {
-    const owner = ownerId ? await this.ctx.users.byId(ownerId) : null;
+    const owner = ownerRow !== undefined ? ownerRow : ownerId ? await this.ctx.users.byId(ownerId) : null;
 
     const res: ShareResponse = {
       id: this.ctx.codec.encodeShareID(share.id),
@@ -487,13 +513,15 @@ export class ShareService {
    * 列表接口用它来置 `expired` 标记（原版 `BuildListShareResponse` 里
    * `expired := inventory.IsValidShare(share) != nil`）。列表本身不过滤。
    * 判定规则见 `share-rules.ts`。
+   *
+   * 组行由调用方批量取好传进来（列表里 owner 的组只查一次，不再逐行查）。
    */
-  private async isShareInvalidListed(
+  private isShareInvalidListed(
     share: ShareRow,
     file: FileRow | null,
     owner: UserRow | null,
-  ): Promise<boolean> {
-    const ownerGroup = owner?.group_users ? await this.ctx.groups.byId(owner.group_users) : null;
+    ownerGroup: GroupRow | null,
+  ): boolean {
     return isShareInvalid(share, file, owner, ownerGroup);
   }
 
