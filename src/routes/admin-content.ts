@@ -1115,7 +1115,7 @@ adminContentRoutes.post('/queue/cleanup', async (c) => {
  * 但打包 / 远程下载等任务不会分派到节点 —— 任务都在请求内同步跑完，
  * 节点配置仅对未来扩展生效。
  */
-function nodeToResponse(n: Record<string, unknown>) {
+function nodeToResponse(n: Record<string, unknown>, boundPolicyIds: number[] = []) {
   return {
     id: num(n.id),
     created_at: iso(n.created_at),
@@ -1128,8 +1128,28 @@ function nodeToResponse(n: Record<string, unknown>) {
     weight: num(n.weight),
     capabilities: (n.capabilities as string) ?? '',
     settings: (n.settings as Record<string, unknown>) ?? {},
-    edges: { storage_policy: [] },
+    // 前端只用 id：节点被策略占用时，能力位那几个开关会被禁掉
+    // （`CapabilitiesSection.tsx` 判 `edges.storage_policy.length > 0`）
+    edges: { storage_policy: boundPolicyIds.map((id) => ({ id })) },
   };
+}
+
+/** 节点 id → 绑定到它的策略 id 列表。 */
+async function policiesByNode(sql: Sql, nodeId?: number): Promise<Map<number, number[]>> {
+  const rows = (await sql(
+    nodeId === undefined
+      ? 'SELECT id, node_id FROM storage_policies WHERE deleted_at IS NULL AND node_id IS NOT NULL'
+      : 'SELECT id, node_id FROM storage_policies WHERE deleted_at IS NULL AND node_id = $1',
+    nodeId === undefined ? [] : [nodeId],
+  )) as Record<string, unknown>[];
+  const map = new Map<number, number[]>();
+  for (const row of rows) {
+    const key = num(row.node_id);
+    const list = map.get(key) ?? [];
+    list.push(num(row.id));
+    map.set(key, list);
+  }
+  return map;
 }
 
 async function loadNode(sql: Sql, id: number): Promise<Record<string, unknown> | null> {
@@ -1157,8 +1177,9 @@ adminContentRoutes.post('/node', async (c) => {
     `SELECT COUNT(*)::int AS total FROM nodes WHERE ${where}`,
     params,
   )) as Record<string, unknown>[];
+  const bound = await policiesByNode(sql);
   return ok(c, {
-      nodes: rows.map(nodeToResponse),
+      nodes: rows.map((row) => nodeToResponse(row, bound.get(num(row.id)) ?? [])),
       pagination: paginationOf(page, pageSize, num(countRows[0]?.total)),
     });
 });
@@ -1169,7 +1190,8 @@ adminContentRoutes.get('/node/:id', async (c) => {
   if (id === null) return fail(c, Err.notFound('Node not found'));
   const node = await loadNode(sql, id);
   if (!node) return fail(c, Err.notFound('Node not found'));
-  return ok(c, { node: nodeToResponse(node) });
+  const bound = await policiesByNode(sql, id);
+  return ok(c, { node: nodeToResponse(node, bound.get(id) ?? []) });
 });
 
 /** 创建 / 更新节点的公共逻辑（`UpsertNodeService`）。 */
@@ -1229,7 +1251,8 @@ async function upsertNode(c: Context<AppBindings>, id: number | null, requireExi
   );
   const updated = await loadNode(sql, id);
   invalidateNodeCache(id);
-  return nodeToResponse(updated!);
+  const bound = await policiesByNode(sql, id);
+  return nodeToResponse(updated!, bound.get(id) ?? []);
 }
 
 adminContentRoutes.put('/node', async (c) => {
