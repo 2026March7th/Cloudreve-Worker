@@ -119,8 +119,15 @@ export class UserService {
    * @param group 调用方手里已有的组行（ctx.user / byEmailWithGroup / 刚查过）
    *              —— 传入可免掉这次 groups 查询；/me、/config、登录响应都是
    *              每请求必走的热路径，这一下省的是 ~200-500ms 的串行往返。
+   * @param opts.exposeEmail 非本人视角下是否暴露 email —— 只对已登录查看者生效，
+   *              且受站点设置 `expose_user_email` 控制（上游 4.17 新增的开关）。
    */
-  async buildUserResponse(user: UserRow, self: boolean, group?: GroupRow | null): Promise<UserResponse> {
+  async buildUserResponse(
+    user: UserRow,
+    self: boolean,
+    group?: GroupRow | null,
+    opts: { exposeEmail?: boolean } = {},
+  ): Promise<UserResponse> {
     const g = group !== undefined ? group : await this.ctx.groups.byId(user.group_users);
     const settings = user.settings ?? {};
 
@@ -138,6 +145,8 @@ export class UserService {
       res.language = settings.email_language;
       res.disable_view_sync = settings.disable_view_sync;
       res.share_links_in_profile = settings.share_links_in_profile;
+    } else if (opts.exposeEmail) {
+      res.email = user.email;
     }
 
     if (user.avatar) {
@@ -922,8 +931,10 @@ export class UserService {
   /** 站内用户搜索（分享页展示所有者等场景）。 */
   async search(keyword: string, limit = 20): Promise<UserResponse[]> {
     const { users } = await this.ctx.users.list({ page: 0, pageSize: limit, keyword });
+    // 已登录查看者才可能看到 email，且要站点开关 `expose_user_email` 打开
+    const exposeEmail = this.ctx.settings.getBool('expose_user_email', true);
     const out: UserResponse[] = [];
-    for (const u of users) out.push(await this.buildUserResponse(u, false));
+    for (const u of users) out.push(await this.buildUserResponse(u, false, undefined, { exposeEmail }));
     return out;
   }
 

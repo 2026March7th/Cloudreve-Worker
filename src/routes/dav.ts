@@ -491,7 +491,11 @@ davRoutes.on(['COPY', 'MOVE'], '*', async (c) => {
 
   const fs = new FileSystemService(ctx);
   const isCopy = c.req.method === 'COPY';
-  const overwrite = (c.req.header('Overwrite') ?? 'T').toUpperCase() !== 'F';
+  // Overwrite 只接受 T / F（缺省 T）。其他值按上游 parseOverwrite 回 400，
+  // 不能默默当成 T —— 否则客户端写错头会被当成「允许覆盖」，直接毁掉目标文件。
+  const overwriteHeader = (c.req.header('Overwrite') ?? 'T').toUpperCase();
+  if (overwriteHeader !== 'T' && overwriteHeader !== 'F') return c.body(null, 400);
+  const overwrite = overwriteHeader === 'T';
 
   // MOVE 会改动源，COPY 只读源；目标两者都要写 —— 两侧都过锁校验
   const blocked = await lockedWriteResponse(
@@ -504,6 +508,9 @@ davRoutes.on(['COPY', 'MOVE'], '*', async (c) => {
   try {
     const src = await fs.mustResolve(srcUri);
     const dst = await fs.resolve(dstUri);
+    // 目标是否已存在：决定成功时的状态码（已存在 → 204 No Content，新建 → 201
+    // Created），与上游 performCopyMove 一致。
+    const dstExists = dst !== null;
 
     // 目标语义（RFC 4918 + 上游 handleCopyMove）：
     //   dst 是目录  → 目标落在 dst/<src.name>
@@ -532,7 +539,7 @@ davRoutes.on(['COPY', 'MOVE'], '*', async (c) => {
       await fs.rename(srcUri, targetName);
       // 锁跟着资源走（RFC 4918 §7.5）
       await moveLockRoots(c, decodedPath(srcUri), decodedPath(targetParent.child(targetName)));
-      return c.body(null, 201);
+      return c.body(null, dstExists ? 204 : 201);
     }
 
     await fs.moveOrCopy([srcUri], targetParent, isCopy);
@@ -545,7 +552,7 @@ davRoutes.on(['COPY', 'MOVE'], '*', async (c) => {
     if (!isCopy) {
       await moveLockRoots(c, decodedPath(srcUri), decodedPath(targetParent.child(targetName)));
     }
-    return c.body(null, isCopy ? 204 : 201);
+    return c.body(null, dstExists ? 204 : 201);
   } catch (e) {
     console.error('webdav copy/move failed', e);
     return c.body(null, 409);

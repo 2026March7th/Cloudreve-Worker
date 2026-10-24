@@ -45,7 +45,7 @@ function parseJson<T>(raw: string | undefined | null, fallback: T): T {
   }
 }
 /** 与原版 constants.BackendVersion 保持一致 */
-export const BACKEND_VERSION = '4.14.0';
+export const BACKEND_VERSION = '4.19.1';
 
 export const siteRoutes = new Hono<AppBindings>();
 

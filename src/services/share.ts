@@ -501,11 +501,17 @@ export class ShareService {
     if (!owner) {
       return { id: '', nickname: '', created_at: new Date().toISOString(), anonymous: true };
     }
-    return {
+    const res: ShareResponse['owner'] = {
       id: this.ctx.codec.encodeUserID(owner.id),
       nickname: owner.nick,
       created_at: owner.created_at.toISOString(),
     };
+    // 上游 BuildUserRedacted(RedactLevelUser)：已登录查看者才拿得到属主邮箱，
+    // 且要站点开关 `expose_user_email` 打开；匿名访客永远看不到。
+    if (this.ctx.user && this.ctx.settings.getBool('expose_user_email', true)) {
+      res.email = owner.email;
+    }
+    return res;
   }
 
   // -------------------------------------------------------------------------

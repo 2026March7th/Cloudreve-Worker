@@ -586,7 +586,14 @@ export class S3CompatibleDriver implements StorageDriver {
     if (res.status === 404) return null;
     if (!res.ok) throw new Error(`S3 HEAD failed (${res.status}) for ${source}`);
     await res.body?.cancel().catch(() => {});
-    return { size: Number(res.headers.get('content-length') ?? 0) };
+    // 缺 Content-Length 不能当成 0 字节：上传哨兵校验会「校验通过」，之后
+    // 文件大小对不上的问题极难定位（对应上游 9792a5c）。
+    const raw = res.headers.get('content-length');
+    const size = raw === null || raw === '' ? Number.NaN : Number(raw);
+    if (!Number.isFinite(size)) {
+      throw new Error(`S3 HEAD returned no usable Content-Length for ${source}`);
+    }
+    return { size };
   }
 
   /**
