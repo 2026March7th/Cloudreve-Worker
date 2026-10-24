@@ -13,7 +13,16 @@
  * 面板的两格命令不需要变。任何一步失败都会带出真实报错并以非零码退出。
  */
 import { spawnSync } from 'node:child_process';
-import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import {
+  cpSync,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
@@ -26,7 +35,44 @@ const SRC_DIR = path.join(ROOT, '_frontend-src');
 const COMMIT = 'c7b6fa5288ed0490a5589ddff4f56ea1f96a5315';
 const UPSTREAM_TARBALL = `https://codeload.github.com/cloudreve/frontend/tar.gz/${COMMIT}`;
 const RELEASE_TAG = 'frontend-assets';
-const RELEASE_ASSET = `frontend-${COMMIT.slice(0, 7)}.tar.gz`;
+
+/**
+ * 预构建包名 = commit + 补丁内容哈希。
+ *
+ * 只带 commit 是不够的：`frontend-patches/` 改了（比如这次的 PWA 预缓存裁剪），
+ * 包的**内容**就变了，但名字没变，CI 与 Cloudflare 会继续命中旧包 —— 改了等于
+ * 没改。把补丁内容的指纹并进名字，改补丁自动生成新包。
+ */
+function patchFingerprint() {
+  const dir = path.join(ROOT, 'frontend-patches');
+  if (!existsSync(dir)) return 'none';
+  const files = [];
+  const walk = (d) => {
+    for (const e of readdirSync(d, { withFileTypes: true }).sort((a, b) =>
+      a.name < b.name ? -1 : 1,
+    )) {
+      const p = path.join(d, e.name);
+      if (e.isDirectory()) walk(p);
+      else files.push(p);
+    }
+  };
+  walk(dir);
+  const h = createHash('sha256');
+  for (const f of files) {
+    h.update(path.relative(dir, f).replaceAll('\\', '/'));
+    h.update(readFileSync(f));
+  }
+  return h.digest('hex').slice(0, 8);
+}
+
+const RELEASE_ASSET = `frontend-${COMMIT.slice(0, 7)}-${patchFingerprint()}.tar.gz`;
+
+// `node scripts/fetch-frontend.mjs --asset-name`：只打印包名，给 CI 用，
+// 避免 CI 里再复刻一遍命名规则（复刻必然漂移）。
+if (process.argv.includes('--asset-name')) {
+  console.log(RELEASE_ASSET);
+  process.exit(0);
+}
 
 /** npx 在 Windows 上需要 shell；CI 是 Linux。 */
 const NPX = process.platform === 'win32' ? 'npx.cmd' : 'npx';

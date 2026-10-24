@@ -101,18 +101,20 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          SHORT=$(node -p "require('fs').readFileSync('scripts/fetch-frontend.mjs','utf8').match(/const COMMIT = '([0-9a-f]{7})/)[1]")
-          ASSET="frontend-${SHORT}.tar.gz"
+          # 包名由脚本算（commit + 补丁哈希），CI 不再复刻命名规则
+          ASSET=$(node scripts/fetch-frontend.mjs --asset-name)
           if gh release view frontend-assets --json assets --jq '.assets[].name' 2>/dev/null | grep -qx "$ASSET"; then
             echo "$ASSET 已存在，跳过"
             exit 0
           fi
+          SHORT="${ASSET#frontend-}"
+          SHORT="${SHORT%.tar.gz}"
           rm -rf _pack && mkdir -p _pack/_frontend-src
           cp -r frontend "_pack/_frontend-src/frontend-${SHORT}"
           tar -czf "$ASSET" -C _pack _frontend-src
           gh release view frontend-assets >/dev/null 2>&1 || \
             gh release create frontend-assets --title "Frontend assets" \
-              --notes "fetch-frontend.mjs 快路径用的预构建前端产物，每个上游 commit 一个包"
+              --notes "fetch-frontend.mjs 快路径用的预构建前端产物，commit + 补丁哈希各一包"
           gh release upload frontend-assets "$ASSET" --clobber
           echo "已发布 $ASSET"
 
