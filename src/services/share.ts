@@ -260,8 +260,18 @@ export class ShareService {
       !share.password || isOwner || (options.password ?? '') === share.password;
 
     if (options.countViews && !isOwner) {
-      await this.ctx.shares.incrementViews(shareId);
-      logAudit(this.ctx, 'share_link_viewed', share.user_shares ?? null, { share_id: shareId, viewer: requester?.id ?? null });
+      // 计数和审计是「浏览统计」，没必要让访客等它们：各自一次跨区写库往返，
+      // 加起来比主查询还贵。扔到 waitUntil 后台跑，丢了最多少记一次浏览。
+      const write = (async () => {
+        await this.ctx.shares.incrementViews(shareId);
+        logAudit(this.ctx, 'share_link_viewed', share.user_shares ?? null, {
+          share_id: shareId,
+          viewer: requester?.id ?? null,
+        });
+      })().catch(() => {
+        /* 统计失败不影响访问 */
+      });
+      this.ctx.waitUntil?.(write);
     }
 
     // 原版 visit 路径直接传 `share.Edges.File.Name`（不回落 restore_uri），

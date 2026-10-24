@@ -11,8 +11,9 @@
  * - 前置 cachePublicAnon()：命中即短路返回、跳过 appContext。
  * - 后置 cachePublicAnonStore()：miss 时把 200 响应写回缓存（60s）。
  *
- * 仅限匿名 GET 的 ping 与 site/config/* —— 这些是全局公开数据，不涉及任何
- * 用户态，缓存安全。TTL 60s 与 settings 的 KV 缓存窗口一致。
+ * 只缓三类「匿名且与人无关」的 GET：ping、site/config/*、匿名分享目录列表。
+ * 都要求请求不带 Authorization，所以不存在跨用户串号。TTL：配置 60s（与
+ * settings 的 KV 缓存窗口一致），分享列表 10s（有上传/删除时尽快反映）。
  */
 import type { Context, MiddlewareHandler } from 'hono';
 import type { Env } from '../env';
@@ -28,9 +29,23 @@ function isCacheable(c: Context<Bindings>): boolean {
   // 态也会互相错乱。只缓存匿名版（未带 Authorization）；登录版由 cacheAuthed
   // 或回源处理。
   if (CONFIG_RE.test(p)) return !c.req.header('Authorization');
+  // 匿名访问分享目录：`GET /file?uri=cloudreve://<share>@share/...`。
+  // 这是分享页的主请求，内部要 6~7 次跨区数据库往返（边缘在港、库在新加坡），
+  // 实测 3.3s；而匿名访客拿到的内容与人无关（属主自己看会带 Authorization，
+  // 走 cacheAuthed 那条路），可以安全地按 URL 缓存十几秒。
+  if (p === '/api/v4/file') {
+    if (c.req.header('Authorization')) return false;
+    const uri = c.req.query('uri') ?? '';
+    return uri.includes('@share');
+  }
   // 其余（ping）仅匿名：带登录态的请求交给 cacheAuthed 处理用户相关端点。
   if (c.req.header('Authorization')) return false;
   return PING_RE.test(p);
+}
+
+/** 各类响应的缓存时长（秒）。列表变化快，给短一点。 */
+function ttlOf(c: Context<Bindings>): number {
+  return c.req.path === '/api/v4/file' ? 10 : 60;
 }
 
 const CONFIG_RE = /^\/api\/v4\/site\/config\//;
@@ -46,7 +61,9 @@ const PING_RE = /^\/api\/v4\/site\/ping$/;
  */
 function cacheKeyOf(c: Context<Bindings>): string {
   const origin = c.req.header('Origin');
-  return origin ? `${c.req.path}|o=${origin}` : c.req.path;
+  // 带上 query：分享目录列表靠 uri/page/order 区分，不带就串号了
+  const query = new URL(c.req.url).search;
+  return `${c.req.path}${query}${origin ? `|o=${origin}` : ''}`;
 }
 
 /** 前置：命中边缘缓存则直接返回，跳过 appContext（省 KV / 冷启动）。 */
@@ -74,7 +91,7 @@ export function cachePublicAnonStore(): MiddlewareHandler<Bindings> {
     // 这里刻意 await 而不是丢给 waitUntil：写缓存只多 1~3ms，而 waitUntil 一旦
     // 拿不到绑定好的方法就会静默丢写（缓存命中率恒 0，外部毫无迹象）。
     // 结果写进响应头，线上可以直接看出「存了没有、失败在哪一步」。
-    const result = await edgeCachePutAwait(origin, cacheKeyOf(c), res, 60);
+    const result = await edgeCachePutAwait(origin, cacheKeyOf(c), res, ttlOf(c));
     if (res.body && !res.bodyUsed) {
       const headers = new Headers(res.headers);
       headers.set('X-Edge-Cache', result);
