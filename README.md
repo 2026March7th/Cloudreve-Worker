@@ -55,6 +55,8 @@ KV 和 R2 会自动建，建表和初始化也是第一次打开站点时自动�
 
 文件管理那一套（上传下载、移动复制、重命名、删除、回收站）、分享和直链、WebDAV（含完整的 RFC 4918 写锁）、多存储策略、用户组和权限、管理后台、离线下载和压缩解压、支付和礼品卡、OIDC 登录、OAuth 授权、审计日志、Windows 桌面客户端接入。
 
+存储这边 R2 / S3 / OSS / COS / OBS / KS3 / 七牛 / OneDrive / 又拍云都支持；**节点存储**也接了 —— 把一台有磁盘的机器加成从节点（官方 Cloudreve 从机或仓库里的 `agent/cloudreve-node-agent.mjs`），策略绑上去，文件就落在它的本地磁盘上。Worker 本身没有硬盘，所以这是「本地文件系统存储」在云函数里的唯一形态。
+
 后端行为对齐上游 `4.19.1`，4.15~4.19 的修复都并进来了（WebDAV 覆盖语义、容量原子预占、OAuth scope 强制校验、属主邮箱开关、S3 元数据校验等），前端也跟到上游最新（含 Cloudreve CLI 的授权登录）。
 
 没做的：一部分 Pro 专有的接口。
@@ -69,7 +71,7 @@ npm run dev                      # 本地起服务
 npm run deploy                   # 部署
 ```
 
-还有几个会用到的：`db:migrate` 建表、`db:sync` 主备同步、`kv:setup` 配 KV、`kv:purge` 清缓存重填、`smoke` 冒烟测试。
+还有几个会用到的：`db:migrate` 建表、`db:sync` 主备同步、`kv:setup` 配 KV、`kv:purge` 清缓存重填、`smoke` 冒烟测试、`test:node` 从节点存储的端到端测试（会自己起一个本地 agent）。
 
 ## 许可
 

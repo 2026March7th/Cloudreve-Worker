@@ -85,10 +85,65 @@ Workers & Pages → Create → 选你 fork 的仓库，只填两格：
 | S3 / OSS / COS / OBS / KS3 / 七牛 | 选对应类型，填桶名、Endpoint、AK/SK、区域 |
 | OneDrive / SharePoint | 类型 `onedrive`，还得在策略页点授权跳微软登录。授权过期了要重新授权 |
 | 又拍云 | 类型 `upyun`，填空间名、操作员、密码、加速域名 |
-| 本机 | 类型 `local`。Workers 没有持久磁盘，这个只用来调试 |
+| 本机磁盘 | 类型 `local` 或 `remote`，**必须绑一个从节点**，见下面「节点存储」 |
 | 负载均衡 | 类型 `load_balance`，在几个策略之间按权重分流 |
 
 加完别忘了去**用户组 → 编辑**把这个策略绑给用户组。组没绑策略，上传会报 `No policy selected`。
+
+### 节点存储（把文件放到自己机器的磁盘上）
+
+Cloudflare 的 Worker 没有硬盘，所以「本地存储」只能由一台有磁盘的机器提供。那台机器叫**从节点**，Worker 当主站，把读写按签名 RPC 发过去。
+
+两种从节点都行：
+
+- **官方 Cloudreve 从机**：`conf.ini` 里 `[System] Mode = slave`、`[Slave] Secret = <密钥>`，正常启动即可。
+- **仓库自带的 agent**：`agent/cloudreve-node-agent.mjs`，单文件零依赖，适合不想再装一套 Cloudreve 的场景。
+
+协议是同一套（`/api/v4/slave/*` + HMAC 签名），所以两种可以混用。
+
+#### 1. 在机器上跑起来
+
+```bash
+# 官方从机
+./cloudreve -c conf.ini
+
+# 或者自带的 agent
+node agent/cloudreve-node-agent.mjs --root /data/cloudreve --port 8666 --secret <密钥>
+```
+
+| agent 参数 | 环境变量 | 默认 | 说明 |
+|---|---|---|---|
+| `--root` | `NODE_ROOT` | `./data` | 文件落盘的根目录 |
+| `--port` | `NODE_PORT` | `8666` | 监听端口 |
+| `--secret` | `NODE_SECRET` | 必填 | 主→从签名密钥，跟后台填的一致 |
+| `--host` | `NODE_HOST` | `0.0.0.0` | 监听地址 |
+
+反代（nginx / Caddy）三件事别忘：走 HTTPS、放开 `PUT` / `DELETE`、`client_max_body_size` 改成 `0` 或者不小于分片大小（默认 25MB，nginx 默认 1MB 会让分片 413）。
+
+#### 2. 后台加节点
+
+管理后台 → 节点 → 新建。类型选 `slave`。
+
+| 字段 | 填什么 |
+|---|---|
+| 名称 | 随便，自己认得出就行 |
+| 地址 | `https://node.example.com`（不带 `/api/v4/slave`，代码自己拼） |
+| 密钥 | 跟从机的 `--secret` / `[Slave] Secret` 完全一致 |
+| 权重 | 只有任务分派用，存储策略用不到，填 1 |
+
+保存后点**测试**。它会给从机发一次签名 ping，通了才说明密钥对得上。
+
+#### 3. 建策略、绑组
+
+存储策略 → 添加 → 类型选 **`remote`** → 「节点」下拉里选刚才那台 → 保存 → 用户组里绑上。
+
+> `local` 类型也能用（服务端是同一个驱动），但前端的 `local` 向导里没有节点选择框，所以实际请用 `remote`。
+
+#### 4. 跑通了看什么
+
+- 上传一个文件，去从机的 `--root` 目录下应该能看到 `uploads/<uid>/...`
+- 下载：返回的是**节点的签名直链**，浏览器直接从节点拉，不走 Worker
+- 排错：从机日志会直接打原因 —— `invalid sign` 是密钥不一致，`signature expired` 是两边时间差超过 60 秒，`40001` 之外的多半是反代改了路径或拦了方法
 
 ### 邮件
 
