@@ -36,12 +36,25 @@ function isCacheable(c: Context<Bindings>): boolean {
 const CONFIG_RE = /^\/api\/v4\/site\/config\//;
 const PING_RE = /^\/api\/v4\/site\/ping$/;
 
+/**
+ * 缓存键：路径 + 请求的 Origin。
+ *
+ * 响应里带着按来源算出来的 `Access-Control-Allow-Origin`，而且我们用
+ * 去掉 `Vary` 的方式存（否则 CF 的 match 永远对不上）。把 Origin 并进键里，
+ * 不同来源各存一份，避免 A 来源的 ACAO 被 B 来源命中（桌面客户端、
+ * 第三方页面都是跨源的）。
+ */
+function cacheKeyOf(c: Context<Bindings>): string {
+  const origin = c.req.header('Origin');
+  return origin ? `${c.req.path}|o=${origin}` : c.req.path;
+}
+
 /** 前置：命中边缘缓存则直接返回，跳过 appContext（省 KV / 冷启动）。 */
 export function cachePublicAnon(): MiddlewareHandler<Bindings> {
   return async (c, next) => {
     if (!isCacheable(c)) return next();
     const origin = new URL(c.req.url).origin;
-    const hit = await edgeCacheMatch(origin, c.req.path);
+    const hit = await edgeCacheMatch(origin, cacheKeyOf(c));
     if (hit) {
       const correlationId = c.req.header('X-Correlation-ID') ?? crypto.randomUUID();
       hit.headers.set('X-Correlation-ID', correlationId);
@@ -60,6 +73,9 @@ export function cachePublicAnonStore(): MiddlewareHandler<Bindings> {
     const res = c.res;
     if (res.status !== 200 || !isCacheable(c)) return;
     const origin = new URL(c.req.url).origin;
-    edgeCachePut(c.executionCtx.waitUntil, origin, c.req.path, res, 60);
+    // ⚠️ 必须包成闭包：`c.executionCtx.waitUntil` 是原生方法，脱离 ExecutionContext
+    // 单独传出去再调用会抛 "Illegal invocation"，而 edgeCachePut 内部 try/catch
+    // 会把它吞掉 —— 缓存一次都写不进去，外部只表现为「每次都慢」。
+    edgeCachePut((p) => c.executionCtx.waitUntil(p), origin, cacheKeyOf(c), res, 60);
   };
 }

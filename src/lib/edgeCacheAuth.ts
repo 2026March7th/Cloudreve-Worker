@@ -106,6 +106,9 @@ function cacheKeyPath(c: Context, hash: string, epoch: string): string {
     epoch,
     encodeURIComponent(c.req.path),
     encodeURIComponent(normalizedQuery(c)),
+    // Origin 也要进键：存的时候去掉了 Vary，但响应里的 Access-Control-Allow-Origin
+    // 是按来源算的，不区分来源会把 A 的 ACAO 发给 B（桌面客户端/第三方页面跨源）。
+    encodeURIComponent(c.req.header('Origin') ?? ''),
   ].join('/');
   return `/__edge_auth__/${seg}`;
 }
@@ -130,5 +133,7 @@ export function edgeAuthCachePut(
 ): void {
   const origin = originOf(c);
   const key = cacheKeyPath(c, hash, epoch);
-  edgeCachePut(c.executionCtx.waitUntil, origin, key, c.res, ttlS);
+  // 闭包包裹，别传裸的 c.executionCtx.waitUntil（未绑定调用会抛 Illegal invocation，
+  // 被 edgeCachePut 的 try/catch 吞掉 → 缓存永远写不进去）
+  edgeCachePut((p) => c.executionCtx.waitUntil(p), origin, key, c.res, ttlS);
 }

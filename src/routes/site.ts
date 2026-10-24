@@ -102,7 +102,7 @@ siteRoutes.get('/kv-status', (c) => {
  * 表现只是「每次都慢一点」，命中率是 0 也没有任何报错。这里做一次真实的
  * put → match → delete 往返，把每一步的结果如实回显。
  */
-siteRoutes.get('/cache-status', async (c) => {
+siteRoutes.get('/edge-cache-status', async (c) => {
   c.header('Cache-Control', 'no-cache');
   const cache = (globalThis as unknown as { caches?: { default?: Cache } }).caches?.default;
   if (!cache) return ok(c, { available: false, hint: '运行时没有 caches.default（本地 Node 环境正常）' });

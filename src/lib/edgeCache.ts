@@ -86,11 +86,17 @@ export function edgeCachePut(
     const body = res.clone().body;
     if (!body) return;
     const copy = new Response(body, { status: 200, headers });
-    waitUntil(
-      cache.put(req, copy).catch(() => {
-        /* 缓存尽力而为 */
-      }),
-    );
+    const write = cache.put(req, copy).catch(() => {
+      /* 缓存尽力而为 */
+    });
+    try {
+      waitUntil(write);
+    } catch (e) {
+      // 传进来的 waitUntil 没绑定 this（例如直接传 `c.executionCtx.waitUntil`）
+      // 会抛 Illegal invocation。写操作此时已经发起，只是没人等它；记一条日志，
+      // 免得缓存静默失效、外面只看到「每次都慢一点」。
+      console.error('edge cache: waitUntil unavailable, write may be dropped', e);
+    }
   } catch {
     /* 同上 */
   }
