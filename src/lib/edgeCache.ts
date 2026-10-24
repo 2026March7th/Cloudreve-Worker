@@ -76,6 +76,13 @@ export function edgeCachePut(
     const headers = new Headers(res.headers);
     headers.set('Cache-Control', `public, max-age=${ttlS}`);
     headers.delete('Content-Disposition'); // 下载语义由命中方按 query 自行附加
+    // ⚠️ 必须删 Vary：CF 的 cache.match 会按已存响应的 Vary 逐个头比对，而查找用的
+    // 是裸 Request（不带 Origin），`Vary: Origin` 一律匹配不上 —— 缓存写了也永远
+    // 命中不了（这就是 site/config 每次都要 1s+ 的根因）。
+    headers.delete('Vary');
+    headers.delete('Pragma');
+    headers.delete('Expires');
+    headers.delete('Set-Cookie');
     const body = res.clone().body;
     if (!body) return;
     const copy = new Response(body, { status: 200, headers });

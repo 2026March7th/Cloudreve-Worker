@@ -36,6 +36,10 @@ interface CacheRule {
 /** 允许缓存的登录态 GET 接口及各自 TTL（秒）。 */
 const AUTH_CACHEABLE: CacheRule[] = [
   { re: /^\/api\/v4\/user\/me$/, ttl: 30 },
+  // 站点配置：登录后首屏必打，内容 99% 是站点设置 + 本人组信息，按登录态指纹
+  // 分键缓存（与 /me 同一套失效机制）能把首屏的 appContext + 设置查询整段省掉。
+  // 管理后台改设置最多 30s 后生效。
+  { re: /^\/api\/v4\/site\/config\/(login|explorer|thumb)$/, ttl: 30 },
   { re: /^\/api\/v4\/file$/, ttl: 8 },
 ];
 
@@ -76,6 +80,8 @@ export function cacheAuthed(): MiddlewareHandler<Bindings> {
         if (hit) {
           const correlationId = c.req.header('X-Correlation-ID') ?? crypto.randomUUID();
           hit.headers.set('X-Correlation-ID', correlationId);
+          // 诊断用：一眼看出这次是缓存命中还是回源
+          hit.headers.set('X-Edge-Cache', 'hit');
           // 浏览器侧 private + SWR：本人机器上即时复用，不进共享代理。
           hit.headers.set(
             'Cache-Control',

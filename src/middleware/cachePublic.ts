@@ -45,6 +45,8 @@ export function cachePublicAnon(): MiddlewareHandler<Bindings> {
     if (hit) {
       const correlationId = c.req.header('X-Correlation-ID') ?? crypto.randomUUID();
       hit.headers.set('X-Correlation-ID', correlationId);
+      // 诊断用：一眼看出这次是缓存命中还是回源
+      hit.headers.set('X-Edge-Cache', 'hit');
       return hit;
     }
     return next();
