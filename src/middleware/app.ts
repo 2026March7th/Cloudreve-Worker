@@ -79,6 +79,7 @@ async function resolveUser(
 /** 装配请求上下文。每个请求一次。 */
 export function appContext(): MiddlewareHandler<AppBindings> {
   return async (c, next) => {
+    const startedAt = performance.now();
     const env = c.env;
     const correlationId = c.req.header('X-Correlation-ID') ?? crypto.randomUUID();
     c.set('correlationId', correlationId);
@@ -94,6 +95,7 @@ export function appContext(): MiddlewareHandler<AppBindings> {
     const db = resolveDb(env);
 
     const settings = await loadSettings(env, db);
+    const settingsMs = performance.now() - startedAt;
     const codec = new HashIDCodec(settings.hashIdSalt);
     const jwt = new JWTService(settings.secretKey);
 
@@ -101,6 +103,7 @@ export function appContext(): MiddlewareHandler<AppBindings> {
     const header = c.req.header('Authorization') ?? null;
     const resolved = await resolveUser(env, header, settings, db);
     const user = resolved?.user;
+    const authMs = performance.now() - startedAt;
 
     // 只有 OAuth 客户端签发的 token 才带 scope，内置登录不受 scope 限制。
     // 复用 resolveUser 已经验过的 claims，不再重复验签。
@@ -165,6 +168,19 @@ export function appContext(): MiddlewareHandler<AppBindings> {
     c.header('X-Correlation-ID', correlationId);
 
     await next();
+
+    // 服务端各阶段耗时。外面测到的 TTFB 混了链路与代理抖动，这个头才是
+    // 「Worker 自己花了多少」：settings=读设置（KV 命中就很小）、auth=解析登录态、
+    // total=整个请求。慢的时候先看这三段谁大。
+    const totalMs = performance.now() - startedAt;
+    try {
+      c.header(
+        'Server-Timing',
+        `settings;dur=${settingsMs.toFixed(1)}, auth;dur=${authMs.toFixed(1)}, total;dur=${totalMs.toFixed(1)}`,
+      );
+    } catch {
+      // 响应头已定稿（例如上游直接返回了不可变的 Response）就放弃这个诊断头
+    }
   };
 }
 

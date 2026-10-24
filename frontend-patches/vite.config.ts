@@ -54,6 +54,8 @@ export default defineConfig({
           "**/Lightbox-*",
           "**/Artplayer-*",
           "**/Editor-*",
+          // 管理后台只在进 /admin 时才加载，普通用户完全用不到，别预缓存（720KB）
+          "**/AdminBundle-*",
         ],
         // 兜底：以后再有新的超大文件也不会被无意塞进预缓存
         maximumFileSizeToCacheInBytes: 2 * 1024 * 1024,
