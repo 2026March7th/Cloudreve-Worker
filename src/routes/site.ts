@@ -95,6 +95,41 @@ siteRoutes.get('/kv-status', (c) => {
   });
 });
 
+/**
+ * 诊断端点：自检 CF Cache API 在这个部署里到底能不能写/读。
+ *
+ * 边缘缓存（`cachePublicAnon` / `cacheAuthed`）出问题时从外部看不出来 ——
+ * 表现只是「每次都慢一点」，命中率是 0 也没有任何报错。这里做一次真实的
+ * put → match → delete 往返，把每一步的结果如实回显。
+ */
+siteRoutes.get('/cache-status', async (c) => {
+  c.header('Cache-Control', 'no-cache');
+  const cache = (globalThis as unknown as { caches?: { default?: Cache } }).caches?.default;
+  if (!cache) return ok(c, { available: false, hint: '运行时没有 caches.default（本地 Node 环境正常）' });
+
+  const origin = new URL(c.req.url).origin;
+  const key = `${origin}/__edge_cache_probe__`;
+  const out: Record<string, unknown> = { available: true, key };
+
+  try {
+    const req = new Request(key, { method: 'GET' });
+    await cache.put(
+      req,
+      new Response('probe', {
+        status: 200,
+        headers: { 'Content-Type': 'text/plain', 'Cache-Control': 'public, max-age=60' },
+      }),
+    );
+    out.put = 'ok';
+    const hit = await cache.match(new Request(key, { method: 'GET' }));
+    out.match = hit ? `ok (${await hit.text()})` : 'miss（写进去了但读不到）';
+    await cache.delete(new Request(key, { method: 'GET' }));
+  } catch (e) {
+    out.error = e instanceof Error ? e.message : String(e);
+  }
+  return ok(c, out);
+});
+
 /** 供诊断用：列出当前 env 上实际存在的 KV 绑定名。 */
 function listKvBindings(env: unknown): string[] {
   const bindings = env as Record<string, unknown>;
