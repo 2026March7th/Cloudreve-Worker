@@ -23,7 +23,7 @@ const TARBALL_PATH = path.join(ROOT, '_frontend.tar.gz');
 const SRC_DIR = path.join(ROOT, '_frontend-src');
 
 /** 上游 .gitmodules 固定的前端提交，更新前端版本就改这里。 */
-const COMMIT = '19da0fe1ecd40971fafa813983d769fdce41573c';
+const COMMIT = 'c7b6fa5288ed0490a5589ddff4f56ea1f96a5315';
 const UPSTREAM_TARBALL = `https://codeload.github.com/cloudreve/frontend/tar.gz/${COMMIT}`;
 const RELEASE_TAG = 'frontend-assets';
 const RELEASE_ASSET = `frontend-${COMMIT.slice(0, 7)}.tar.gz`;

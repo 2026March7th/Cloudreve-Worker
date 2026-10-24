@@ -10,7 +10,7 @@
  *   POST   /api/v4/session/authn           Passkey 登录：验证断言、签发 token
  */
 import { Hono } from 'hono';
-import type { AppBindings } from '../middleware/app';
+import type { AppBindings, AppRequest } from '../middleware/app';
 import { ctxOf } from '../middleware/app';
 import { fail, ok, okWithCode } from '../lib/response';
 import { UserService } from '../services/user';
@@ -246,28 +246,35 @@ sessionRoutes.get('/oauth/app/:app_id', async (c) => {
   }
 });
 
-/** 用户同意 → 签发授权码。 */
-sessionRoutes.post('/oauth/consent', async (c) => {
+/** 用户同意 → 签发授权码；拒绝（`/deny`）→ 只回 `access_denied`。 */
+async function handleConsent(c: AppRequest, deny: boolean): Promise<Response> {
   const ctx = ctxOf(c);
   if (!ctx.user) return fail(c, Err.loginRequired());
   const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
   const service = new OAuthService(ctx, c.env);
   try {
-    const res = await service.consent(ctx.user, {
-      client_id: String(body.client_id ?? ''),
-      response_type: String(body.response_type ?? ''),
-      redirect_uri: String(body.redirect_uri ?? ''),
-      state: body.state === undefined ? undefined : String(body.state),
-      scope: String(body.scope ?? ''),
-      code_challenge: body.code_challenge === undefined ? undefined : String(body.code_challenge),
-      code_challenge_method:
-        body.code_challenge_method === undefined ? undefined : String(body.code_challenge_method),
-    });
+    const res = await service.consent(
+      ctx.user,
+      {
+        client_id: String(body.client_id ?? ''),
+        response_type: String(body.response_type ?? ''),
+        redirect_uri: String(body.redirect_uri ?? ''),
+        state: body.state === undefined ? undefined : String(body.state),
+        scope: String(body.scope ?? ''),
+        code_challenge: body.code_challenge === undefined ? undefined : String(body.code_challenge),
+        code_challenge_method:
+          body.code_challenge_method === undefined ? undefined : String(body.code_challenge_method),
+      },
+      { deny },
+    );
     return ok(c, res);
   } catch (e) {
     return fail(c, e);
   }
-});
+}
+
+sessionRoutes.post('/oauth/consent', (c) => handleConsent(c, false));
+sessionRoutes.post('/oauth/consent/deny', (c) => handleConsent(c, true));
 
 /** 授权码换 token。表单编码（OAuth2 规范）。 */
 sessionRoutes.post('/oauth/token', async (c) => {
@@ -282,6 +289,7 @@ sessionRoutes.post('/oauth/token', async (c) => {
       grant_type: get('grant_type'),
       code: get('code'),
       code_verifier: form.has('code_verifier') ? get('code_verifier') : undefined,
+      redirect_uri: form.has('redirect_uri') ? get('redirect_uri') : undefined,
     });
     return c.json(res as never);
   } catch (e) {

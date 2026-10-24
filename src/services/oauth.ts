@@ -76,6 +76,43 @@ function assertSafeRedirectUri(uri: string): void {
   }
 }
 
+/**
+ * 注册的回调地址与请求的是否匹配（RFC 8252 §7.3）。
+ *
+ * 原生客户端（CLI / 桌面）用 loopback 回调，监听端口是随机的，注册时只能写
+ * `http://127.0.0.1/callback`。所以**只对 IP loopback 的 http 地址放宽端口**，
+ * scheme / host / path / query 仍逐字节一致；其他情况一律精确匹配。
+ * 对应上游 `service/oauth/redirect.go` 的 `redirectURIMatches`。
+ */
+function redirectURIMatches(registered: string, requested: string): boolean {
+  if (!registered.startsWith('http://')) return registered === requested;
+  // 片段会把注入的 code 甩掉，两边带 # 都不认
+  if (registered.includes('#') || requested.includes('#')) return false;
+
+  let reg: URL;
+  try {
+    reg = new URL(registered);
+  } catch {
+    return false;
+  }
+  const host = reg.hostname;
+  // 只认 IP 回环；localhost 属于「域名」，端口放宽会让劫持面变大，走精确匹配
+  if (host !== '127.0.0.1' && host !== '[::1]') return registered === requested;
+
+  let req: URL;
+  try {
+    req = new URL(requested);
+  } catch {
+    return false;
+  }
+  for (const u of [reg, req]) {
+    if (u.protocol !== 'http:') return false;
+    if (u.username || u.password) return false; // http://user@127.0.0.1/ 这类
+  }
+  const normalize = (u: URL): string => `${u.protocol}//${u.hostname}${u.pathname}${u.search}`;
+  return normalize(reg) === normalize(req);
+}
+
 /** 自动注册的新客户端默认放开的 scope（私有部署策略：宽松）。 */
 const AUTO_SCOPES = [
   'openid',
@@ -98,6 +135,26 @@ const AUTO_SCOPES = [
   'Finance.Write',
   'Admin.Read',
   'Admin.Write',
+];
+
+/**
+ * 官方 Cloudreve CLI 的内置 OAuth 客户端。值必须与上游
+ * `inventory/migration.go`（OAuthClientCLI*）逐字一致 —— CLI 把 GUID 和
+ * secret 编进了二进制，改了就登不上。回调是 loopback，端口由 CLI 随机选，
+ * 所以校验要靠 `redirectURIMatches` 放宽端口。
+ */
+const CLI_CLIENT_GUID = '6326d2af-2fef-4a99-94da-1ee8ef0ca53f';
+const CLI_CLIENT_SECRET = 'yoFiNgbxvSCzK2Nm92T3TNaREh4qBjq4';
+const CLI_CLIENT_REDIRECT = 'http://127.0.0.1/callback';
+const CLI_CLIENT_SCOPES = [
+  'profile',
+  'email',
+  'openid',
+  'offline_access',
+  'UserInfo.Write',
+  'Workflow.Write',
+  'Files.Write',
+  'Shares.Write',
 ];
 
 /** KV 里的授权码内容。 */
@@ -159,6 +216,23 @@ export class OAuthService {
    */
   private async ensureAutoProvision(guid: string): Promise<void> {
     if (!UUID_RE.test(guid)) return;
+
+    // 官方 Cloudreve CLI 内置了固定的 client_id / secret（上游
+    // `inventory/migration.go` 的 migrateOAuthClientCLI），回调是 loopback +
+    // 随机端口。这里按同一组值播种，否则 CLI 换 token 时 secret 对不上。
+    if (guid === CLI_CLIENT_GUID) {
+      await this.sql`
+        INSERT INTO oauth_clients (guid, secret, name, homepage_url, redirect_uris, scopes, props, is_enabled)
+        VALUES (${CLI_CLIENT_GUID}, ${CLI_CLIENT_SECRET}, ${'Cloudreve CLI'}, '',
+                ${JSON.stringify([CLI_CLIENT_REDIRECT])}::jsonb,
+                ${JSON.stringify(CLI_CLIENT_SCOPES)}::jsonb,
+                ${JSON.stringify({ icon: '/static/img/cloudreve.svg', refresh_token_ttl: 7776000 })}::jsonb,
+                true)
+        ON CONFLICT (guid) DO NOTHING
+      `;
+      return;
+    }
+
     await this.sql`
       INSERT INTO oauth_clients (guid, secret, name, homepage_url, redirect_uris, scopes, props, is_enabled)
       VALUES (${guid}, ${randomString(48)}, ${'Client ' + guid.slice(0, 8)}, '', '[]'::jsonb,
@@ -213,7 +287,7 @@ export class OAuthService {
     return out;
   }
 
-  /** 用户同意：校验后落 grant、发授权码。 */
+  /** 用户同意：校验后落 grant、发授权码；拒绝时只回 error，不落 grant。 */
   async consent(
     user: UserWithGroup,
     args: {
@@ -225,7 +299,8 @@ export class OAuthService {
       code_challenge?: string;
       code_challenge_method?: string;
     },
-  ): Promise<{ code: string; state: string }> {
+    opts: { deny?: boolean } = {},
+  ): Promise<{ code?: string; error?: string; state: string }> {
     if (args.response_type !== 'code') {
       throw new AppError(CodeParamErr, 'response_type must be "code"');
     }
@@ -250,11 +325,18 @@ export class OAuthService {
     //   明文链路或被发往危险协议；
     // - 其余（手动创建却未登记白名单）保持原语义：不校验。
     if (app.redirect_uris.length > 0) {
-      if (!app.redirect_uris.includes(args.redirect_uri)) {
+      // 精确匹配，仅对 IP loopback 放宽端口（CLI/原生客户端回调端口随机）
+      if (!app.redirect_uris.some((uri) => redirectURIMatches(uri, args.redirect_uri))) {
         throw new AppError(CodeParamErr, 'Invalid redirect URI');
       }
     } else if (app.props.auto_provisioned) {
       assertSafeRedirectUri(args.redirect_uri);
+    }
+
+    // 用户点了「拒绝」：按 OAuth2 §4.1.2.1 回 access_denied，
+    // 不落 grant、不发码（对应上游 `POST /session/oauth/consent/deny`）。
+    if (opts.deny) {
+      return { error: 'access_denied', state: args.state ?? '' };
     }
 
     const requestedScopes = args.scope.split(' ').filter(Boolean);
@@ -303,6 +385,7 @@ export class OAuthService {
     grant_type: string;
     code: string;
     code_verifier?: string;
+    redirect_uri?: string;
   }): Promise<TokenResponse> {
     if (args.grant_type !== 'authorization_code') {
       throw new AppError(CodeParamErr, 'grant_type must be authorization_code');
@@ -315,6 +398,12 @@ export class OAuthService {
 
     if (authCode.client_id !== args.client_id) {
       throw new AppError(CodeCredentialInvalid, 'Client ID mismatch');
+    }
+
+    // RFC 6749 §4.1.3：授权请求带过 redirect_uri，换 token 时也带就必须一致。
+    // 不带则跳过（老客户端兼容），上游 9f1e0b8 同样只在传了时校验。
+    if (args.redirect_uri !== undefined && args.redirect_uri !== authCode.redirect_uri) {
+      throw new AppError(CodeCredentialInvalid, 'Redirect URI mismatch');
     }
 
     // PKCE（S256）：授权码必须带挑战，且 verifier 必须匹配（consent 已强制挑战，
