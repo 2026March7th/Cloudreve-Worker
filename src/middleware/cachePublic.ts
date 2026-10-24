@@ -16,7 +16,7 @@
  */
 import type { Context, MiddlewareHandler } from 'hono';
 import type { Env } from '../env';
-import { edgeCacheMatch, edgeCachePut } from '../lib/edgeCache';
+import { edgeCacheMatch, edgeCachePutAwait } from '../lib/edgeCache';
 
 type Bindings = { Bindings: Env };
 
@@ -73,9 +73,14 @@ export function cachePublicAnonStore(): MiddlewareHandler<Bindings> {
     const res = c.res;
     if (res.status !== 200 || !isCacheable(c)) return;
     const origin = new URL(c.req.url).origin;
-    // ⚠️ 必须包成闭包：`c.executionCtx.waitUntil` 是原生方法，脱离 ExecutionContext
-    // 单独传出去再调用会抛 "Illegal invocation"，而 edgeCachePut 内部 try/catch
-    // 会把它吞掉 —— 缓存一次都写不进去，外部只表现为「每次都慢」。
-    edgeCachePut((p) => c.executionCtx.waitUntil(p), origin, cacheKeyOf(c), res, 60);
+    // 这里刻意 await 而不是丢给 waitUntil：写缓存只多 1~3ms，而 waitUntil 一旦
+    // 拿不到绑定好的方法就会静默丢写（缓存命中率恒 0，外部毫无迹象）。
+    // 结果写进响应头，线上可以直接看出「存了没有、失败在哪一步」。
+    const result = await edgeCachePutAwait(origin, cacheKeyOf(c), res, 60);
+    if (res.body && !res.bodyUsed) {
+      const headers = new Headers(res.headers);
+      headers.set('X-Edge-Cache', result);
+      c.res = new Response(res.body, { status: res.status, headers });
+    }
   };
 }

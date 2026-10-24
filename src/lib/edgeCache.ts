@@ -102,6 +102,41 @@ export function edgeCachePut(
   }
 }
 
+/**
+ * 同步版写入：await 到 put 真正完成，返回结果字符串（便于在诊断头里回显）。
+ *
+ * 与 `edgeCachePut` 的区别是不依赖 `waitUntil` —— 后者一旦拿不到绑定好的
+ * waitUntil 就会静默丢写（踩过：传裸方法抛 Illegal invocation 被 catch 吞掉，
+ * 缓存命中率恒为 0 而外部毫无迹象）。
+ */
+export async function edgeCachePutAwait(
+  origin: string,
+  keyPath: string,
+  res: Response,
+  ttlS: number,
+): Promise<string> {
+  const cache = defaultCache();
+  if (!cache) return 'no-cache-api';
+  if (res.status !== 200) return `skip-status-${res.status}`;
+  const req = cacheRequest(origin, keyPath);
+  if (!req) return 'bad-key';
+  try {
+    const headers = new Headers(res.headers);
+    headers.set('Cache-Control', `public, max-age=${ttlS}`);
+    headers.delete('Content-Disposition');
+    headers.delete('Vary');
+    headers.delete('Pragma');
+    headers.delete('Expires');
+    headers.delete('Set-Cookie');
+    const body = res.clone().body;
+    if (!body) return 'no-body';
+    await cache.put(req, new Response(body, { status: 200, headers }));
+    return 'stored';
+  } catch (e) {
+    return `error:${e instanceof Error ? e.message : String(e)}`;
+  }
+}
+
 /** 从缓存的响应还原 ObjectContent 形状（只缓存过 200，无 contentRange）。 */
 export function objectFromCacheResponse(
   hit: Response,
