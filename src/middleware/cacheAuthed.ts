@@ -25,6 +25,7 @@ import {
   edgeAuthCachePut,
   getAuthEpoch,
 } from '../lib/edgeCacheAuth';
+import { withHeaders } from '../lib/edgeCache';
 
 type Bindings = { Bindings: import('../env').Env };
 
@@ -79,15 +80,13 @@ export function cacheAuthed(): MiddlewareHandler<Bindings> {
         const hit = await edgeAuthCacheMatch(c, hash, epoch);
         if (hit) {
           const correlationId = c.req.header('X-Correlation-ID') ?? crypto.randomUUID();
-          hit.headers.set('X-Correlation-ID', correlationId);
-          // 诊断用：一眼看出这次是缓存命中还是回源
-          hit.headers.set('X-Edge-Cache', 'hit');
-          // 浏览器侧 private + SWR：本人机器上即时复用，不进共享代理。
-          hit.headers.set(
-            'Cache-Control',
-            `private, max-age=0, stale-while-revalidate=${rule.ttl}`,
-          );
-          return hit;
+          // cache.match 返回的响应头只读，改之前先复制
+          return withHeaders(hit, {
+            'X-Correlation-ID': correlationId,
+            'X-Edge-Cache': 'hit',
+            // 浏览器侧 private + SWR：本人机器上即时复用，不进共享代理。
+            'Cache-Control': `private, max-age=0, stale-while-revalidate=${rule.ttl}`,
+          });
         }
         // miss：记下来，post 阶段写回（复用同一 hash/epoch）。
         pendingHash = hash;
@@ -106,10 +105,11 @@ export function cacheAuthed(): MiddlewareHandler<Bindings> {
       if (code === 0) {
         edgeAuthCachePut(c, pendingHash, pendingEpoch!, pendingTtl);
         // 同时让浏览器也能 SWR（覆盖 jsonResponse 强制的 no-store）。
-        res.headers.set(
-          'Cache-Control',
-          `private, max-age=0, stale-while-revalidate=${pendingTtl}`,
-        );
+        // 同样要复制响应再改头：c.res 的头在 Hono 里是只读的。
+        c.res = withHeaders(res, {
+          'Cache-Control': `private, max-age=0, stale-while-revalidate=${pendingTtl}`,
+          'X-Edge-Cache': 'miss',
+        });
       }
       return;
     }

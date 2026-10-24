@@ -16,7 +16,7 @@
  */
 import type { Context, MiddlewareHandler } from 'hono';
 import type { Env } from '../env';
-import { edgeCacheMatch, edgeCachePutAwait } from '../lib/edgeCache';
+import { edgeCacheMatch, edgeCachePutAwait, withHeaders } from '../lib/edgeCache';
 
 type Bindings = { Bindings: Env };
 
@@ -57,10 +57,8 @@ export function cachePublicAnon(): MiddlewareHandler<Bindings> {
     const hit = await edgeCacheMatch(origin, cacheKeyOf(c));
     if (hit) {
       const correlationId = c.req.header('X-Correlation-ID') ?? crypto.randomUUID();
-      hit.headers.set('X-Correlation-ID', correlationId);
-      // 诊断用：一眼看出这次是缓存命中还是回源
-      hit.headers.set('X-Edge-Cache', 'hit');
-      return hit;
+      // 只读头，必须复制后才改
+      return withHeaders(hit, { 'X-Correlation-ID': correlationId, 'X-Edge-Cache': 'hit' });
     }
     return next();
   };

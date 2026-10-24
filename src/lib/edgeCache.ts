@@ -103,6 +103,18 @@ export function edgeCachePut(
 }
 
 /**
+ * 复制一份可改头的响应。
+ *
+ * `cache.match()` 返回的响应头是**只读的**，直接 `hit.headers.set()` 会抛
+ * `Can't modify immutable headers`（表现为 50005 内部错误）。改头前一律先复制。
+ */
+export function withHeaders(res: Response, sets: Record<string, string>): Response {
+  const headers = new Headers(res.headers);
+  for (const [k, v] of Object.entries(sets)) headers.set(k, v);
+  return new Response(res.body, { status: res.status, statusText: res.statusText, headers });
+}
+
+/**
  * 同步版写入：await 到 put 真正完成，返回结果字符串（便于在诊断头里回显）。
  *
  * 与 `edgeCachePut` 的区别是不依赖 `waitUntil` —— 后者一旦拿不到绑定好的
