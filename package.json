@@ -2,6 +2,7 @@
   "name": "cloudreve-worker",
   "version": "4.14.0",
   "private": true,
+  "license": "GPL-3.0-only",
   "description": "Cloudreve v4 backend reimplemented for Cloudflare Workers (KV + Neon + R2/OneDrive)",
   "type": "module",
   "scripts": {

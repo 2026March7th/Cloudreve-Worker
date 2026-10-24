@@ -71,4 +71,4 @@ npm run deploy                   # 部署
 
 ## 许可
 
-MIT。上游是 [cloudreve/Cloudreve](https://github.com/cloudreve/Cloudreve)。
+GPL-3.0。本项目是 [cloudreve/Cloudreve](https://github.com/cloudreve/Cloudreve)（GPL-3.0）的移植，所以沿用同一许可，见 `LICENSE`。
