@@ -410,10 +410,10 @@ export class UploadService {
 
     const driver = this.ctx.driverFor(session.policy);
 
-    // 是否覆盖已有内容（用于事件类型判定：create vs modify）
-    const hadContent = session.fileId
-      ? (await this.ctx.files.byId(session.fileId))?.primary_entity !== null
-      : false;
+    // 覆盖前的文件快照：既用于事件类型判定（create vs modify），
+    // 也用于容量预占失败时把「转正」回滚回去。
+    const prev = session.fileId ? await this.ctx.files.byId(session.fileId) : null;
+    const hadContent = prev?.primary_entity != null;
 
     await driver.completeUpload(session);
 
@@ -450,8 +450,21 @@ export class UploadService {
     const claimed = await this.ctx.entities.claimUploadSession(session.entityId, session.id);
     if (!claimed) return; // 已被并发/重试的另一次收尾记账（其上的转正操作都是幂等的）
 
-    // 容量记账
-    await this.ctx.users.addStorage(session.uid, session.size);
+    // 容量记账：走数据库原子预占，而不是「读快照 → 判断 → 自增」。
+    // 先查后记在并发下会让多个上传同时通过检查、最后一起超配额；预占把判定和
+    // 自增压进同一条 UPDATE，由行锁串行化（对应上游 UsersRepo.ReserveStorage）。
+    // 预占失败必须把上面三步「转正」回滚：容量没记上，内容就不能留在文件上。
+    const reserved = await this.ctx.users.reserveStorage(
+      session.uid,
+      session.size,
+      this.ctx.maxStorage,
+    );
+    if (!reserved) {
+      await this.ctx.entities.unlinkFile(session.fileId, session.entityId);
+      await this.ctx.files.updatePrimaryEntity(session.fileId, prev?.primary_entity ?? null);
+      await this.ctx.files.updateSize(session.fileId, prev?.size ?? 0);
+      this.ctx.throwCapacity();
+    }
 
     // 清理同一文件下其它未完成会话遗留的占位实体
     const entities = await this.ctx.entities.listByFile(session.fileId);
@@ -638,7 +651,16 @@ export class UploadService {
     await this.ctx.entities.linkFile(file.id, entity.id);
     await this.ctx.files.updatePrimaryEntity(file.id, entity.id);
     await this.ctx.files.updateSize(file.id, length);
-    await this.ctx.users.addStorage(user.id, length);
+
+    // 容量记账同样走原子预占（并发保存不会一起突破配额）。
+    // 失败要回滚上面三步：没记上容量就不能把新内容当成主版本。
+    const reserved = await this.ctx.users.reserveStorage(user.id, length, this.ctx.maxStorage);
+    if (!reserved) {
+      await this.ctx.entities.unlinkFile(file.id, entity.id);
+      await this.ctx.files.updatePrimaryEntity(file.id, file.primary_entity);
+      await this.ctx.files.updateSize(file.id, Number(file.size));
+      this.ctx.throwCapacity();
+    }
 
     // 新旧实体同在一张 file_entities 里，按版本保留策略裁剪（与上传提交同一条路径）
     await this.capVersionEntities(file.id, file.owner_id, file.name);

@@ -377,6 +377,34 @@ export class UserRepo {
     await this.touchCache(id);
   }
 
+  /**
+   * 原子预占容量：`storage + size` 必须在 `maxTotal` 之内（null / <=0 表示不限）。
+   * 返回 false 表示已超配额，此时**不会**改动 storage。
+   *
+   * 对应上游 `userClient.ReserveStorage`（`inventory/user.go`）。为什么不能沿用
+   * 「先 assertCapacity 再 addStorage」：前者读的是请求开始时的用户快照，两个
+   * 并发上传都会通过检查，最后一起写进去 → 实际用量超配额。把判定和自增放进
+   * 同一条 UPDATE，由数据库行锁串行化，超出的那个直接 0 行受影响。
+   */
+  async reserveStorage(id: number, size: number, maxTotal: number | null): Promise<boolean> {
+    if (size <= 0) return true;
+    const rows = (
+      maxTotal !== null && maxTotal > 0
+        ? await this.sql`
+            UPDATE users SET storage = storage + ${size}, updated_at = now()
+            WHERE id = ${id} AND storage <= ${maxTotal - size}
+            RETURNING id
+          `
+        : await this.sql`
+            UPDATE users SET storage = storage + ${size}, updated_at = now()
+            WHERE id = ${id}
+            RETURNING id
+          `
+    ) as Record<string, unknown>[];
+    await this.touchCache(id);
+    return rows.length > 0;
+  }
+
   /** 原子给某用户追加一个容量包（JSONB 数组追加，避免并发读写覆盖导致丢包）。 */
   async addQuotaPack(
     userId: number,

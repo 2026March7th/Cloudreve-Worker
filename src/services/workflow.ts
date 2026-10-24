@@ -569,8 +569,20 @@ export class WorkflowService {
         imported += 1;
       }
 
-      // 容量记账：导入的对象同样占用目标用户配额
-      await this.ctx.users.addStorage(target.id, totalBytes);
+      // 容量记账：导入的对象同样占用目标用户配额。
+      // 走数据库原子预占 —— 导入是批量写，先查后记在并发导入下会一起突破上限。
+      const quotaLimit = target.group?.max_storage ?? 0;
+      const reserved = await this.ctx.users.reserveStorage(
+        target.id,
+        totalBytes,
+        quotaLimit > 0 ? quotaLimit : null,
+      );
+      if (!reserved) {
+        throw new AppError(
+          CodeFeatureNotEnabled,
+          `Import needs ${totalBytes} bytes but the destination quota is insufficient`,
+        );
+      }
 
       await this.ctx.tasks.updateStatus(task.id, 'completed', {
         summary: {
