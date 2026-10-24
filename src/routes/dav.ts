@@ -803,8 +803,9 @@ function lockResponse(c: AppRequest, lock: DavLock, status: 200 | 201): Response
  *   - 目标被锁且请求没在 If 头里给出对应 token → 423 Locked；
  *   - `includeDescendants`（DELETE / MOVE）时，树内子孙上的锁同样要求 token。
  *
- * 属主例外：同一账号自己锁的、且请求**完全没带 If 头**时放行 —— 不少客户端
- * 只在改「别人锁住的资源」时才补 If；带了 If 但对不上仍然 423。
+ * 严格按 RFC：不做「属主放行」—— 锁要防的正是同一个人的两个客户端并发写，
+ * 放行等于把锁的意义抹掉。Windows / RaiDrive / Cyberduck 在写完 LOCK 之后
+ * 都会在 If 头里带 token；rclone 这类根本不发 LOCK 的客户端不会触发校验。
  */
 async function lockedWriteResponse(
   c: AppRequest,
@@ -816,9 +817,7 @@ async function lockedWriteResponse(
   const locks = await loadLocks(kv);
   if (locks.length === 0) return null;
 
-  const ifHeader = c.req.header('If');
-  const lists = parseIfHeader(ifHeader);
-  const principal = ctx.user?.id ?? -1;
+  const lists = parseIfHeader(c.req.header('If'));
 
   for (const target of targets) {
     const path = decodedPath(target);
@@ -829,7 +828,6 @@ async function lockedWriteResponse(
         (opts.includeDescendants === true && lock.path.startsWith(prefix)),
     );
     for (const lock of related) {
-      if (lock.principal === principal && !ifHeader) continue;
       if (ifAssertsToken(lists, lock.token)) continue;
       return c.body(null, 423);
     }
