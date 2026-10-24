@@ -343,13 +343,13 @@ export class FileSystemService {
     if (!uri.id) throw Err.shareNotFound();
     const shareId = this.ctx.codec.decodeShareID(uri.id);
     if (shareId === null) throw Err.shareNotFound();
-    const share = await this.ctx.shares.byId(shareId);
-    if (!share) throw Err.shareNotFound();
 
-    const owner = share.user_shares ? await this.ctx.users.byId(share.user_shares) : null;
-    const root = share.file_shares ? await this.ctx.files.byId(share.file_shares) : null;
+    // 分享 / 文件 / 属主 / 属主组一次 JOIN 取齐：原来是 4 条串行查询，
+    // 在「边缘在港、库在新加坡」的部署下每次分享访问白付 3 次往返。
+    const bundle = await this.ctx.shares.infoBundle(shareId);
+    if (!bundle) throw Err.shareNotFound();
+    const { share, file: root, owner, ownerGroup } = bundle;
     // 上游 PR #3524：属主当前所属组失去 Share 权限位时分享失效
-    const ownerGroup = owner?.group_users ? await this.ctx.groups.byId(owner.group_users) : null;
     if (isShareInvalid(share, root, owner, ownerGroup)) throw Err.shareNotFound();
 
     const viewer = this.ctx.user;
@@ -502,16 +502,20 @@ export class FileSystemService {
 
   async buildFileResponse(file: FileRow, options: BuildFileOptions = {}): Promise<FileResponse> {
     const user = this.ctx.user;
-    const path = options.precomputedPath ?? (await this.pathOf(file));
     // 用户视角的 URI：
     //   - 回收站项固定是 `cloudreve://trash/<随机名>`（原版 trash_navigator.go:94-95）；
     //   - 其余情况以调用方给的 `options.uri` 为准 —— 分享空间下它是
     //     `cloudreve://<shareHashid>[:<pwd>]@share/<path>`（原版 share_navigator.go:148
     //     把 root 的 pathIndexUser 设成请求 URI 的 Root()，子节点在此基础上 Join）；
-    //   - 没给 uri 时回落到 `cloudreve://my/<path>`。
+    //   - 没给 uri 时才回落到 `cloudreve://my/<path>`，这时才需要算路径。
+    //
+    // ⚠️ 路径计算（`pathOf`）是一条向上逐级查库的链，**只在真的要用时才做**。
+    // 原来无条件先算一遍，而列表接口每个条目都传了 uri → 白跑一趟（分享目录
+    // 列表因此在跨区库上白付一次往返）。
     const userViewUri = this.isInTrash(file)
       ? URI.trash(file.name)
-      : options.uri ?? URI.my(path);
+      : (options.uri ??
+        URI.my(options.precomputedPath ?? (await this.pathOf(file))));
 
     const res: FileResponse = {
       type: file.type,
