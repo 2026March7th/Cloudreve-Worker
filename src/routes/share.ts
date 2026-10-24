@@ -19,6 +19,27 @@ import { Err } from '../lib/errors';
 
 export const shareRoutes = new Hono<AppBindings>();
 
+/**
+ * OAuth scope 校验（对应上游分享写路由上的 `RequiresScopes(ScopeSharesWrite)`）：
+ *   - 建/改/删分享 → `Shares.Write`
+ *   - 转存（`/save/:id`）会写文件 → `Files.Write`
+ *   - 购买付费分享（`/purchase/:id`）不碰分享本身，放行
+ * 内置登录签发的 token 没有 scopes，不受影响。
+ */
+shareRoutes.use('*', async (c, next) => {
+  const method = c.req.method.toUpperCase();
+  if (method === 'GET' || method === 'HEAD') return next();
+  const path = c.req.path.replace(/^\/api\/v4\/share/, '') || '/';
+  if (path.startsWith('/purchase/')) return next();
+  const ctx = ctxOf(c);
+  if (path.startsWith('/save/')) {
+    if (!ctx.hasScopes(['Files.Write'])) return fail(c, Err.scopeInsufficient('Files.Write'));
+    return next();
+  }
+  if (!ctx.hasScopes(['Shares.Write'])) return fail(c, Err.scopeInsufficient('Shares.Write'));
+  await next();
+});
+
 function buildService(c: AppRequest): ShareService {
   const ctx = ctxOf(c);
   return new ShareService(ctx, new FileSystemService(ctx));
@@ -129,7 +150,8 @@ shareRoutes.delete('/', async (c) => {
   if (!body.ids?.length) return fail(c, Err.param('ids is required'));
   try {
     await buildService(c).batchDelete(body.ids);
-    return ok(c);
+    // 上游 4.16 起显式回一个空对象而不是省略 data（7a43005），前端按对象解构
+    return ok(c, {});
   } catch (e) {
     return fail(c, e);
   }

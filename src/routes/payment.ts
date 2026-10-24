@@ -184,6 +184,12 @@ paymentAdminRoutes.use('*', async (c, next) => {
   const ctx = ctxOf(c);
   if (!ctx.user) return fail(c, Err.loginRequired());
   if (!ctx.isAdmin) return fail(c, Err.adminRequired());
+  // 与管理端一致：读要 Admin.Read，生成礼品卡这类写操作要 Admin.Write。
+  if (!ctx.hasScopes(['Admin.Read'])) return fail(c, Err.scopeInsufficient('Admin.Read'));
+  const method = c.req.method.toUpperCase();
+  if (method !== 'GET' && method !== 'HEAD' && !ctx.hasScopes(['Admin.Write'])) {
+    return fail(c, Err.scopeInsufficient('Admin.Write'));
+  }
   await next();
 });
 

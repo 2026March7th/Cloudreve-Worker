@@ -85,12 +85,19 @@ const AUTO_SCOPES = [
   'UserInfo.Read',
   'UserInfo.Write',
   'UserSecurityInfo.Read',
+  'UserSecurityInfo.Write',
   'Workflow.Read',
   'Workflow.Write',
   'Files.Read',
   'Files.Write',
   'Shares.Read',
+  'Shares.Write',
   'DavAccount.Read',
+  'DavAccount.Write',
+  'Finance.Read',
+  'Finance.Write',
+  'Admin.Read',
+  'Admin.Write',
 ];
 
 /** KV 里的授权码内容。 */

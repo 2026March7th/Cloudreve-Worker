@@ -65,11 +65,45 @@ import type { GroupRow, StoragePolicyRow } from '../db/types';
 
 export const adminRoutes = new Hono<AppBindings>();
 
-/** 所有管理端点统一先做管理员校验。 */
+/**
+ * 只读的 POST 端点。管理后台的列表查询沿用原版写法：条件多、用 POST 传，不是写操作，
+ * 不该要求 Admin.Write。新建/修改走 PUT / PATCH。
+ */
+const READ_ONLY_POSTS = new Set([
+  '/audit/log',
+  '/settings',
+  '/group',
+  '/policy',
+  '/user',
+  '/file',
+  '/entity',
+  '/share',
+  '/queue',
+  '/node',
+  '/oauthClient',
+]);
+
+/**
+ * 所有管理端点统一先做管理员校验，再按方法做 OAuth scope 校验。
+ *
+ * 对应上游 `routers/router.go` 里管理分组上的 `RequiredScopes(ScopeAdminRead)`
+ * 与逐个写路由上的 `ScopeAdminWrite`。少了 scope 这一层，一个只申请了
+ * `Files.Read` 的 OAuth 客户端只要绑定在管理员账号上，就能改站点设置、建用户、
+ * 删存储策略 —— 这正是上游 4.15~4.19 连续几个安全提交在修的问题。
+ * 内置登录签发的 token 没有 scopes，不受限制。
+ */
 adminRoutes.use('*', async (c, next) => {
   const ctx = ctxOf(c);
   if (!ctx.user) return fail(c, Err.loginRequired());
   if (!ctx.isAdmin) return fail(c, Err.adminRequired());
+  if (!ctx.hasScopes(['Admin.Read'])) return fail(c, Err.scopeInsufficient('Admin.Read'));
+
+  const method = c.req.method.toUpperCase();
+  const path = (c.req.path.replace(/^\/api\/v4\/admin/, '') || '/').replace(/\/+$/, '') || '/';
+  const isWrite = method !== 'GET' && method !== 'HEAD' && !READ_ONLY_POSTS.has(path);
+  if (isWrite && !ctx.hasScopes(['Admin.Write'])) {
+    return fail(c, Err.scopeInsufficient('Admin.Write'));
+  }
   await next();
 });
 

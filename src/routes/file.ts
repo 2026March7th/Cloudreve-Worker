@@ -53,6 +53,31 @@ import { throttleStream } from '../lib/throttle';
 
 export const fileRoutes = new Hono<AppBindings>();
 
+/**
+ * 语义上是「读」的写方法端点：下载地址、预览会话、目录视图偏好。
+ * 它们用 POST 只是为了传参，OAuth 只读客户端（Files.Read）也该能用。
+ */
+const FILE_READ_ONLY_POSTS = new Set(['/url', '/viewerSession', '/view']);
+
+/**
+ * OAuth scope 校验：写操作必须带 `Files.Write`。
+ *
+ * 对应上游 `routers/router.go` 里每个 file 写路由上的
+ * `RequiredScopes(ScopeFilesWrite)`。之前我们只解析了 scope、从没校验过 ——
+ * 一个只申请了 `Files.Read` 的第三方客户端拿到 token 后能直接删文件。
+ * 内置登录签发的 token 没有 scopes，不受影响。
+ */
+fileRoutes.use('*', async (c, next) => {
+  const method = c.req.method.toUpperCase();
+  if (method === 'GET' || method === 'HEAD') return next();
+  const path = c.req.path.replace(/^\/api\/v4\/file/, '') || '/';
+  if (FILE_READ_ONLY_POSTS.has(path) || path.startsWith('/wopi/')) return next();
+  if (!ctxOf(c).hasScopes(['Files.Write'])) {
+    return fail(c, Err.scopeInsufficient('Files.Write'));
+  }
+  await next();
+});
+
 /** 统一的「需要登录」守卫 */
 function guard(c: AppRequest): boolean {
   return Boolean(ctxOf(c).user);

@@ -252,6 +252,28 @@ adminContentRoutes.get('/user/:id', async (c) => {
  *   - `two_fa: "clear"` 是「重置两步验证」的表达（`UserDialog.tsx:95`），
  *     即清空 TOTP 密钥。
  */
+/**
+ * 管理员创建/修改用户时的凭证校验（对应上游 `adminUserEmailValidation`：
+ * `binding:"required,email"`，密码 `omitempty,min=6,max=128`）。
+ *
+ * 之前只在创建时检查「非空 + 长度 >= 6」，改用户时连格式都不校验 —— 能把
+ * 邮箱改成一个不存在的串，之后密码重置、激活邮件全部失效。
+ */
+function assertEmail(value: string): string {
+  const email = value.trim();
+  // 口径接近 go-playground 的 email：单个 @，域名至少有一个点，长度 <= 254。
+  if (email.length > 254 || !/^[^\s@]+@[^\s@.]+(\.[^\s@.]+)+$/.test(email)) {
+    throw Err.param('Email format error');
+  }
+  return email;
+}
+
+function assertPassword(value: string): void {
+  if (value.length < 6 || value.length > 128) {
+    throw Err.param('Password should be between 6 and 128 characters');
+  }
+}
+
 async function upsertUser(c: Context<AppBindings>, id: number | null) {
   const { sql, codec, ctx } = withCtx(c);
   const raw = await readBody(c);
@@ -259,10 +281,9 @@ async function upsertUser(c: Context<AppBindings>, id: number | null) {
   const password = String(body.password ?? raw.password ?? '');
 
   if (id === null) {
-    const email = String(body.email ?? '').trim();
-    if (!email) throw Err.param('Email is required');
+    const email = assertEmail(String(body.email ?? ''));
     if (!password) throw Err.param('Password is required');
-    if (password.length < 6) throw Err.param('Password is too short');
+    assertPassword(password);
 
     const exists = (await sql(
       'SELECT id FROM users WHERE email = $1 AND deleted_at IS NULL LIMIT 1',
@@ -291,7 +312,7 @@ async function upsertUser(c: Context<AppBindings>, id: number | null) {
   if (body.email !== undefined) {
     await sql('UPDATE users SET email = $2, updated_at = now() WHERE id = $1', [
       id,
-      String(body.email),
+      assertEmail(String(body.email)),
     ]);
   }
   if (body.nick !== undefined) {
@@ -315,7 +336,7 @@ async function upsertUser(c: Context<AppBindings>, id: number | null) {
     }
   }
   if (password) {
-    if (password.length < 6) throw Err.param('Password is too short');
+    assertPassword(password);
     await ctx.users.updatePassword(id, await digestPassword(password));
   }
   // 积分调整（edge 自建）：管理员在用户编辑弹窗里直接改积分余额。

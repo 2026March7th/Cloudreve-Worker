@@ -6,6 +6,7 @@ import type { Env } from '../env';
 import type { SettingsProvider } from '../settings/provider';
 import type { HashIDCodec } from '../lib/hashid';
 import type { JWTService } from '../lib/jwt';
+import { checkScope } from '../lib/jwt';
 import { Signer } from '../lib/sign';
 import {
   DirectLinkRepo,
@@ -335,21 +336,49 @@ export class AppContext {
     return Number(this.requireUser().storage ?? 0);
   }
 
-  /** 容量校验：超出上限抛 40051。 */
+  /**
+   * 容量预检：超出上限抛 40051。
+   *
+   * 只是「早失败」的快速通道 —— 它读的是请求开始时加载的用户快照，并发下
+   * 两个上传都能通过。真正的把关在写入侧的 DB 原子预占
+   * （`UserRepo.reserveStorage`），见 `throwCapacity`。
+   */
   assertCapacity(additional: number): void {
     const max = this.maxStorage;
     if (max === null || max <= 0) return; // 不限量
-    if (this.usedStorage + additional > max) {
-      // 对应原版 Pro 的「存储配额超出」通知（mail_exceed_quota_template）：
-      // 由中间件注入 notifier，fire-and-forget 发信（限频在 notifier 内做），
-      // 绝不能阻塞或影响这次必然失败的请求。
-      try {
-        this.onQuotaExceeded?.(this.requireUser());
-      } catch {
-        /* 通知失败不影响业务错误抛出 */
-      }
-      throw new AppError(40051, 'Insufficient capacity');
+    if (this.usedStorage + additional > max) this.throwCapacity();
+  }
+
+  /**
+   * 配额不足：触发一次配额通知（若有）后抛 40051。
+   *
+   * 原子预占失败（DB 判定 storage + size 超上限）也走这里，保证两条路径的
+   * 错误码与通知行为一致。
+   */
+  throwCapacity(): never {
+    // 对应原版 Pro 的「存储配额超出」通知（mail_exceed_quota_template）：
+    // 由中间件注入 notifier，fire-and-forget 发信（限频在 notifier 内做），
+    // 绝不能阻塞或影响这次必然失败的请求。
+    try {
+      this.onQuotaExceeded?.(this.requireUser());
+    } catch {
+      /* 通知失败不影响业务错误抛出 */
     }
+    throw new AppError(40051, 'Insufficient capacity');
+  }
+
+  // -------------------------------------------------------------------------
+  // OAuth scope
+  // -------------------------------------------------------------------------
+
+  /**
+   * 当前 token 是否覆盖所需 scope。写权限隐式包含对应读权限，且内置登录
+   * （非 OAuth 客户端签发的 token，`scopes` 为 undefined）一律放行。
+   *
+   * 对应上游 `middleware.RequiredScopes` / `types.CheckScope`。
+   */
+  hasScopes(required: string[]): boolean {
+    return checkScope(this.scopes, required);
   }
 
   // -------------------------------------------------------------------------
