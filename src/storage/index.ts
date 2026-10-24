@@ -18,9 +18,13 @@
  *   - `onedrive` → OneDriveDriver（Microsoft Graph）
  *   - `upyun`    → 又拍云（**非 S3 协议**，独立 UpyunDriver：自有 REST +
  *                  UPYUN 签名，全中转上传/下载，见 upyun.ts）
+ *   - `remote`   → NodeRelayDriver（节点中转，文件落在从节点自己的磁盘上）
+ *   - `local`    → 同一份 NodeRelayDriver。Worker 没有本地磁盘，所以「本地文件
+ *                  系统存储」只能由节点提供 —— 策略必须绑 `node_id`，
+ *                  对应「从节点的本地磁盘」。上游里 `local` 指的是主站所在
+ *                  机器的磁盘，云函数里没有这个概念。
  *
- * `local` / `remote` 仍未实现（Workers 无本地文件系统、remote 依赖节点
- * 模型），取驱动时抛 `CodePolicyNotAllowed`。
+ * 拆包说明：`nodeRelay.ts` 只依赖 lib/db，不 import 任何路由。
  */
 import type { Env } from '../env';
 import type { StoragePolicyRow } from '../db/types';
@@ -30,6 +34,10 @@ import { R2Driver } from './r2';
 import { OneDriveDriver } from './onedrive';
 import { S3CompatibleDriver } from './s3';
 import { UpyunDriver } from './upyun';
+import { NodeRelayDriver } from './nodeRelay';
+import { requireNode } from '../db/nodes';
+import { loadSettings } from '../settings/provider';
+import { BACKEND_VERSION } from '../lib/version';
 import type { StorageDriver } from './types';
 
 /** 当前实现支持的策略类型。 */
@@ -42,7 +50,34 @@ export const SUPPORTED_POLICY_TYPES = [
   PolicyType.Ks3,
   PolicyType.OneDrive,
   PolicyType.Upyun,
+  PolicyType.Local,
+  PolicyType.Remote,
 ] as const;
+
+/** 必须绑定从节点才能工作的类型（Worker 侧没有本地磁盘）。 */
+export const NODE_BOUND_POLICY_TYPES: readonly string[] = [PolicyType.Local, PolicyType.Remote];
+
+export function isNodeBoundPolicyType(type: string): boolean {
+  return NODE_BOUND_POLICY_TYPES.includes(type);
+}
+
+/**
+ * 节点存储驱动：把「查节点 + 站点信息」注入进去，驱动自身不碰 db。
+ * 站点信息（siteId/siteUrl/版本）随每个 RPC 带给从机，从机用它拼回调地址。
+ */
+function createNodeRelayDriver(env: Env, policy: StoragePolicyRow): NodeRelayDriver {
+  return new NodeRelayDriver(policy, async (p) => {
+    const [node, settings] = await Promise.all([requireNode(env, p.node_id), loadSettings(env)]);
+    return {
+      node,
+      meta: {
+        siteId: settings.siteId,
+        siteUrl: settings.siteUrl,
+        version: BACKEND_VERSION,
+      },
+    };
+  });
+}
 
 export function getStorageDriver(env: Env, policy: StoragePolicyRow): StorageDriver {
   switch (policy.type) {
@@ -60,6 +95,16 @@ export function getStorageDriver(env: Env, policy: StoragePolicyRow): StorageDri
       return new OneDriveDriver(env, policy);
     case PolicyType.Upyun:
       return new UpyunDriver(policy);
+    case PolicyType.Local:
+    case PolicyType.Remote:
+      if (!policy.node_id) {
+        throw new AppError(
+          CodePolicyNotAllowed,
+          `Storage policy "${policy.name}" must be bound to a node: ` +
+            'the edge build has no local disk, node storage is the only way to keep files on a disk',
+        );
+      }
+      return createNodeRelayDriver(env, policy);
     default:
       throw new AppError(
         CodePolicyNotAllowed,
@@ -86,3 +131,4 @@ export { R2Driver } from './r2';
 export { OneDriveDriver } from './onedrive';
 export { S3CompatibleDriver } from './s3';
 export { UpyunDriver } from './upyun';
+export { NodeRelayDriver } from './nodeRelay';

@@ -66,6 +66,31 @@ export interface StoragePolicyRow {
   node_id: number | null;
 }
 
+/**
+ * 从节点。对应上游 `ent.Node`（`application/migrator/model/node.go`）。
+ *
+ * `server` 是从节点的访问地址，`slave_key` 是**主→从 RPC 的 HMAC 密钥**
+ * （与从节点配置文件里的 `[Slave] Secret` 是同一个值）。策略 `node_id`
+ * 指向这里，存储读写就打到这台机器的磁盘上。
+ */
+export interface NodeRow {
+  id: number;
+  created_at: Date;
+  updated_at: Date;
+  deleted_at: Date | null;
+  name: string;
+  /** `master` / `slave` */
+  type: string;
+  server: string | null;
+  slave_key: string | null;
+  /** 能力位布尔集（序列化字符串），任务分派用；存储走 policy.node_id，不看它 */
+  capabilities: string | null;
+  weight: number | null;
+  /** `active` / `suspended` */
+  status: string;
+  settings: Record<string, unknown> | null;
+}
+
 export interface FileRow {
   id: number;
   created_at: Date;

@@ -18,6 +18,7 @@ import { UserService } from '../services/user';
 import { publicOidcInfo } from '../services/oidc';
 import type { AppContext } from '../services/context';
 import { kvFor } from '../lib/kvRouter';
+import { BACKEND_VERSION } from '../lib/version';
 import { backupDatabaseUrls, databaseUrls, failoverEnabled } from '../db';
 import { archiveCount, archiveEnabled } from '../services/archive';
 import { walUnfinished } from '../services/wal';
@@ -44,8 +45,8 @@ function parseJson<T>(raw: string | undefined | null, fallback: T): T {
     return fallback;
   }
 }
-/** 与原版 constants.BackendVersion 保持一致 */
-export const BACKEND_VERSION = '4.19.1';
+/** 与原版 constants.BackendVersion 保持一致（定义在 lib 里，供存储驱动复用） */
+export { BACKEND_VERSION };
 
 export const siteRoutes = new Hono<AppBindings>();
 

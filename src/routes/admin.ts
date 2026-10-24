@@ -37,6 +37,7 @@
  * 付费/订单/兑换码相关的一切在原版社区版里就不存在，边缘版同样没有。
  */
 import { Hono } from 'hono';
+import type { Context } from 'hono';
 import type { AppBindings } from '../middleware/app';
 import { ctxOf } from '../middleware/app';
 import { permissionsOf } from '../services/context';
@@ -54,7 +55,8 @@ import {
 } from '../lib/errors';
 import { invalidateSettings } from '../settings/provider';
 import { AuditRepo } from '../db/audit';
-import { SUPPORTED_POLICY_TYPES, getStorageDriver, isPolicyTypeSupported, isSelectablePolicyType } from '../storage';
+import { SUPPORTED_POLICY_TYPES, getStorageDriver, isNodeBoundPolicyType, isPolicyTypeSupported, isSelectablePolicyType } from '../storage';
+import { loadNodeById } from '../db/nodes';
 import { validateLoadBalanceSettings } from '../storage/loadBalance';
 import { BACKEND_VERSION } from './site';
 import { adminContentRoutes } from './admin-content';
@@ -836,7 +838,34 @@ function policyCreateArgs(body: Record<string, unknown>, type: string) {
     dirNameRule: (body.dir_name_rule as string) || null,
     fileNameRule: (body.file_name_rule as string) || null,
     settings: (body.settings as Record<string, unknown>) ?? {},
+    nodeId: body.node_id === undefined || body.node_id === null ? null : Number(body.node_id) || null,
   };
+}
+
+/**
+ * `local` / `remote` 把文件写到从节点的磁盘上，必须绑定一个可用的从节点。
+ *
+ * 边缘版没有「主站本地磁盘」这种东西，所以 `local` 在云函数里也只能由节点提供
+ * （前端的新建向导里 `local` 没有节点选择框，实际请用 `remote` 类型 + 节点，
+ * 两者在服务端是同一份驱动）。
+ */
+async function assertPolicyNode(
+  c: Context<AppBindings>,
+  type: string,
+  rawNodeId: unknown,
+): Promise<void> {
+  if (!isNodeBoundPolicyType(type)) return;
+  const nodeId = Number(rawNodeId ?? 0) || 0;
+  if (!nodeId) {
+    throw Err.param(
+      '这一类型把文件写到从节点磁盘上，必须选一个节点。云函数没有本地磁盘，' +
+        '「本地文件系统存储」请用「节点中转」类型并绑定节点。',
+    );
+  }
+  const node = await loadNodeById(c.env, nodeId);
+  if (!node) throw Err.param('Node not found');
+  if (node.type !== 'slave') throw Err.param('Only slave nodes can hold storage policies');
+  if (node.status !== 'active') throw Err.param(`Node "${node.name}" is suspended`);
 }
 
 adminRoutes.put('/policy', async (c) => {
@@ -854,6 +883,7 @@ adminRoutes.put('/policy', async (c) => {
     await validateLoadBalanceSettings(ctx.policies, body.settings as Record<string, unknown> | undefined);
   }
   try {
+    await assertPolicyNode(c, type, body.node_id);
     const policy = await ctx.policies.create(policyCreateArgs(body, type));
     return ok(c, policyToResponse(ctx.codec, policy));
   } catch (e) {
@@ -882,6 +912,11 @@ adminRoutes.put('/policy/:id', async (c) => {
   }
 
   try {
+    await assertPolicyNode(
+      c,
+      String(body.type ?? policy.type),
+      body.node_id !== undefined ? body.node_id : policy.node_id,
+    );
     await ctx.policies.update(
       id,
       {
@@ -894,6 +929,9 @@ adminRoutes.put('/policy/:id', async (c) => {
         ...(body.dir_name_rule !== undefined ? { dir_name_rule: body.dir_name_rule as string } : {}),
         ...(body.file_name_rule !== undefined ? { file_name_rule: body.file_name_rule as string } : {}),
         ...(body.settings !== undefined ? { settings: body.settings } : {}),
+        ...(body.node_id !== undefined
+          ? { node_id: body.node_id === null ? null : Number(body.node_id) || null }
+          : {}),
       },
       {
         // 空值表示「不改动」——前端会把读到的值原样回填，这里防的是空串把密钥冲掉

@@ -744,15 +744,17 @@ export class PolicyRepo {
     dirNameRule?: string | null;
     fileNameRule?: string | null;
     settings?: Record<string, unknown>;
+    /** 节点存储（local / remote）绑定的从节点 id */
+    nodeId?: number | null;
   }): Promise<StoragePolicyRow> {
     const rows = (await this.sql`
       INSERT INTO storage_policies
         (name, type, server, bucket_name, is_private, access_key, secret_key,
-         max_size, dir_name_rule, file_name_rule, settings)
+         max_size, dir_name_rule, file_name_rule, settings, node_id)
       VALUES (${args.name}, ${args.type}, ${args.server ?? null}, ${args.bucketName ?? null},
               ${args.isPrivate ?? null}, ${args.accessKey ?? null}, ${args.secretKey ?? null},
               ${args.maxSize ?? null}, ${args.dirNameRule ?? null}, ${args.fileNameRule ?? null},
-              ${JSON.stringify(args.settings ?? {})}::jsonb)
+              ${JSON.stringify(args.settings ?? {})}::jsonb, ${args.nodeId ?? null})
       RETURNING *
     `) as Record<string, unknown>[];
     return normalizePolicy(rows[0]!);
@@ -805,6 +807,9 @@ export class PolicyRepo {
         UPDATE storage_policies SET settings = ${JSON.stringify(patchFields.settings)}::jsonb, updated_at = now()
         WHERE id = ${id}
       `;
+    }
+    if (patchFields.node_id !== undefined) {
+      await this.sql`UPDATE storage_policies SET node_id = ${patchFields.node_id as number | null}, updated_at = now() WHERE id = ${id}`;
     }
     if (encrypted.accessKey !== undefined) {
       await this.sql`UPDATE storage_policies SET access_key = ${encrypted.accessKey}, updated_at = now() WHERE id = ${id}`;

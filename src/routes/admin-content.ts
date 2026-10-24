@@ -31,6 +31,7 @@ import { BACKEND_VERSION } from './site';
 import { digestPassword, randomString } from '../lib/crypto';
 import { logAudit } from '../services/audit';
 import { getSql, type Sql } from '../db';
+import { invalidateNodeCache } from '../db/nodes';
 import { resolveDomainHandle } from '../db/shard';
 import type { HashIDCodec } from '../lib/hashid';
 import { numericId, paginationArgs, paginationOf, unwrapBody } from './shared';
@@ -1143,12 +1144,18 @@ adminContentRoutes.post('/node', async (c) => {
   const { sql } = withCtx(c);
   const body = await readBody(c);
   const { page, pageSize, offset } = paginationArgs(body);
+  // 策略新建向导的节点下拉只想要启用中的节点（`conditions.node_status`）
+  const conditions = (body.conditions as Record<string, unknown> | undefined) ?? {};
+  const statusFilter = String(conditions.node_status ?? body.status ?? '').trim();
+  const where = statusFilter ? 'deleted_at IS NULL AND status = $1' : 'deleted_at IS NULL';
+  const params: unknown[] = statusFilter ? [statusFilter] : [];
   const rows = (await sql(
-    'SELECT * FROM nodes WHERE deleted_at IS NULL ORDER BY id ASC LIMIT $1 OFFSET $2',
-    [pageSize, offset],
+    `SELECT * FROM nodes WHERE ${where} ORDER BY id ASC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+    [...params, pageSize, offset],
   )) as Record<string, unknown>[];
   const countRows = (await sql(
-    'SELECT COUNT(*)::int AS total FROM nodes WHERE deleted_at IS NULL',
+    `SELECT COUNT(*)::int AS total FROM nodes WHERE ${where}`,
+    params,
   )) as Record<string, unknown>[];
   return ok(c, {
       nodes: rows.map(nodeToResponse),
@@ -1198,6 +1205,7 @@ async function upsertNode(c: Context<AppBindings>, id: number | null, requireExi
         settings,
       ],
     )) as Record<string, unknown>[];
+    invalidateNodeCache(Number(rows[0]!.id));
     return nodeToResponse(rows[0]!);
   }
 
@@ -1220,6 +1228,7 @@ async function upsertNode(c: Context<AppBindings>, id: number | null, requireExi
     ],
   );
   const updated = await loadNode(sql, id);
+  invalidateNodeCache(id);
   return nodeToResponse(updated!);
 }
 
@@ -1267,6 +1276,7 @@ adminContentRoutes.delete('/node/:id', async (c) => {
     }
 
     await sql('UPDATE nodes SET deleted_at = now(), updated_at = now() WHERE id = $1', [id]);
+    invalidateNodeCache(id);
     return ok(c);
   } catch (e) {
     return fail(c, e);
