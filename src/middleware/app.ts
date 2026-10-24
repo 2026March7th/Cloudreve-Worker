@@ -28,6 +28,10 @@ export interface AppBindings {
     correlationId: string;
     /** WebDAV Basic Auth 验证通过的账号（仅 /dav 路由使用） */
     davAccount: import('../db/repo').DavAccountRow;
+    /** 从节点 RPC：验签通过的节点行（仅 /api/v4/slave 路由使用） */
+    slaveNode: import('../db/types').NodeRow;
+    /** 从节点 RPC：已读出的原始正文（中间件消费掉 body，这里带下去） */
+    slaveBody: string;
   };
 }
 

@@ -17,6 +17,7 @@ import {
   PolicyRepo,
   ShareRepo,
   TaskRepo,
+  NodeRepo,
   UserRepo,
   DavAccountRepo,
   PasskeyRepo,
@@ -54,6 +55,7 @@ export class AppContext {
   readonly metadata: MetadataRepo;
   readonly directLinks: DirectLinkRepo;
   readonly tasks: TaskRepo;
+  readonly nodes: NodeRepo;
   readonly davAccounts: DavAccountRepo;
   readonly passkeys: PasskeyRepo;
   /** URL / 请求签名器，密钥与 JWT 共用站点 secret */
@@ -118,6 +120,7 @@ export class AppContext {
     });
     this.directLinks = new DirectLinkRepo(sql);
     this.tasks = new TaskRepo(sql);
+    this.nodes = new NodeRepo(sql);
     this.davAccounts = new DavAccountRepo(sql);
     this.passkeys = new PasskeyRepo(sql);
     this.signer = new Signer(settings.secretKey);

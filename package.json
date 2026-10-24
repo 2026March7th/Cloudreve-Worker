@@ -26,8 +26,10 @@
     "test:copy": "node scripts/test-copy-roundtrip.mjs",
     "test:db-schema": "node scripts/test-db-schema-sync.mjs",
     "test:multidb": "node scripts/test-kv-router.mjs && node scripts/test-db-failover.mjs && node scripts/test-user-cache.mjs && node scripts/test-cache-purge.mjs && node scripts/test-db-schema-sync.mjs && node scripts/test-copy-fixture.mjs && node scripts/test-copy-roundtrip.mjs",
-    "test:node": "node scripts/test-node-relay.mjs",
-    "node:agent": "node agent/cloudreve-node-agent.mjs"
+    "test:node": "node scripts/test-node-relay.mjs && node scripts/test-node-tasks.mjs && node scripts/test-node-pool.mjs",
+    "node:agent": "node agent/cloudreve-node-agent.mjs",
+    "test:node-tasks": "node scripts/test-node-tasks.mjs",
+    "test:node-pool": "node scripts/test-node-pool.mjs"
   },
   "dependencies": {
     "@neondatabase/serverless": "^0.10.4",

@@ -24,6 +24,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import http from 'node:http';
+import { Readable } from 'node:stream';
 import path from 'node:path';
 
 // ---------------------------------------------------------------------------
@@ -219,6 +220,146 @@ function gcSessions() {
   for (const [id, s] of sessions) {
     if (now - s.createdAt > SESSION_TTL) sessions.delete(id);
   }
+}
+
+// ---------------------------------------------------------------------------
+// 任务（主站分派过来，在后台跑）
+// ---------------------------------------------------------------------------
+
+/** nodeTaskId → { type, state, status, error, createdAt } */
+const tasks = new Map();
+let taskSeq = 1;
+const TASK_TTL = 24 * 3600 * 1000;
+
+function gcTasks() {
+  const now = Date.now();
+  for (const [, t] of tasks) {
+    if (now - t.createdAt > TASK_TTL) tasks.delete(t.id);
+  }
+}
+
+/**
+ * 反向调用主站的 `/api/v4/slave/*`。
+ *
+ * 签名与主站打过来时同款（同一个 secret），只是方向相反：节点当客户端。
+ * 主站靠 `X-Cr-Node-Id` + HMAC 认这台机器，所以这两个头必须带上。
+ */
+async function masterRpc(masterSiteUrl, method, path, payload, nodeId) {
+  const base = String(masterSiteUrl || '').replace(/\/+$/, '');
+  if (!base) throw new Error('task state has no master_site_url');
+  const target = new URL(`/api/v4/slave/${path.replace(/^\/+/, '')}`, base);
+  const bodyText = payload === undefined ? '' : JSON.stringify(payload);
+  const expires = Math.floor(Date.now() / 1000) + 300;
+  const headers = {
+    'X-Cr-Node-Id': String(nodeId ?? 0),
+    'X-Cr-Site-Id': 'node-agent',
+    'X-Cr-Site-Url': base,
+    'X-Cr-Version': 'node-agent',
+  };
+  const content = goJson({ Path: target.pathname, Header: signedHeaderString(headers), Body: bodyText });
+  const sign = signContent(content, expires);
+  const res = await fetch(target.toString(), {
+    method,
+    headers: {
+      ...headers,
+      Authorization: `Bearer Cr ${sign}`,
+      'Content-Type': 'application/json; charset=utf-8',
+    },
+    ...(payload === undefined ? {} : { body: bodyText }),
+  });
+  const json = await res.json().catch(() => null);
+  if (!json) throw new Error(`master returned HTTP ${res.status} (non-JSON)`);
+  if ((json.code ?? 0) !== 0) throw new Error(`master returns code ${json.code}: ${json.msg ?? ''}`);
+  return json.data;
+}
+
+/** 远端文件大小：HEAD 拿不到就用 Range 探测（CDN 常见）。 */
+async function remoteSize(url) {
+  const head = await fetch(url, { method: 'HEAD' }).catch(() => null);
+  let size = Number(head?.headers.get('content-length') ?? 0);
+  if (size > 0) return size;
+  const probe = await fetch(url, { method: 'GET', headers: { Range: 'bytes=0-0' } }).catch(() => null);
+  const range = probe?.headers.get('content-range');
+  const total = range ? Number(range.split('/')[1]) : 0;
+  if (total > 0) return total;
+  return Number(probe?.headers.get('content-length') ?? 0);
+}
+
+/** 后台跑一个任务，状态写进 tasks 表。 */
+function startTask(type, stateRaw) {
+  gcTasks();
+  const id = taskSeq++;
+  tasks.set(id, { type, state: stateRaw, status: 'processing', createdAt: Date.now() });
+  console.log(`[node-agent] 接任务 #${id} ${type}`);
+
+  (async () => {
+    let sessionId = null;
+    try {
+      if (type === 'remote_download') {
+        // 先取到会话 id，失败时才能通知主站放弃
+        const st = JSON.parse(stateRaw);
+        const size = await remoteSize(st.url);
+        if (!size) throw new Error('remote file size is unknown');
+        const session = await masterRpc(st.master_site_url, 'PUT', 'statelessUpload/prepare', {
+          upload_request: { props: { uri: st.dst, size } },
+          user_id: st.user_id,
+        }, st.node_id);
+        sessionId = session?.Props?.UploadSessionID ?? null;
+        const savePath = session?.Props?.SavePath;
+        if (!savePath || !sessionId) throw new Error('master did not return a usable upload session');
+
+        const abs = resolveInRoot(savePath);
+        await fsp.mkdir(path.dirname(abs), { recursive: true });
+        const res = await fetch(st.url);
+        if (!res.ok || !res.body) throw new Error(`failed to fetch remote file: HTTP ${res.status}`);
+        // fetch 的 body 是 web ReadableStream，没有 .pipe —— 要转成 Node 流
+        await new Promise((resolve, reject) => {
+          const out = fs.createWriteStream(abs);
+          Readable.fromWeb(res.body).pipe(out);
+          out.on('finish', resolve);
+          out.on('error', reject);
+        });
+        const written = (await fsp.stat(abs)).size;
+        if (written !== size) throw new Error(`downloaded ${written} bytes but expected ${size}`);
+
+        await masterRpc(
+          st.master_site_url,
+          'POST',
+          'statelessUpload/complete',
+          { upload_session: { Props: { UploadSessionID: sessionId } }, user_id: st.user_id },
+          st.node_id,
+        );
+        console.log(`[node-agent] 远程下载完成 ${st.url} → ${savePath}（${size} B）`);
+      } else {
+        throw new Error(`unsupported task type: ${type}`);
+      }
+      const t = tasks.get(id);
+      if (t) t.status = 'completed';
+    } catch (err) {
+      const t = tasks.get(id);
+      if (t) {
+        t.status = 'error';
+        t.error = err.message;
+      }
+      console.error(`[node-agent] 任务 #${id} 失败：`, err.message);
+      if (sessionId) {
+        try {
+          const st = JSON.parse(stateRaw);
+          await masterRpc(
+            st.master_site_url,
+            'POST',
+            'statelessUpload/failed',
+            { upload_session: { Props: { UploadSessionID: sessionId } }, user_id: st.user_id },
+            st.node_id,
+          );
+        } catch {
+          /* 通知失败不影响任务状态 */
+        }
+      }
+    }
+  })();
+
+  return id;
 }
 
 // ---------------------------------------------------------------------------
@@ -485,6 +626,57 @@ async function handle(req, res) {
       return;
     }
     sendEnvelope(res, 0, '', items);
+    return;
+  }
+
+  // --- 任务 -----------------------------------------------------------------
+  if (p === '/api/v4/slave/task' && method === 'PUT') {
+    let body;
+    try {
+      body = JSON.parse(rawBody.toString('utf8') || '{}');
+    } catch {
+      sendEnvelope(res, 40001, 'invalid json body');
+      return;
+    }
+    const type = String(body.type ?? '');
+    const state = String(body.state ?? '{}');
+    if (!type) {
+      sendEnvelope(res, 40001, 'task type is required');
+      return;
+    }
+    const id = startTask(type, state);
+    sendEnvelope(res, 0, '', { id });
+    return;
+  }
+
+  const taskMatch = /^\/api\/v4\/slave\/task\/(\d+)$/.exec(p);
+  if (taskMatch && method === 'GET') {
+    const id = Number(taskMatch[1]);
+    const t = tasks.get(id);
+    if (!t) {
+      sendEnvelope(res, 40001, 'task not found');
+      return;
+    }
+    sendEnvelope(res, 0, '', {
+      status: t.status,
+      error: t.error ?? '',
+      private_state: t.state,
+    });
+    return;
+  }
+
+  if (p === '/api/v4/slave/task/cleanup' && method === 'POST') {
+    let body;
+    try {
+      body = JSON.parse(rawBody.toString('utf8') || '{}');
+    } catch {
+      sendEnvelope(res, 40001, 'invalid json body');
+      return;
+    }
+    for (const dir of Array.isArray(body.path) ? body.path : []) {
+      await fsp.rm(resolveInRoot(dir), { recursive: true, force: true }).catch(() => {});
+    }
+    sendEnvelope(res, 0);
     return;
   }
 

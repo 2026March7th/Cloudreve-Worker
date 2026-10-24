@@ -32,6 +32,7 @@ import {
   type RangeReader,
 } from '../lib/zipread';
 import { URI } from './uri';
+import { dispatchRemoteDownload, markDispatched } from './nodeTasks';
 
 /**
  * 单个任务允许处理的字节上限。
@@ -231,6 +232,28 @@ export class WorkflowService {
       userId: user.id,
       publicState: { summary: { props: { src: args.url, dst: args.dst } } },
     });
+
+    // 有具备 remoteDownload 能力的从节点就分派过去：文件大小不受
+    // MAX_WORKFLOW_BYTES 限制，也不占 Worker 的 CPU 预算。
+    // 分派失败（节点不可达等）不阻断任务 —— 回落到请求内执行。
+    try {
+      const dispatch = await dispatchRemoteDownload(this.ctx.env, {
+        taskId: task.id,
+        userId: user.id,
+        url: args.url,
+        dst: args.dst,
+      });
+      if (dispatch) {
+        await markDispatched(this.ctx, task.id, dispatch);
+        return (await this.ctx.tasks.byId(task.id))!;
+      }
+    } catch (e) {
+      console.error(
+        `remote download dispatch failed, falling back to in-request execution: ${
+          e instanceof Error ? e.message : e
+        }`,
+      );
+    }
 
     try {
       // 先 HEAD 拿长度；拿不到就按流式未知长度处理（上传会话必须要一个确定长度，

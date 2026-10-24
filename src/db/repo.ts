@@ -11,6 +11,7 @@ import type {
   FileRow,
   GroupRow,
   MetadataRow,
+  NodeRow,
   ShareRow,
   StoragePolicyRow,
   TaskRow,
@@ -1765,6 +1766,32 @@ export class DirectLinkRepo {
 // ---------------------------------------------------------------------------
 // 任务
 // ---------------------------------------------------------------------------
+// 从节点
+// ---------------------------------------------------------------------------
+
+/** 从节点行读取 + 分派任务用的小查询。驱动里带 isolate 缓存的版本在 db/nodes.ts。 */
+export class NodeRepo {
+  private sql: Sql;
+  constructor(sql: Sql) {
+    this.sql = sql;
+  }
+
+  async byId(id: number): Promise<NodeRow | null> {
+    const rows = (await this.sql`
+      SELECT * FROM nodes WHERE id = ${id} AND deleted_at IS NULL LIMIT 1
+    `) as Record<string, unknown>[];
+    if (!rows[0]) return null;
+    return {
+      ...rows[0],
+      created_at: toDate(rows[0].created_at),
+      updated_at: toDate(rows[0].updated_at),
+      deleted_at: rows[0].deleted_at ? toDate(rows[0].deleted_at) : null,
+      settings: toJson(rows[0].settings, {}),
+    } as unknown as NodeRow;
+  }
+}
+
+// ---------------------------------------------------------------------------
 
 export class TaskRepo {
   private sql: Sql;
@@ -1885,6 +1912,23 @@ export class TaskRepo {
       status: String(r.status),
       total: toNum(r.total),
     }));
+  }
+
+  /**
+   * 已分派给从节点、还没结束的任务（cron 同步用）。
+   *
+   * `private_state` 是 TEXT 而不是 JSONB，所以用 LIKE 判定而不是
+   * `->>'node_task_id'` —— 后者遇到非 JSON 内容会直接报错，把整次 cron 打挂。
+   */
+  async listNodeDispatched(limit = 50): Promise<TaskRow[]> {
+    const rows = (await this.sql`
+      SELECT * FROM tasks
+      WHERE deleted_at IS NULL AND status IN ('queued', 'processing')
+        AND private_state LIKE '%"node_task_id"%'
+      ORDER BY id ASC
+      LIMIT ${limit}
+    `) as Record<string, unknown>[];
+    return rows.map(normalizeTask);
   }
 }
 

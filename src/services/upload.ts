@@ -702,8 +702,11 @@ export class UploadService {
     throw new AppError(CodeUploadSessionExpired, 'Upload session expired');
   }
 
-  /** 丢弃一个上传会话：撤销远端会话、回收占位实体（必要时连文件行）。 */
-  private async discardSession(session: UploadSession): Promise<void> {
+  /**
+   * 丢弃一个上传会话：撤销远端会话、回收占位实体（必要时连文件行）。
+   * 公开给从节点回调（`/api/v4/slave/statelessUpload/failed`）用。
+   */
+  async discardSession(session: UploadSession): Promise<void> {
     const driver = this.ctx.driverFor(session.policy);
     try {
       await driver.cancelToken(session);
@@ -741,9 +744,40 @@ export class UploadService {
     });
   }
 
-  private async loadSession(sessionId: string): Promise<UploadSession | null> {
+  /**
+   * 给从节点建上传会话：走与客户端完全相同的约束校验（策略、配额、命名），
+   * 但返回**完整会话**而不是客户端响应 —— 节点需要 `save_path`（它要把字节
+   * 写到自己磁盘的这个位置）、`chunk_size` 和 `entity_id`。
+   */
+  async prepareStatelessUpload(params: CreateUploadSessionParams): Promise<UploadSession> {
+    const res = await this.createSession(params);
+    const session = await this.loadSession(res.session_id);
+    if (!session) {
+      throw new AppError(CodeUploadSessionExpired, 'Upload session was not persisted');
+    }
+    return session;
+  }
+
+  /**
+   * 取上传会话。公开是因为从节点回调（`/api/v4/slave/statelessUpload/complete`）
+   * 也要按 id 读会话 —— 那条路的「用户」由节点在 user_id 里声明，鉴权靠节点的
+   * HMAC 密钥，所以不能再走 requireUser 的属主校验。
+   */
+  async loadSession(sessionId: string): Promise<UploadSession | null> {
     const raw = await kvFor(this.ctx.env, 'upload').get(`${SESSION_PREFIX}${sessionId}`, 'json');
     return (raw as UploadSession | null) ?? null;
+  }
+
+  /**
+   * 从节点回调用的收尾（`POST /api/v4/slave/statelessUpload/complete`）。
+   *
+   * 与客户端分片上传的收尾是同一条路：实体转正、容量原子预占、清理遗留占位。
+   * 区别只在于「字节是谁写的」—— 从节点把文件写在自己的磁盘上，所以这里
+   * 不再有分片进度可校验，由调用方保证内容已就位（哨兵校验仍会跑一次
+   * `driver.meta` 比对大小）。
+   */
+  async completeStatelessSession(session: UploadSession): Promise<void> {
+    await this.finishUpload(session);
   }
 
   private async deleteSessionRecord(sessionId: string): Promise<void> {

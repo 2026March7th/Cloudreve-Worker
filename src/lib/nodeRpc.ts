@@ -24,6 +24,9 @@ import type { NodeRow } from '../db/types';
 /** 从机 RPC 的路径前缀（`constants.APIPrefixSlave`）。 */
 export const SLAVE_PREFIX = '/api/v4/slave';
 
+/** 控制类 RPC 的超时（建会话、查任务、删文件）。 */
+const CONTROL_TIMEOUT_MS = 30_000;
+
 /** 主站自身信息，随每个请求带给从机（从机用它回调主站 / 拼链接）。 */
 export interface NodeSiteMeta {
   siteId: string;
@@ -138,12 +141,32 @@ export function nodeSecret(node: NodeRow): string {
   return key;
 }
 
+/**
+ * 把头名规范化成 Go `textproto.CanonicalMIMEHeaderKey` 的形态
+ * （`X-Cr-Node-Id` 这种：每段首字母大写、其余小写）。
+ *
+ * 必须做：JS 的 `Headers`（含 Workers 的 `request.headers`）一律返回**小写**键，
+ * 而 Go 收请求时会规范化。两边如果不统一，签名里的头串永远对不上 —— 而且
+ * 表现只是「invalid sign」，看不出是大小写问题。
+ */
+function canonicalHeaderKey(name: string): string {
+  return name
+    .split('-')
+    .map((part) => (part ? part[0].toUpperCase() + part.slice(1).toLowerCase() : part))
+    .join('-');
+}
+
 /** 参与签名的头：所有 `X-Cr-*`（`X-Cr-Filename` 除外），按名字排序后用 `&` 连接。 */
 function signedHeaderString(headers: Record<string, string>): string {
-  return Object.keys(headers)
-    .filter((k) => k.startsWith('X-Cr-') && k !== 'X-Cr-Filename')
-    .sort()
-    .map((k) => `${k}=${headers[k]}`)
+  const canon = new Map<string, string>();
+  for (const [raw, value] of Object.entries(headers)) {
+    const key = canonicalHeaderKey(raw);
+    if (!key.startsWith('X-Cr-') || key === 'X-Cr-Filename') continue;
+    canon.set(key, value);
+  }
+  return [...canon.entries()]
+    .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+    .map(([k, v]) => `${k}=${v}`)
     .join('&');
 }
 
@@ -301,4 +324,137 @@ export async function nodeRpc<T = unknown>(
     throw new NodeRpcError(json.msg ?? `node returns code ${json.code}`, res.status, json.code ?? 0);
   }
   return json.data as T;
+}
+
+// ---------------------------------------------------------------------------
+// 验签（主站接收从机调用时用）
+// ---------------------------------------------------------------------------
+
+export type SignatureCheck =
+  | { ok: true; expires: number }
+  | { ok: false; reason: string };
+
+/**
+ * 校验从机发来的请求签名。与 `signNodeRequest` 完全对称，对应上游
+ * `auth.CheckRequest` + `middleware.SignRequired`。
+ *
+ * 调用方负责：按 `X-Cr-Node-Id` 找到节点、把 slave_key 传进来。
+ * 分片上传（`POST /api/v4/slave/upload/…`）的正文不参与签名 —— 与上游
+ * `isUploadDataRequest` 同一个判据，否则几十 MB 的分片要先读进内存。
+ */
+export async function verifyNodeSignature(args: {
+  slaveKey: string;
+  method: string;
+  /** 请求的完整 URL（用于取解码后的路径） */
+  url: string;
+  headers: Headers;
+  /** 原始正文；分片上传传空 */
+  body?: string | Uint8Array | null;
+}): Promise<SignatureCheck> {
+  const method = args.method.toUpperCase();
+  const isUploadData =
+    new URL(args.url).pathname.includes(`${SLAVE_PREFIX}/upload/`) && method !== 'PUT';
+  const bodyText =
+    isUploadData || args.body == null
+      ? ''
+      : typeof args.body === 'string'
+        ? args.body
+        : new TextDecoder().decode(args.body);
+
+  const auth = args.headers.get('authorization') ?? '';
+  if (!auth.startsWith('Bearer Cr ')) return { ok: false, reason: 'authorization header is missing' };
+  const provided = auth.slice('Bearer Cr '.length);
+
+  const headers: Record<string, string> = {};
+  args.headers.forEach((value, key) => {
+    headers[key] = value;
+  });
+  const content = goJsonStringify({
+    Path: decodePathForSign(new URL(args.url).pathname),
+    Header: signedHeaderString(headers),
+    Body: bodyText,
+  });
+
+  const idx = provided.lastIndexOf(':');
+  if (idx < 0) return { ok: false, reason: 'invalid sign format' };
+  const expires = Number(provided.slice(idx + 1));
+  if (!Number.isFinite(expires) || expires === 0) {
+    return { ok: false, reason: 'expire timestamp is missing' };
+  }
+  if (expires < Math.floor(Date.now() / 1000)) return { ok: false, reason: 'signature expired' };
+
+  const want = await hmacSign(args.slaveKey, content, expires);
+  // 逐字符比较，避免时序侧信道
+  let diff = 0;
+  for (let i = 0; i < want.length; i += 1) {
+    diff |= want.charCodeAt(i) ^ (provided.charCodeAt(i) ?? 0);
+  }
+  if (diff !== 0 || want.length !== provided.length) {
+    return { ok: false, reason: 'invalid sign' };
+  }
+  return { ok: true, expires };
+}
+
+// ---------------------------------------------------------------------------
+// 任务（主站 → 从节点）
+// ---------------------------------------------------------------------------
+
+/** 从节点上的任务摘要（对应上游 `cluster.SlaveTaskSummary`）。 */
+export interface NodeTaskSummary {
+  status: string;
+  error?: string;
+  /** 从节点自己留的进度（不透明，原样带回前端） */
+  private_state?: string;
+  progress?: unknown;
+}
+
+/** 在从节点上创建任务，返回从节点侧的任务 id。 */
+export async function createNodeTask(
+  node: NodeRow,
+  meta: NodeSiteMeta,
+  args: { type: string; state: string },
+): Promise<number> {
+  const body = JSON.stringify(args);
+  const data = await nodeRpc<{ id?: number }>(node, meta, {
+    method: 'PUT',
+    path: 'task',
+    body,
+    bodyText: body,
+    timeoutMs: CONTROL_TIMEOUT_MS,
+    extraHeaders: { 'Content-Type': 'application/json' },
+  });
+  if (!data || typeof data.id !== 'number') {
+    throw new NodeRpcError('node did not return a task id', 0, 0);
+  }
+  return data.id;
+}
+
+/** 查从节点任务状态。 */
+export async function getNodeTask(
+  node: NodeRow,
+  meta: NodeSiteMeta,
+  taskId: number,
+): Promise<NodeTaskSummary> {
+  return nodeRpc<NodeTaskSummary>(node, meta, {
+    method: 'GET',
+    path: `task/${taskId}`,
+    timeoutMs: CONTROL_TIMEOUT_MS,
+  });
+}
+
+/** 让从节点清理任务临时目录。 */
+export async function cleanupNodeFolders(
+  node: NodeRow,
+  meta: NodeSiteMeta,
+  folders: string[],
+): Promise<void> {
+  const body = JSON.stringify({ path: folders });
+  await nodeRpc(node, meta, {
+    method: 'POST',
+    path: 'task/cleanup',
+    body,
+    bodyText: body,
+    timeoutMs: CONTROL_TIMEOUT_MS,
+    extraHeaders: { 'Content-Type': 'application/json' },
+  });
 }

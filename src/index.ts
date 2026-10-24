@@ -44,11 +44,13 @@ import { shareRoutes } from './routes/share';
 import { adminRoutes } from './routes/admin';
 import { workflowRoutes } from './routes/workflow';
 import { callbackRoutes } from './routes/callback';
+import { slaveRoutes } from './routes/slave';
 import { devicesRoutes } from './routes/devices';
 import { davRoutes } from './routes/dav';
 import { paymentRoutes, paymentAdminRoutes } from './routes/payment';
 import { DownloadService } from './services/download';
 import { FileSystemService } from './services/fs';
+import { syncNodeTasks } from './services/nodeTasks';
 import { ShareService } from './services/share';
 import { isSocialMediaBot, renderSharePreview } from './services/share-preview';
 
@@ -239,6 +241,11 @@ app.route('/api/v4/payment', paymentRoutes);
  * 鉴权靠路径里的 callback secret，不走登录中间件（与原版一致）。
  */
 app.route('/api/v4/callback', callbackRoutes);
+/**
+ * 从节点回调（主站侧 `/api/v4/slave/*`）。鉴权不走登录态，而是
+ * `X-Cr-Node-Id` + HMAC 签名（见 routes/slave.ts 文件头）。
+ */
+app.route('/api/v4/slave', slaveRoutes);
 app.route('/api/v4/devices', devicesRoutes);
 app.route('/dav', davRoutes);
 
@@ -514,6 +521,16 @@ export default {
       // 部分错误对象（跨序列化边界）会丢 message，把全部字段 dump 出来
       // 才能在日志里看到真实原因，而不是只剩一行堆栈帧。
       console.error('trash collector failed', describeError(e));
+    }
+
+    // 3. 从节点任务状态同步。没有从节点的部署这一步是零查询（LIKE 匹配为空）。
+    try {
+      const synced = await syncNodeTasks(env);
+      if (synced.checked > 0) {
+        console.log(`node task sync: checked=${synced.checked} updated=${synced.updated}`);
+      }
+    } catch (e) {
+      console.error('node task sync failed', describeError(e));
     }
   },
 };

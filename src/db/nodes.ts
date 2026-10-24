@@ -64,6 +64,29 @@ export async function requireNode(env: Env, id: number | null | undefined): Prom
 
 /** 清缓存：`id` 省略时全清。 */
 export function invalidateNodeCache(id?: number): void {
-  if (id === undefined) cache.clear();
-  else cache.delete(id);
+  if (id === undefined) {
+    cache.clear();
+    listCache = null;
+  } else {
+    cache.delete(id);
+    listCache = null;
+  }
+}
+
+/** 可用节点列表缓存。节点表很小且极少变动，5 秒够了。 */
+const LIST_TTL_MS = 5_000;
+let listCache: { at: number; rows: NodeRow[] } | null = null;
+
+/** 状态为 active 的节点（任务分派用）。 */
+export async function listActiveNodes(env: Env): Promise<NodeRow[]> {
+  const now = Date.now();
+  if (listCache && now - listCache.at < LIST_TTL_MS) return listCache.rows;
+
+  const sql = getSql(env);
+  const rows = (await sql`
+    SELECT * FROM nodes WHERE deleted_at IS NULL AND status = 'active' ORDER BY id ASC
+  `) as Record<string, unknown>[];
+  const list = rows.map(normalize);
+  listCache = { at: now, rows: list };
+  return list;
 }
