@@ -207,8 +207,44 @@ function patchIndexHtml() {
     finalHtml = finalHtml.replace('</head>', `  ${logoTag}\n  </head>`);
   }
 
+  // 白屏自愈：一旦某一版前端 JS 崩了（2026-10-26 拆 chunk 拆出循环依赖就崩过一次），
+  // Service Worker 会把坏版本连同 index.html 一起预缓存下来；而它的新版本要靠页面里
+  // 的「有新版本，刷新？」提示来激活 —— 页面都白屏了，提示永远弹不出来，用户就**永久
+  // 卡死**，除非手动 Ctrl+F5。
+  //
+  // 这段内联脚本跑在入口 module 之前（module 是 defer 的），所以即使应用整体崩掉它也在：
+  // 6 秒后 #root 还是空的，就把已经在等待的新 SW 直接推上去并重载一次。
+  // 有 sessionStorage 兜底，只重载一次，不会循环。
+  const selfHealTag = `<script>${SELF_HEAL_SCRIPT}</script>`;
+  if (!finalHtml.includes('__edge_self_heal')) {
+    finalHtml = finalHtml.replace('</body>', `  ${selfHealTag}\n</body>`);
+  }
+
   if (finalHtml !== html) writeFileSync(file, finalHtml);
 }
+
+/**
+ * 见 patchIndexHtml 里的说明。刻意保持 ES5（要跑在很老的 WebView 里）与零依赖。
+ * 触发条件很窄：6 秒后应用没挂载 + 存在 waiting 的 SW，二者同时成立才动。
+ */
+const SELF_HEAL_SCRIPT = `/* __edge_self_heal */
+(function () {
+  if (!('serviceWorker' in navigator) || !navigator.serviceWorker.getRegistration) return;
+  var KEY = 'edge:selfheal';
+  if (sessionStorage.getItem(KEY) === '1') return;
+  setTimeout(function () {
+    var root = document.getElementById('root');
+    if (root && root.childElementCount > 0) return; // 应用正常起来了
+    navigator.serviceWorker.getRegistration().then(function (reg) {
+      if (!reg || !reg.waiting) return; // 没有待激活的新版本就不动
+      sessionStorage.setItem(KEY, '1');
+      reg.waiting.postMessage({ type: 'SKIP_WAITING' });
+      // 不用等 controllerchange：sw.js 没开 clientsClaim，现有页面不会立刻换
+      // controller，但 reload 之后发起的导航一定走已激活的新版本。
+      setTimeout(function () { location.reload(); }, 800);
+    }).catch(function () {});
+  }, 6000);
+})();`;
 
 /** 在构建产物里找出 Roboto latin 的 400/500 字重文件（哈希名，必须运行时找）。 */
 function findRobotoLatinFonts() {
