@@ -38,10 +38,14 @@ export interface AppBindings {
 /** 路由处理函数里收到的 Hono 上下文类型。 */
 export type AppRequest = Context<AppBindings>;
 
-/** 带上关联 ID 与安全头。 */
+/** 带上安全响应头（所有经 Worker 的响应，含缓存写回的那份）。 */
 export function securityHeaders(): MiddlewareHandler<AppBindings> {
   return async (c, next) => {
     c.header('X-Content-Type-Options', 'nosniff');
+    // 不把完整 URL（可能含分享密码 / 直链签名）带给第三方站点
+    c.header('Referrer-Policy', 'strict-origin-when-cross-origin');
+    // 不允许外部页面套 iframe（拖框点击 / 界面伪装），同源内嵌（PDF 预览）照常
+    c.header('X-Frame-Options', 'SAMEORIGIN');
     await next();
   };
 }

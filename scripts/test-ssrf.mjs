@@ -39,7 +39,7 @@ try {
     outfile: bundlePath,
     logLevel: 'silent',
   });
-  const { assertSafeRemoteUrl, effectiveIp } = await import(`file://${bundlePath}`);
+  const { assertSafeRemoteUrl, effectiveIp, safeFetch } = await import(`file://${bundlePath}`);
 
   const allowed = (url) => {
     try {
@@ -141,10 +141,80 @@ try {
     check(u, !allowed(u));
   }
 
+  console.log('\n[7] safeFetch：重定向的每一跳都要重新校验');
+  {
+    const realFetch = globalThis.fetch;
+    const stub = (handler) => {
+      globalThis.fetch = async (url, init) => handler(String(url), init);
+      return () => {
+        globalThis.fetch = realFetch;
+      };
+    };
+
+    // 302 到云元数据地址：必须拒绝，而不是把内网内容抓回来
+    let restore = stub((url) =>
+      url.includes('evil.example.com')
+        ? new Response(null, { status: 302, headers: { Location: 'http://169.254.169.254/latest/meta-data/' } })
+        : new Response('ok', { status: 200 }),
+    );
+    let blocked = false;
+    try {
+      await safeFetch('https://evil.example.com/x');
+    } catch (e) {
+      blocked = e?.name === 'UnsafeRemoteUrlError';
+    }
+    restore();
+    check('302 到 169.254.169.254 被拦下', blocked);
+
+    // 相对 Location + 一路公网：应当跟随并返回最终响应
+    restore = stub((url, init) => {
+      check(`跟随重定向时用 manual 模式（${url.slice(0, 32)}）`, init?.redirect === 'manual');
+      if (url.endsWith('/a')) {
+        return new Response(null, { status: 302, headers: { Location: '/b' } });
+      }
+      return new Response('final', { status: 200 });
+    });
+    let body = '';
+    try {
+      body = await (await safeFetch('https://example.com/a')).text();
+    } catch (e) {
+      body = `throw:${e?.message}`;
+    }
+    restore();
+    check('相对重定向正常跟随', body === 'final', body);
+
+    // 无限重定向必须中止
+    restore = stub(
+      () => new Response(null, { status: 302, headers: { Location: 'https://example.com/loop' } }),
+    );
+    blocked = false;
+    try {
+      await safeFetch('https://example.com/loop');
+    } catch (e) {
+      blocked = e?.name === 'UnsafeRemoteUrlError';
+    }
+    restore();
+    check('超过跳数上限时中止', blocked);
+
+    // 初始地址就不合规时压根不该发出请求
+    let called = false;
+    restore = stub(() => {
+      called = true;
+      return new Response('ok');
+    });
+    blocked = false;
+    try {
+      await safeFetch('http://127.0.0.1/x');
+    } catch (e) {
+      blocked = e?.name === 'UnsafeRemoteUrlError';
+    }
+    restore();
+    check('初始地址非法时不发请求', blocked && !called);
+  }
+
   console.log(
     `\n${failed === 0 ? '全部通过' : `${failed} 项不通过`}（${passed} 项通过，${failed} 项失败）`,
-  );
-  process.exitCode = failed === 0 ? 0 : 1;
+  );  process.exitCode = failed === 0 ? 0 : 1;
 } catch (err) {
   console.error('测试异常：', err);
   process.exitCode = 1;

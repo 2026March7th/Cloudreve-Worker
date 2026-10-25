@@ -142,4 +142,10 @@ export const RATE_LIMITS = {
   resetByIp: { bucket: 'reset:ip', limit: 3, windowSec: 300 },
   /** 同一分享 + IP 猜密码：10 次 / 分钟 */
   sharePassword: { bucket: 'share:pwd', limit: 10, windowSec: 60 },
+  /**
+   * 同一 IP 的 WebDAV 认证**失败**：30 次 / 分钟。
+   * 定得比登录宽：客户端拿到 401 会重试几轮，且多人共用一个出口 IP 很常见；
+   * 30 次/分钟已足够把在线爆破压到无意义的速率。
+   */
+  davAuthByIp: { bucket: 'dav:auth:ip', limit: 30, windowSec: 60 },
 } as const;

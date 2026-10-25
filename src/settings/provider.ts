@@ -12,9 +12,14 @@ import { DEFAULT_SETTINGS, GENERATED_SETTINGS } from './defaults';
 import { randomString } from '../lib/crypto';
 import { resolveDb, type DbHandle } from '../db/shard';
 import { kvFor } from '../lib/kvRouter';
+import { coloCacheDelete, coloCacheGetJson, coloCachePutJson } from '../lib/coloCache';
 
 const KV_CACHE_KEY = 'settings:all:v1';
 const KV_CACHE_TTL = 60;
+/** Colo 级（Cache API）副本的物理 TTL / 逻辑新鲜期（秒）。 */
+const COLO_CACHE_KEY = 'settings:all:v1';
+const COLO_CACHE_TTL_S = 120;
+const COLO_MAX_AGE_S = 15;
 
 /**
  * isolate 级内存缓存。
@@ -231,8 +236,23 @@ export async function loadSettings(env: Env, db: DbHandle = resolveDb(env)): Pro
     return new SettingsProvider(env, memoryCache.map);
   }
 
-  // 站点设置是「读极多写极少」的纯缓存数据 → 独立的 site 角色 namespace，
-  // 不与自举标记/会话状态抢同一个 KV。
+  // 第二层：colo 内跨 isolate 的 Cache API（1~3ms）。isolate 被平台回收后
+  // 模块内存就没了，KV 读又要几十到几百毫秒 —— 这一层让「新 isolate 的第一个
+  // 访客」也能立刻拿到设置，而不必等一次 KV + 一次跨区数据库往返。
+  const coloHit = await coloCacheGetJson<Record<string, string>>(COLO_CACHE_KEY, COLO_MAX_AGE_S);
+  if (coloHit) {
+    const map = new Map<string, string>();
+    for (const [k, v] of Object.entries(coloHit)) {
+      if (typeof v === 'string') map.set(k, v);
+    }
+    if (map.size > 0) {
+      memoryCache = { at: Date.now(), map };
+      return new SettingsProvider(env, map);
+    }
+  }
+
+  // 第三层：KV（全局、跨 colo）。站点设置是「读极多写极少」的纯缓存数据 →
+  // 独立的 site 角色 namespace，不与自举标记/会话状态抢同一个 KV。
   const cached = await kvFor(env, 'site').get(KV_CACHE_KEY, 'json');
   if (cached && typeof cached === 'object') {
     const map = new Map<string, string>();
@@ -283,6 +303,8 @@ async function refillSettingsFromDb(env: Env, db: DbHandle = resolveDb(env)): Pr
   const obj: Record<string, string> = {};
   for (const [k, v] of map) obj[k] = v;
   await kvFor(env, 'site').put(KV_CACHE_KEY, JSON.stringify(obj), { expirationTtl: KV_CACHE_TTL });
+  // 顺手写一份 colo 副本，给本节点后续的冷 isolate 用
+  await coloCachePutJson(COLO_CACHE_KEY, obj, COLO_CACHE_TTL_S);
   return map;
 }
 
@@ -322,10 +344,15 @@ export async function refreshSettingsCache(env: Env): Promise<boolean> {
   }
 }
 
-/** 后台改设置后调用，让 KV 缓存失效（内存缓存一并清掉）。 */
+/** 后台改设置后调用，让 KV 缓存失效（内存缓存与 colo 副本一并清掉）。 */
 export async function invalidateSettings(env: Env): Promise<void> {
   memoryCache = null;
-  await kvFor(env, 'site').delete(KV_CACHE_KEY);
+  await Promise.all([
+    kvFor(env, 'site').delete(KV_CACHE_KEY),
+    // 只删得掉当前 colo 的副本，其它节点最多晚 COLO_MAX_AGE_S 秒（与 KV 的
+    // 最终一致语义同量级，不再额外引入更长的陈旧窗口）。
+    coloCacheDelete(COLO_CACHE_KEY),
+  ]);
 }
 
 /**

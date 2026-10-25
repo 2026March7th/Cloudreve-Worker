@@ -33,6 +33,7 @@ import { UploadService } from '../services/upload';
 import type { FileRow } from '../db/types';
 import type { DavAccountRow } from '../db/repo';
 import { BooleanSet, GroupPermission, FileType } from '../lib/boolset';
+import { RATE_LIMITS, clientIp, hitRateLimit } from '../lib/rateLimit';
 import {
   CodeFileNotFound,
   CodeInsufficientCapacity,
@@ -105,9 +106,17 @@ davRoutes.use('*', async (c, next) => {
   const ctx = ctxOf(c);
   const hit = await ctx.davAccounts.byNameAndPassword(auth.name, auth.password);
   if (!hit) {
+    // WebDAV 的 Basic Auth 是**每个请求**都带凭据的，攻击者可以拿它当登录接口
+    // 无限试密码 —— 登录接口有邮箱/IP 限速，这条路径原来一条都没有。
+    // 只对**失败**计数：正常客户端的大量 PROPFIND 不该被算进去。
+    const gate = await hitRateLimit(ctx.env, { ...RATE_LIMITS.davAuthByIp, id: clientIp(c) });
     logAudit(ctx, 'webdav_login_failed', null, { name: auth.name });
     // Windows WebClient 收到没有 WWW-Authenticate 的 401 不会重试凭据
     c.header('WWW-Authenticate', 'Basic realm="cloudreve"');
+    if (!gate.ok) {
+      c.header('Retry-After', String(gate.retryAfter));
+      return c.body(null, 429);
+    }
     return c.body(null, 401);
   }
 

@@ -33,7 +33,7 @@ import {
 } from '../lib/zipread';
 import { URI } from './uri';
 import { dispatchRemoteDownload, markDispatched } from './nodeTasks';
-import { assertSafeRemoteUrl, UnsafeRemoteUrlError } from '../lib/ssrf';
+import { assertSafeRemoteUrl, safeFetch, UnsafeRemoteUrlError } from '../lib/ssrf';
 
 /**
  * 单个任务允许处理的字节上限。
@@ -282,13 +282,13 @@ export class WorkflowService {
     try {
       // 先 HEAD 拿长度；拿不到就按流式未知长度处理（上传会话必须要一个确定长度，
       // 所以这里退化为「先取到内存上限内」——超过上限直接报太大）
-      const head = await fetch(args.url, { method: 'HEAD' }).catch(() => null);
+      const head = await safeFetch(args.url, { method: 'HEAD' }).catch(() => null);
       let declared = Number(head?.headers.get('content-length') ?? 0);
       // HEAD 拿不到长度时（常见，尤其 CDN/对象存储不回 content-length）再用一次
       // Range 探测 GET 取总大小；仍拿不到就明确报错 —— Worker 上传需要明确大小，
       // 不能默默以 0 字节落地成空文件，也绝不能绕过 MAX_WORKFLOW_BYTES 上限拉取超大文件。
       if (!declared) {
-        const probe = await fetch(args.url, { method: 'GET', headers: { Range: 'bytes=0-0' } }).catch(() => null);
+        const probe = await safeFetch(args.url, { method: 'GET', headers: { Range: 'bytes=0-0' } }).catch(() => null);
         const rangeTotal = probe?.headers.get('Content-Range')?.split('/')[1];
         declared = Number(rangeTotal ?? probe?.headers.get('content-length') ?? 0);
       }
@@ -305,7 +305,7 @@ export class WorkflowService {
         );
       }
 
-      const res = await fetch(args.url);
+      const res = await safeFetch(args.url);
       if (!res.ok || !res.body) {
         throw new AppError(CodeFeatureNotEnabled, `Failed to fetch remote file: HTTP ${res.status}`);
       }

@@ -124,6 +124,16 @@ export default defineConfig({
             ],
             mermaid: ["node_modules/mermaid", "node_modules/katex"],
             leaflet: ["node_modules/leaflet", "node_modules/react-leaflet"],
+            // MUI + Emotion 是首屏就要用、但很少变动的代码。单独切出来后，
+            // 每次部署变的只有应用自己的 chunk，老用户复访直接从浏览器缓存
+            // 命中这两块（合计约两百 KB brotli），不用跟着主包重下一次。
+            // ⚠️ 必须排在下面的 `react` 之前：那段是 id.includes("node_modules/react")，
+            // 会连带匹配 react-router / react-redux / react-i18next，顺序反了就被吞掉。
+            mui: ["node_modules/@mui"],
+            emotion: ["node_modules/@emotion"],
+            i18n: ["node_modules/i18next", "node_modules/react-i18next"],
+            redux: ["node_modules/redux", "node_modules/react-redux", "node_modules/@reduxjs"],
+            router: ["node_modules/react-router", "node_modules/@remix-run"],
             react: ["node_modules/react", "node_modules/react-dom"],
             mapbox: ["node_modules/mapbox-gl"],
           };

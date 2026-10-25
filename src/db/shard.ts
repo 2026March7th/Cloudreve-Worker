@@ -209,15 +209,28 @@ export async function clearDomainDown(env: Env, domain: DomainName): Promise<voi
  * （不能每请求读 KV），所以在自举/cron 里调用一次即可覆盖整个 isolate。
  */
 export async function applyDomainDownFromKv(env: Env): Promise<void> {
+  // 没配分域的部署（绝大多数）根本不会有降级键：直接返回，冷启动**一次 KV
+  // 都不读**。原来这里固定串行读两个键，等于给每个新 isolate 的首个请求
+  // 白加两跳 KV（各几十到几百毫秒）。
+  const configured = (['audit', 'metadata'] as const).filter((domain) => {
+    const raw = (env as unknown as Record<string, string | undefined>)[DOMAIN_SOURCE[domain]]?.trim();
+    return Boolean(raw);
+  });
+  if (configured.length === 0) return;
+
   try {
     const { kvFor } = await import('../lib/kvRouter');
     const kv = kvFor(env, 'flag');
-    for (const domain of ['audit', 'metadata'] as const) {
-      if (await kv.get(`shard:down:${domain}`)) {
+    // 两个键并行读：串行会让冷启动成本翻倍。
+    const flags = await Promise.all(
+      configured.map((domain) => kv.get(`shard:down:${domain}`).catch(() => null)),
+    );
+    configured.forEach((domain, i) => {
+      if (flags[i]) {
         // 具体剩余 TTL 拿不到，给足一个保守窗口；cron 每小时会重新评估
         domainDownUntil.set(domain, Date.now() + 60 * 60 * 1000);
       }
-    }
+    });
   } catch {
     // KV 不可用就不装，靠运行时查询失败触发短降级
   }

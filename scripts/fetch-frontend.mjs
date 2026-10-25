@@ -168,7 +168,10 @@ function patchIndexHtml() {
     .replaceAll('{siteScript}', '')
     .replaceAll('{pwa_small_icon}', '/static/img/favicon.ico')
     .replaceAll('{pwa_medium_icon}', '/static/img/logo192.png')
-    .replaceAll('var(--defaultThemeColor)', '#1976d2');
+    .replaceAll('var(--defaultThemeColor)', '#1976d2')
+    // 上游模板里 theme-color 是空的 —— 手机浏览器的地址栏/状态栏取不到颜色，
+    // 显示成默认灰白。填上同一个主题色，和 PWA manifest 保持一致。
+    .replace('<meta name="theme-color" content="" />', '<meta name="theme-color" content="#1976d2" />');
 
   // 预加载入口脚本：Vite 只 modulepreload 了 common/react 两个分片，
   // 1.5MB 的主包没有预加载，Lighthouse 会报「Preload key requests」。
@@ -187,7 +190,37 @@ function patchIndexHtml() {
     }
   }
 
+  // 预加载正文字体：vite.config.ts 把样式表改成 `media="print" onload` 异步加载
+  // （不阻塞首屏），代价是字体文件要等 CSS 下载并应用后才被发现 —— 手机上
+  // 正文先渲染成系统字体再跳变，既慢又晃。这里按产物里真实存在的文件名硬预加载
+  // Roboto 的 400/500 两个 latin 子集（首屏只有这两档字重）。
+  for (const font of findRobotoLatinFonts()) {
+    const tag = `<link rel="preload" as="font" type="font/woff2" crossorigin href="/assets/${font}">`;
+    if (finalHtml.includes(tag)) continue;
+    finalHtml = finalHtml.replace('</head>', `  ${tag}\n  </head>`);
+  }
+
+  // 首屏遮罩里的 logo 是 CSS 背景图，只有等样式生效才开始下载 —— 预加载一下
+  // 能让「白屏 → logo 出现」这一步提前，感知上快很多。
+  const logoTag = '<link rel="preload" as="image" href="/static/img/logo192.png">';
+  if (!finalHtml.includes(logoTag)) {
+    finalHtml = finalHtml.replace('</head>', `  ${logoTag}\n  </head>`);
+  }
+
   if (finalHtml !== html) writeFileSync(file, finalHtml);
+}
+
+/** 在构建产物里找出 Roboto latin 的 400/500 字重文件（哈希名，必须运行时找）。 */
+function findRobotoLatinFonts() {
+  const assetsDir = path.join(TARGET, 'assets');
+  if (!existsSync(assetsDir)) return [];
+  try {
+    return readdirSync(assetsDir)
+      .filter((n) => /^roboto-latin-(400|500)-normal.*\.woff2$/.test(n))
+      .sort();
+  } catch {
+    return [];
+  }
 }
 
 /**
@@ -205,6 +238,16 @@ function writeHeaders() {
     '# Cloudreve edge：内容哈希资源永久缓存，HTML 保持默认 max-age=0 以便即时更新',
     '/assets/*',
     '  Cache-Control: public, max-age=31536000, immutable',
+    '',
+    '# 静态资源的安全响应头（API 侧由 src/middleware/app.ts 的 securityHeaders 负责）',
+    '/*',
+    '  X-Content-Type-Options: nosniff',
+    '  Referrer-Policy: strict-origin-when-cross-origin',
+    '  X-Frame-Options: SAMEORIGIN',
+    '',
+    '# 站点图标/占位图：文件名固定、内容极少变，一天缓存换掉首屏那次条件请求',
+    '/static/*',
+    '  Cache-Control: public, max-age=86400',
     '',
   ].join('\n');
   writeFileSync(file, content);
@@ -280,17 +323,20 @@ if (!existsSync(src)) {
   process.exit(1);
 }
 applyFrontendPatches(src);
+const pinned = applyDependencyPins(src);
 
 console.log('  安装前端依赖（首次约 1-3 分钟）…');
 const installStart = Date.now();
 // --network-timeout：CF 构建机到 npm registry 偶发抖动时，默认超时会直接
 // 失败（曾出现 12 分钟后构建失败）。yarn 1 的时间戳网络错误靠它兜底。
-runOrDie(
-  NPX,
-  npxArgs(['yarn@1.22.22', 'install', '--frozen-lockfile', '--network-timeout', '600000']),
-  'yarn install',
-  { cwd: src, env: { HUSKY: '0', NODE_OPTIONS: '--max-old-space-size=6144' } },
-);
+// 有依赖钉死时不能用 --frozen-lockfile：lockfile 与 resolutions 不一致，
+// yarn 会直接报「lockfile needs update」并退出。
+const installArgs = ['yarn@1.22.22', 'install', '--network-timeout', '600000'];
+if (!pinned) installArgs.push('--frozen-lockfile');
+runOrDie(NPX, npxArgs(installArgs), 'yarn install', {
+  cwd: src,
+  env: { HUSKY: '0', NODE_OPTIONS: '--max-old-space-size=6144' },
+});
 console.log(`  yarn install 完成，耗时 ${Math.round((Date.now() - installStart) / 1000)}s`);
 
 console.log('  构建前端（vite build，约 1-4 分钟）…');
@@ -318,7 +364,41 @@ function applyFrontendPatches(srcDir) {
   if (!existsSync(patches)) return;
   console.log('  叠加本地前端补丁（Pro 去除 / 缓存键刷新等）…');
   cpSync(patches, srcDir, { recursive: true, force: true });
+  // 补丁目录里的 dep-pins.json 只是给下面的 applyDependencyPins() 读的配置，
+  // 不该留进源码树（会被 vite 当成项目文件）。
+  rmSync(path.join(srcDir, 'dep-pins.json'), { force: true });
   console.log('✅ 前端补丁已叠加。');
+}
+
+/**
+ * 依赖版本钉死（安全修复）。
+ *
+ * `frontend-patches/dep-pins.json` 里列的是「当前上游 lockfile 解析出来的版本
+ * 有已知 CVE、而有修复版」的包。写进 package.json 的 `resolutions` 后 yarn 会
+ * 强制用钉死的版本，连传递依赖一起换掉 —— 不动上游源码就能把漏洞修掉。
+ *
+ * 返回 true 表示这次确实改了依赖树：调用方要相应地**放弃** `--frozen-lockfile`
+ * （lockfile 与 resolutions 不一致时 yarn 会直接拒绝安装）。
+ */
+function applyDependencyPins(srcDir) {
+  const pinsFile = path.join(ROOT, 'frontend-patches', 'dep-pins.json');
+  if (!existsSync(pinsFile)) return false;
+  let pins;
+  try {
+    pins = JSON.parse(readFileSync(pinsFile, 'utf8'));
+  } catch (e) {
+    console.error(`✘ frontend-patches/dep-pins.json 解析失败：${e?.message || e}`);
+    process.exit(1);
+  }
+  const entries = Object.entries(pins || {});
+  if (entries.length === 0) return false;
+
+  const pkgPath = path.join(srcDir, 'package.json');
+  const pkg = JSON.parse(readFileSync(pkgPath, 'utf8'));
+  pkg.resolutions = { ...(pkg.resolutions || {}), ...pins };
+  writeFileSync(pkgPath, `${JSON.stringify(pkg, null, 2)}\n`);
+  console.log(`  钉住 ${entries.length} 个依赖版本：${entries.map(([k, v]) => `${k}@${v}`).join(', ')}`);
+  return true;
 }
 rmSync(TARGET, { recursive: true, force: true });
 cpSync(built, TARGET, { recursive: true });

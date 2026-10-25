@@ -243,3 +243,43 @@ export function safeRemoteUrlOrNull(raw: string): URL | null {
     return null;
   }
 }
+
+/** 允许跟随的最大重定向跳数（与浏览器/curl 的常用上限一致）。 */
+const MAX_REDIRECTS = 5;
+
+/**
+ * 带 SSRF 校验的 fetch：**逐跳**校验重定向目标。
+ *
+ * 为什么必须这样：`assertSafeRemoteUrl` 只看用户填的初始 URL。而 `fetch` 默认
+ * 自动跟随 302 —— 一个公网地址完全可以 302 到 `http://169.254.169.254/`
+ * 或 `http://10.0.0.5/`，校验就形同虚设（云厂商元数据接口正是这么被打的）。
+ * 这里改成 `redirect: 'manual'`，每拿到一个 Location 都重新过一遍校验，
+ * 不合规直接抛 `UnsafeRemoteUrlError`。
+ *
+ * 注意：Workers 的 fetch 本身也拒绝连内网地址，那是平台层的兜底；应用层
+ * 不能依赖平台行为（换运行时、加代理就没了）。
+ */
+export async function safeFetch(input: string, init: RequestInit = {}): Promise<Response> {
+  let current = assertSafeRemoteUrl(input).toString();
+  for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
+    const res = await fetch(current, { ...init, redirect: 'manual' });
+    const isRedirect = res.status >= 300 && res.status < 400;
+    const location = isRedirect ? res.headers.get('Location') : null;
+    if (!isRedirect || !location) return res;
+
+    let next: string;
+    try {
+      next = new URL(location, current).toString();
+    } catch {
+      throw new UnsafeRemoteUrlError('Redirected to an invalid URL');
+    }
+    current = assertSafeRemoteUrl(next).toString();
+    // 丢弃上一跳的响应体，避免连接泄漏
+    try {
+      await res.body?.cancel();
+    } catch {
+      /* 忽略 */
+    }
+  }
+  throw new UnsafeRemoteUrlError('Too many redirects');
+}

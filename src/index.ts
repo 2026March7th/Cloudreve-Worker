@@ -19,7 +19,7 @@ import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import type { Context } from 'hono';
 import type { Env } from './env';
-import { appContext, ctxOf, type AppBindings } from './middleware/app';
+import { appContext, ctxOf, securityHeaders, type AppBindings } from './middleware/app';
 import { cachePublicAnon, cachePublicAnonStore } from './middleware/cachePublic';
 import { cacheAuthed } from './middleware/cacheAuthed';
 import { fail, ok } from './lib/response';
@@ -217,6 +217,9 @@ app.use('/api/*', cors({
   maxAge: 86400,
 }));
 
+// 安全响应头。放在两个缓存中间件**之前**：写进边缘缓存的那份响应也要带上
+// （否则命中缓存的请求没有 nosniff / Referrer-Policy）。
+app.use('*', securityHeaders());
 // 公共匿名接口（ping / site/config/*）的边缘缓存：命中即短路，跳过 appContext
 // 的 KV 读与冷启动。必须在 appContext 之前注册，否则缓存命中也要先跑一通中间件。
 app.use('*', cachePublicAnon());
