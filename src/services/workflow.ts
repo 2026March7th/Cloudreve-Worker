@@ -33,6 +33,7 @@ import {
 } from '../lib/zipread';
 import { URI } from './uri';
 import { dispatchRemoteDownload, markDispatched } from './nodeTasks';
+import { assertSafeRemoteUrl, UnsafeRemoteUrlError } from '../lib/ssrf';
 
 /**
  * 单个任务允许处理的字节上限。
@@ -214,18 +215,26 @@ export class WorkflowService {
     if (!args.url) throw Err.param('url is required');
     if (!args.dst) throw Err.param('dst is required');
 
+    // 服务端替用户去抓 URL，必须挡住内网/回环/云元数据（SSRF）。
+    // 这里用的是带 CVE-2026-79913 修复的版本：会先拆开 NAT64 / 6to4 /
+    // Teredo / IPv4-compatible 这些「IPv4 藏在 IPv6 里」的封装再判断。
     let parsed: URL;
     try {
-      parsed = new URL(args.url);
-    } catch {
+      parsed = assertSafeRemoteUrl(args.url);
+    } catch (e) {
+      if (e instanceof UnsafeRemoteUrlError) {
+        // magner/torrent 之类不是「不安全」，单独给一条更贴切的文案
+        if (e.message === 'Only HTTP(S) links are supported') {
+          throw new AppError(
+            CodeFeatureNotEnabled,
+            'Only HTTP(S) links are supported; torrents and magnet links need a slave node',
+          );
+        }
+        throw Err.param(e.message);
+      }
       throw Err.param('Invalid URL');
     }
-    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-      throw new AppError(
-        CodeFeatureNotEnabled,
-        'Only HTTP(S) links are supported; torrents and magnet links need a slave node',
-      );
-    }
+    void parsed;
 
     const task = await this.ctx.tasks.create({
       type: 'remote_download',

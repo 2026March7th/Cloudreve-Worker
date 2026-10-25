@@ -273,6 +273,53 @@ async function masterRpc(masterSiteUrl, method, path, payload, nodeId) {
   return json.data;
 }
 
+/**
+ * 从机侧的 SSRF 兜底检查。
+ *
+ * 权威校验在主站（`src/lib/ssrf.ts`，含 CVE-2026-79913 的 IPv4-in-IPv6 拆解），
+ * 但节点跑在真实网络里、能直连内网，所以在真正发请求前再拦一道 ——
+ * 只要主机名是 IP 字面量且落在私网/回环/链路本地，就直接拒绝。
+ */
+function assertSafeRemoteUrl(raw) {
+  let u;
+  try {
+    u = new URL(raw);
+  } catch {
+    throw new Error('invalid remote url');
+  }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') {
+    throw new Error('only http(s) is allowed');
+  }
+  const host = u.hostname.replace(/^\[|\]$/g, '');
+  const v4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
+  if (v4) {
+    const [a, b] = [Number(v4[1]), Number(v4[2])];
+    const blocked =
+      a === 0 ||
+      a === 10 ||
+      a === 127 ||
+      (a === 100 && b >= 64 && b <= 127) ||
+      (a === 169 && b === 254) ||
+      (a === 172 && b >= 16 && b <= 31) ||
+      (a === 192 && b === 168) ||
+      (a === 198 && (b === 18 || b === 19)) ||
+      a >= 224;
+    if (blocked) throw new Error('refusing to fetch a private/loopback address');
+    return u;
+  }
+  if (host.includes(':')) {
+    const lower = host.toLowerCase();
+    if (lower === '::1' || lower === '::') throw new Error('refusing to fetch a loopback address');
+    if (/^f[cd][0-9a-f]{2}:/.test(lower) || /^fe[89ab][0-9a-f]:/.test(lower)) {
+      throw new Error('refusing to fetch a private address');
+    }
+  }
+  if (/^(localhost|\.localhost|.*\.local|\.internal)$/.test(host.toLowerCase())) {
+    throw new Error('refusing to fetch a local hostname');
+  }
+  return u;
+}
+
 /** 远端文件大小：HEAD 拿不到就用 Range 探测（CDN 常见）。 */
 async function remoteSize(url) {
   const head = await fetch(url, { method: 'HEAD' }).catch(() => null);
@@ -298,6 +345,7 @@ function startTask(type, stateRaw) {
       if (type === 'remote_download') {
         // 先取到会话 id，失败时才能通知主站放弃
         const st = JSON.parse(stateRaw);
+        assertSafeRemoteUrl(st.url);
         const size = await remoteSize(st.url);
         if (!size) throw new Error('remote file size is unknown');
         const session = await masterRpc(st.master_site_url, 'PUT', 'statelessUpload/prepare', {
