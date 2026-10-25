@@ -59,6 +59,19 @@ export default defineConfig({
         ],
         // 兜底：以后再有新的超大文件也不会被无意塞进预缓存
         maximumFileSizeToCacheInBytes: 2 * 1024 * 1024,
+        /**
+         * 新 SW 直接接管，不等页面点「刷新」。
+         *
+         * 上游是 `registerType: "prompt"`：新版本装好后进入 waiting，要页面里的
+         * 「有新版本，刷新？」提示来触发 skipWaiting。问题是**页面一旦崩了就永远
+         * 弹不出那个提示** —— 2026-10-26 那次白屏，坏版本连同 index.html 被一起
+         * 预缓存，用户每次打开都拿到坏的，又没法升级，只能 Ctrl+F5。死锁。
+         *
+         * 注意这里**不开 clientsClaim**：老页面继续由老 SW 控制，它懒加载的旧分片
+         * 仍然由老 SW 的预缓存供给（新部署里那些文件已经没了，claim 过去就会 404）。
+         * 只让新 SW 在后台激活，用户下一次打开自然就是新版本。
+         */
+        skipWaiting: true,
         navigateFallbackDenylist: [/^\/pdfviewer.html/, /^\/api\/(.+)/, /^\/f\/(.+)/, /^\/s\/(.+)/],
       },
       devOptions: {
