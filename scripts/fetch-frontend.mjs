@@ -132,18 +132,32 @@ function detectRepoSlug() {
  * 拿到非 200 就被判成「没有预构建包」会直接退回源码现构建，白白多花好几分钟。
  * 这里只对 5xx / 网络错误重试（404 / 403 是「真没有 / 没权限」，重试无意义）。
  */
-async function fetchWithRetry(url, attempts = 3) {
+/**
+ * 下载预构建包。404 也要重试几次 —— GitHub 刚上传完资产时，下载地址会有
+ * 几秒到几十秒的传播延迟（这时文件其实已经存在了，只是边缘还回 404）。
+ *
+ * 传 token：仓库改私有、或者匿名下载被 GitHub 限流时，带上 `GH_TOKEN` /
+ * `GITHUB_TOKEN` 就能继续走快路径（公开仓库匿名也能下，不带也一样）。
+ *
+ * ⚠️ 要认清一个正常现象：**改动 frontend-patches 的那一次提交，这个包必然不存在**
+ * —— 包名里带补丁哈希，而这个包正是由「这次构建」产出的。所以第一次构建走源码
+ * 构建是设计如此，不是配置错了；下一次同指纹的构建才会命中。
+ */
+async function fetchWithRetry(url, attempts = 4) {
+  const token = process.env.GH_TOKEN || process.env.GITHUB_TOKEN || '';
+  const headers = token ? { Authorization: `Bearer ${token}` } : undefined;
   let status = 0;
   for (let i = 1; i <= attempts; i += 1) {
     try {
-      const res = await fetch(url, { redirect: 'follow' });
+      const res = await fetch(url, { redirect: 'follow', headers });
       if (res.ok) return res;
       status = res.status;
-      if (res.status === 404 || res.status === 403) return res;
+      // 401/403 是权限问题，重试没用；404 可能是「刚上传、还没传播完」→ 再试
+      if (res.status !== 404) return res;
     } catch {
       status = 0;
     }
-    if (i < attempts) await new Promise((r) => setTimeout(r, 1000 * i));
+    if (i < attempts) await new Promise((r) => setTimeout(r, 6000 * i));
   }
   console.log(`  （预构建包下载重试 ${attempts} 次仍未成功，最后一次：${status ? `HTTP ${status}` : '网络错误'}）`);
   return { ok: false, status };
@@ -333,8 +347,18 @@ try {
       }
       console.log('  Release 包内容异常，回退到源码构建。');
       cleanup();
-    } else {
-      console.log(`  下载失败（HTTP ${res.status}，私有仓库/未发布 Release 时属正常），改从源码构建。`);
+    } else if (res.status === 404) {
+      // 最常见的两种情况，写清楚免得当成故障排查：
+      //   1. 这次提交改了 frontend-patches/ → 包名（带补丁指纹）是新算出来的，
+      //      而它正由**这次构建**产出 → 第一次必然 404，属正常。
+      //   2. 刚由别的流水线发布、CDN 还没传播完（上面已经重试过）。
+      console.log(
+        `  预构建包尚不存在（${RELEASE_ASSET}）。` +
+          '改动过 frontend-patches 的那次提交本来就没有这个包，本次源码构建后会自动发出来。',
+      );
+    } else {      console.log(
+        `  下载失败（HTTP ${res.status}）。私有仓库需要给构建机配 GH_TOKEN；公开仓库多半是网络问题。`,
+      );
     }
   }
 } catch (e) {
