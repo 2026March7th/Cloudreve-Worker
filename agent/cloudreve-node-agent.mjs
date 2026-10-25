@@ -13,6 +13,7 @@
  *   --root     文件根目录，默认 ./data
  *   --port     监听端口，默认 8666
  *   --secret   主→从 HMAC 密钥，**必填**，要与管理后台「节点密钥」一致
+ *   --allow-private-fetch  允许远程下载抓内网/回环地址（默认禁止，做内网源时用）
  *   --host     监听地址，默认 0.0.0.0
  *   --node-id  本节点 id（只用于日志，校验时不比对）
  *
@@ -50,6 +51,16 @@ function parseArgs(argv) {
 
 const args = parseArgs(process.argv.slice(2));
 const env = process.env;
+
+/**
+ * 允许抓取内网 / 回环地址。
+ *
+ * 默认禁止：远程下载是「服务端替用户去抓 URL」，不拦就能打内网服务。但如果
+ * 这台节点的用途就是拉内网 NAS / 局域网源，可以显式打开（`--allow-private-fetch`
+ * 或 `NODE_ALLOW_PRIVATE_FETCH=1`），风险自负。端到端测试也用它来连本地假服务器。
+ */
+const ALLOW_PRIVATE_FETCH =
+  args['allow-private-fetch'] === 'true' || env.NODE_ALLOW_PRIVATE_FETCH === '1';
 
 const ROOT = path.resolve(args.root ?? env.NODE_ROOT ?? './data');
 const PORT = Number(args.port ?? env.NODE_PORT ?? 8666);
@@ -290,6 +301,7 @@ function assertSafeRemoteUrl(raw) {
   if (u.protocol !== 'http:' && u.protocol !== 'https:') {
     throw new Error('only http(s) is allowed');
   }
+  if (ALLOW_PRIVATE_FETCH) return u;
   const host = u.hostname.replace(/^\[|\]$/g, '');
   const v4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
   if (v4) {

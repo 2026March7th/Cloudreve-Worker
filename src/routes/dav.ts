@@ -43,7 +43,7 @@ import {
   CodePolicyNotAllowed,
 } from '../lib/errors';
 import { kvFor } from '../lib/kvRouter';
-import { DAV_PREFIX, davHref, resolveDavTarget, safeDecode } from '../lib/davPath';
+import { DAV_PREFIX, davChildHref, davHref, resolveDavTarget, safeDecode } from '../lib/davPath';
 
 export const davRoutes = new Hono<AppBindings>();
 
@@ -301,7 +301,9 @@ davRoutes.on('PROPFIND', '*', async (c) => {
       const childIsDir = item.type === FileType.Folder;
       responses.push(
         davResponseXml({
-          href: hrefFor(childUri, childIsDir),
+          // ⚠️ 不能用 childUri.path：它已经被 encode 过一次，再编码就是双重编码
+          // （中文/空格名字的 href 会变成 %25E7%2585… → 客户端 404）
+          href: davChildHref(decodedPath(uri), item.name, childIsDir),
           displayName: item.name,
           isCollection: childIsDir,
           size: Number(item.size ?? 0),
@@ -664,15 +666,12 @@ function decodedPath(uri: URI): string {
   return uri.elements.length === 0 ? '/' : `/${uri.elements.join('/')}`;
 }
 
-/** href：逐段编码，目录补尾斜杠（与 hrefFor 保持一致）。 */
+/**
+ * href：逐段编码 + 目录补尾斜杠。**直接复用 `davHref`** —— 之前这里复制了一份
+ * 同样的实现，两份一起漂移就是双重编码这类 bug 的温床。
+ */
 function pathHref(path: string, isDir = false): string {
-  const encoded = path
-    .split('/')
-    .map((seg) => (seg === '' ? '' : encodeURIComponent(seg)))
-    .join('/');
-  const withSlash = isDir && !encoded.endsWith('/') ? `${encoded}/` : encoded;
-  const full = `${DAV_PREFIX}${withSlash}`;
-  return full === DAV_PREFIX ? `${DAV_PREFIX}/` : full;
+  return davHref(path, isDir);
 }
 
 /** `Timeout: Second-3600, Infinite` → 秒数。缺省 10 分钟，封顶 7 天。 */

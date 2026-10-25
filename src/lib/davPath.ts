@@ -77,6 +77,18 @@ export function encodeDavPath(path: string): string {
  * 集合资源不带尾斜杠时 Windows 报「找不到网络路径」，Alist / MT管理器 直接
  * 判定连接失败。根目录回 `/dav/` 而不是 `/dav`。
  */
+/**
+ * 子项 href：由**已解码的父路径** + 原始子名字拼出来。
+ *
+ * 不能直接用 `URI.child(name).path` —— `join()` 会先 `encodeURIComponent`
+ * 一次，这里再编码就等于双重编码：中文目录名变成 `%25E7%2585…`，客户端
+ * 点进去是 404（ASCII 名字看不出问题，所以特别容易漏）。
+ */
+export function davChildHref(parentPath: string, name: string, isDir: boolean): string {
+  const base = parentPath === '/' ? '' : parentPath.replace(/\/+$/, '');
+  return davHref(`${base}/${name}`, isDir);
+}
+
 export function davHref(path: string, isDir: boolean): string {
   const encoded = encodeDavPath(path);
   const withSlash = isDir && !encoded.endsWith('/') ? `${encoded}/` : encoded;

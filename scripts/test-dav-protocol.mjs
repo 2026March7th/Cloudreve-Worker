@@ -422,6 +422,112 @@ try {
   }
 
   // -------------------------------------------------------------------------
+  // 真实客户端的完整请求序列。逐个按它们的实际行为打一遍：任一步返回意料之外
+  // 的状态码，客户端就会在山一步报「连接失败」。
+  console.log('\n[9] 客户端完整序列');
+
+  const seq = async (app, label, steps) => {
+    for (const [desc, fn] of steps) {
+      const status = await fn(app);
+      check(`${label} · ${desc}`, status === true || (Array.isArray(status) ? false : status), String(status));
+    }
+  };
+
+  const okStatus = (allowed) => (status) => allowed.includes(status);
+
+  // --- Windows「映射网络驱动器」---
+  {
+    resetStore();
+    resetKv();
+    const app2 = makeApp();
+    seedFolder('/sub');
+    const w = (allowed) => (app) => allowed; // 占位，下面逐个写
+    void w;
+    const results = [];
+    const step = async (desc, fn, allowed) => {
+      const status = await fn(app2);
+      results.push([desc, status, allowed]);
+      check(`Windows · ${desc}`, allowed.includes(status), `实际 ${status} 期望 ${allowed.join('/')}`);
+    };
+
+    await step('OPTIONS 无凭据 → 要凭据', (a) => a.request('https://dav.test/dav', { method: 'OPTIONS' }).then((r) => r.status), [200]);
+    await step('PROPFIND 根 Depth 0', async (a) => (await req(a, 'PROPFIND', '/dav', { headers: { Depth: '0' }, body: PROPFIND_BODY })).status, [207]);
+    await step('PROPFIND 根 Depth 1', async (a) => (await req(a, 'PROPFIND', '/dav', { headers: { Depth: '1' }, body: PROPFIND_BODY })).status, [207]);
+    await step('PROPFIND 子目录 Depth 1', async (a) => (await req(a, 'PROPFIND', '/dav/sub', { headers: { Depth: '1' }, body: PROPFIND_BODY })).status, [207]);
+    await step('PUT 新建', async (a) => (await req(a, 'PUT', '/dav/sub/doc.docx', { headers: { 'Content-Length': '4' }, body: 'v1..' })).status, [201]);
+    await step('PUT 覆盖（资源管理器保存）', async (a) => (await req(a, 'PUT', '/dav/sub/doc.docx', { headers: { 'Content-Length': '5' }, body: 'v2...' })).status, [204]);
+    await step('GET 读回', async (a) => { const r = await req(a, 'GET', '/dav/sub/doc.docx'); return r.status === 200 && r.text === 'v2...' ? 200 : -1; }, [200]);
+    await step('MOVE 同目录改名', async (a) => (await req(a, 'MOVE', '/dav/sub/doc.docx', { headers: { Destination: 'https://dav.test/dav/sub/DOC2.docx' } })).status, [201]);
+    let winLock = null;
+    await step('LOCK 打开文件', async (a) => {
+      const r = await req(a, 'LOCK', '/dav/sub/DOC2.docx', { headers: { Depth: '0' }, body: LOCK_BODY });
+      const m = /opaquelocktoken:([^>]+)/.exec(r.res.headers.get('lock-token') ?? '');
+      winLock = m ? m[1] : null;
+      return r.status;
+    }, [200, 201]);
+    await step('被锁时无 If 删除 → 423（RFC 要求）', async (a) => (await req(a, 'DELETE', '/dav/sub/DOC2.docx')).status, [423]);
+    await step('带 If 头删除', async (a) => (await req(a, 'DELETE', '/dav/sub/DOC2.docx', { headers: { If: `(<opaquelocktoken:${winLock}>)` } })).status, [204]);
+  }
+
+  // --- Alist / OpenList「添加 WebDAV 存储」---
+  {
+    resetStore();
+    resetKv();
+    const app2 = makeApp();
+    seedFile('/a.txt', 'aaa');
+    const step = async (desc, fn, allowed) =>
+      check(`Alist · ${desc}`, allowed.includes(await fn(app2)), `期望 ${allowed.join('/')}`);
+
+    await step('PROPFIND 根 Depth 0', async (a) => (await req(a, 'PROPFIND', '/dav', { headers: { Depth: '0' } })).status, [207]);
+    await step('PROPFIND 根 Depth 1', async (a) => (await req(a, 'PROPFIND', '/dav', { headers: { Depth: '1' } })).status, [207]);
+    await step('PROPFIND 文件 Depth 0', async (a) => (await req(a, 'PROPFIND', '/dav/a.txt', { headers: { Depth: '0' } })).status, [207]);
+    await step('GET 文件', async (a) => (await req(a, 'GET', '/dav/a.txt')).status, [200]);
+    await step('MKCOL 建目录', async (a) => (await req(a, 'MKCOL', '/dav/newdir')).status, [201]);
+    await step('PUT 上传', async (a) => (await req(a, 'PUT', '/dav/newdir/b.bin', { headers: { 'Content-Length': '3' }, body: 'bbb' })).status, [201]);
+  }
+
+  // --- rclone（sync / copy）---
+  {
+    resetStore();
+    resetKv();
+    const app2 = makeApp();
+    seedFile('/r.dat', '0123456789');
+    const step = async (desc, fn, allowed) =>
+      check(`rclone · ${desc}`, allowed.includes(await fn(app2)), `期望 ${allowed.join('/')}`);
+
+    await step('OPTIONS', (a) => a.request('https://dav.test/dav/', { method: 'OPTIONS' }).then((r) => r.status), [200]);
+    await step('PROPFIND Depth 1', async (a) => (await req(a, 'PROPFIND', '/dav', { headers: { Depth: '1' } })).status, [207]);
+    await step('HEAD 取大小', async (a) => (await req(a, 'HEAD', '/dav/r.dat')).status, [200]);
+    await step('GET Range', async (a) => (await req(a, 'GET', '/dav/r.dat', { headers: { Range: 'bytes=2-4' } })).status, [206]);
+    await step('COPY 传副本', async (a) => (await req(a, 'COPY', '/dav/r.dat', { headers: { Destination: 'https://dav.test/dav/r2.dat' } })).status, [201]);
+    await step('MOVE 跨目录', async (a) => { await req(a, 'MKCOL', '/dav/dir'); return (await req(a, 'MOVE', '/dav/r2.dat', { headers: { Destination: 'https://dav.test/dav/dir/r3.dat' } })).status; }, [201]);
+    await step('DELETE', async (a) => (await req(a, 'DELETE', '/dav/dir/r3.dat')).status, [204]);
+  }
+
+  // --- MT管理器（Android，Sardine 库）---
+  {
+    resetStore();
+    resetKv();
+    const app2 = makeApp();
+    seedFolder('/照片');
+    seedFile('/照片/图 1.jpg', 'jpeg');
+    const step = async (desc, fn, allowed) =>
+      check(`MT · ${desc}`, allowed.includes(await fn(app2)), `期望 ${allowed.join('/')}`);
+
+    await step('PROPFIND 根 Depth 1', async (a) => (await req(a, 'PROPFIND', '/dav', { headers: { Depth: '1' } })).status, [207]);
+    await step('PROPFIND 中文目录 Depth 1', async (a) => (await req(a, 'PROPFIND', `/dav/${encodeURIComponent('照片')}`, { headers: { Depth: '1' } })).status, [207]);
+    await step('GET 中文+空格文件名', async (a) => (await req(a, 'GET', `/dav/${encodeURIComponent('照片')}/${encodeURIComponent('图 1.jpg')}`)).status, [200]);
+    await step('PROPFIND 目录 href 带尾斜杠', async (a) => {
+      const r = await req(a, 'PROPFIND', '/dav', { headers: { Depth: '1' } });
+      return r.text.includes(`<D:href>/dav/${encodeURIComponent('照片')}/</D:href>`) ? 207 : -1;
+    }, [207]);
+    await step('中文子项 href 不得双重编码', async (a) => {
+      const r = await req(a, 'PROPFIND', '/dav', { headers: { Depth: '1' } });
+      return r.text.includes('%25E7') ? -1 : 207;
+    }, [207]);
+  }
+
+  // -------------------------------------------------------------------------
   console.log(`\n${failed === 0 ? '全部通过' : `${failed} 项不通过`}（${passed} 项通过，${failed} 项失败）`);
   process.exitCode = failed === 0 ? 0 : 1;
 } catch (err) {

@@ -151,6 +151,8 @@ async function main() {
       '--secret', SECRET,
       '--host', '127.0.0.1',
       '--node-id', String(NODE_ID),
+      // 假远端服务器跑在 127.0.0.1，从机的 SSRF 兜底默认会拒 —— 测试里显式放开
+      '--allow-private-fetch',
     ],
     { stdio: ['ignore', 'pipe', 'pipe'] },
   );

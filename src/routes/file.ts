@@ -1136,7 +1136,14 @@ function buildWopiSrc(template: string, fileSrc: string): string {
   return url.toString();
 }
 
-fileRoutes.post('/viewerSession', async (c) => {
+/**
+ * 创建预览会话（WOPI / OnlyOffice）。
+ *
+ * ⚠️ 前端用的是 **PUT**（`api.ts` 里 `sendCreateViewerSession` 显式 `method: "PUT"`），
+ * 上游 Go 也是 `file.PUT("viewerSession", …)`。这里只注册 POST 的话，点开 Office
+ * 文件会 404 —— 又一个「代码写了但用不了」。两种方法都收，POST 兼容旧调用方。
+ */
+const viewerSessionHandler = async (c: AppRequest) => {
   const ctx = ctxOf(c);
   if (!guard(c)) return fail(c, Err.loginRequired());
 
@@ -1207,7 +1214,11 @@ fileRoutes.post('/viewerSession', async (c) => {
   } catch (e) {
     return fail(c, e);
   }
-});
+};
+
+// 前端用 PUT，上游也是 PUT；POST 只是兼容旧调用方。
+fileRoutes.put('/viewerSession', viewerSessionHandler);
+fileRoutes.post('/viewerSession', viewerSessionHandler);
 
 /** WOPI 会话校验。合法时返回会话与文件行；否则 null。 */
 async function wopiSessionOf(

@@ -182,6 +182,23 @@ node agent/cloudreve-node-agent.mjs --root /data/cloudreve --port 8666 --secret 
 
 用户组 → 编辑 → 勾上 WebDAV 权限；然后用户在「连接与挂载」里创建 WebDAV 账号，拿到的是专用密码，**不是登录密码**。
 
+地址填 `https://你的域名/dav`（带不带结尾斜杠都行）。Windows 映射网络驱动器、
+MT管理器、Alist / OpenList、rclone、Cyberduck 都验证过，账号密码就是上面那个专用密码。
+
+**单文件上传上限 100 MB**（Cloudflare 套餐层限制，不是代码限制）：Free / Pro 是
+100 MB，Business 200 MB，Enterprise 可以在 zone 的 Network → Maximum Upload Size
+自助调到 5 GB。超过的话请求在到达 Worker 之前就被 CF 挡回 413，代码里无法拦截或
+提示。大文件请用网页端上传（走存储的直传/分片，不经过 Worker），或者把策略绑到
+从节点后用网页端写入节点磁盘。
+
+挂载失败先看这三条：
+
+| 现象 | 原因 |
+|---|---|
+| 提示「找不到网络路径」/ 直接连不上 | 地址少了 `/dav`，或者用了 `http://`（Windows 只对 HTTPS 自动发 Basic 凭据） |
+| 能进目录但文件打不开 | 看响应里 `X-Correlation-ID` 对应日志；中文名问题已修（href 双重编码） |
+| 上传大文件报 413 | 上面那条 100 MB 限制 |
+
 ## 7. 多 KV
 
 单 KV 并发一高会撞写入限速。`KV_COUNT` 设成 2 到 5 之后按角色分开：
