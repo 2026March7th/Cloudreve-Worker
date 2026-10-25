@@ -122,7 +122,11 @@ not_found_handling = "single-page-application"
 # 坏响应，Chrome 直接 ERR_FAILED（Firefox 会回退网络所以看不出来）。
 # 设 none 后 .html 原样 200，其余未知路径仍交给 not_found_handling 回退 index.html。
 html_handling = "none"
-run_worker_first = ["/api/*", "/s/*", "/f/*", "/dav/*", "/manifest.json"]
+# ⚠️ `/dav` 必须单独列一条**精确路径**：只写 `/dav/*` 的话裸 `/dav`（不带尾斜杠）
+# 匹配不上，会落到静态资源处理器 —— 而它只支持 GET/HEAD，OPTIONS/PROPFIND 一律
+# 405。MT管理器 / Alist / OpenList / 官方桌面端都会先探不带斜杠的地址，于是
+# 「连接失败」。列了精确路径后由 Worker 自己处理（内部再 301 到 /dav/）。
+run_worker_first = ["/api/*", "/s/*", "/f/*", "/dav", "/dav/*", "/manifest.json"]
 
 # ---------------------------------------------------------------------------
 # 定时任务（每小时整点）。需要同步在 src/index.ts 的 scheduled() 里处理，已实现。
