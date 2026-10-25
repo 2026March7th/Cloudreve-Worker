@@ -233,8 +233,8 @@ const TASK_TTL = 24 * 3600 * 1000;
 
 function gcTasks() {
   const now = Date.now();
-  for (const [, t] of tasks) {
-    if (now - t.createdAt > TASK_TTL) tasks.delete(t.id);
+  for (const [id, t] of tasks) {
+    if (now - t.createdAt > TASK_TTL) tasks.delete(id);
   }
 }
 
