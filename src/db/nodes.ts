@@ -18,7 +18,7 @@ function toDate(value: unknown): Date {
   return new Date(String(value ?? 0));
 }
 
-function normalize(row: Record<string, unknown>): NodeRow {
+export function normalizeNodeRow(row: Record<string, unknown>): NodeRow {
   return {
     id: Number(row.id),
     created_at: toDate(row.created_at),
@@ -46,7 +46,7 @@ export async function loadNodeById(env: Env, id: number): Promise<NodeRow | null
   const rows = (await sql`
     SELECT * FROM nodes WHERE id = ${id} AND deleted_at IS NULL LIMIT 1
   `) as Record<string, unknown>[];
-  const row = rows[0] ? normalize(rows[0]) : null;
+  const row = rows[0] ? normalizeNodeRow(rows[0]) : null;
   cache.set(id, { at: now, row });
   return row;
 }
@@ -86,7 +86,7 @@ export async function listActiveNodes(env: Env): Promise<NodeRow[]> {
   const rows = (await sql`
     SELECT * FROM nodes WHERE deleted_at IS NULL AND status = 'active' ORDER BY id ASC
   `) as Record<string, unknown>[];
-  const list = rows.map(normalize);
+  const list = rows.map(normalizeNodeRow);
   listCache = { at: now, rows: list };
   return list;
 }

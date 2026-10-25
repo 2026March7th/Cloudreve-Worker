@@ -29,7 +29,8 @@
     "test:node": "node scripts/test-node-relay.mjs && node scripts/test-node-tasks.mjs && node scripts/test-node-pool.mjs",
     "node:agent": "node agent/cloudreve-node-agent.mjs",
     "test:node-tasks": "node scripts/test-node-tasks.mjs",
-    "test:node-pool": "node scripts/test-node-pool.mjs"
+    "test:node-pool": "node scripts/test-node-pool.mjs",
+    "test:share-og": "node scripts/test-share-og.mjs"
   },
   "dependencies": {
     "@neondatabase/serverless": "^0.10.4",

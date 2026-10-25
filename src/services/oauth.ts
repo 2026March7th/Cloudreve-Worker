@@ -86,8 +86,17 @@ function assertSafeRedirectUri(uri: string): void {
  */
 function redirectURIMatches(registered: string, requested: string): boolean {
   if (!registered.startsWith('http://')) return registered === requested;
-  // 片段会把注入的 code 甩掉，两边带 # 都不认
+  // 片段会把授权码甩掉，两边带 # 都不认
   if (registered.includes('#') || requested.includes('#')) return false;
+
+  // `http://127.0.0.1:/cb` 解析后与「完全不带端口」同形（host=127.0.0.1、
+  // port=''），下面的归一化区分不出来，只能查原文。上游用
+  // `strings.HasSuffix(host, ":")` 挡的就是这个：端口放宽只对「注册地址带具体
+  // 端口或干脆不带」有意义，带个空冒号必须拒，否则任意端口都能匹配上。
+  for (const raw of [registered, requested]) {
+    const m = /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\/([^/?#]*)/.exec(raw);
+    if (m && m[1]!.endsWith(':')) return false;
+  }
 
   let reg: URL;
   try {

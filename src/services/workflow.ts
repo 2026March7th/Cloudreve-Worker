@@ -244,10 +244,25 @@ export class WorkflowService {
         dst: args.dst,
       });
       if (dispatch) {
-        await markDispatched(this.ctx, task.id, dispatch);
-        return (await this.ctx.tasks.byId(task.id))!;
+        try {
+          await markDispatched(this.ctx, task.id, dispatch);
+          return (await this.ctx.tasks.byId(task.id))!;
+        } catch (e) {
+          // 节点已经在跑了，但主站没记下分派信息 → cron 永远不会同步它，
+          // 任务会永远停在 queued。这种情况必须显式置错，让用户能看到原因，
+          // 而不是看着一个永远不结束的任务。
+          const message = e instanceof Error ? e.message : String(e);
+          await this.ctx.tasks.updateStatus(task.id, 'error', {
+            summary: {
+              props: { src: args.url, dst: args.dst },
+              error: `Dispatched to node ${dispatch.nodeId} but failed to record it: ${message}`,
+            },
+          });
+          throw e;
+        }
       }
     } catch (e) {
+      if (e instanceof AppError) throw e;
       console.error(
         `remote download dispatch failed, falling back to in-request execution: ${
           e instanceof Error ? e.message : e

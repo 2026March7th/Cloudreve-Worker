@@ -335,45 +335,59 @@ export type SignatureCheck =
   | { ok: false; reason: string };
 
 /**
- * 校验从机发来的请求签名。与 `signNodeRequest` 完全对称，对应上游
- * `auth.CheckRequest` + `middleware.SignRequired`。
+ * 校验从机发来的请求签名。与 `signNodeRequest` / `signNodeUrl` 完全对称，
+ * 对应上游 `auth.CheckRequest` + `auth.CheckURI` + `middleware.SignRequired`。
  *
  * 调用方负责：按 `X-Cr-Node-Id` 找到节点、把 slave_key 传进来。
- * 分片上传（`POST /api/v4/slave/upload/…`）的正文不参与签名 —— 与上游
+ *
+ * 签名方式同样**看方法**（与从机的 SignRequired 一致）：
+ *   PUT / POST / PATCH → `Authorization: Bearer Cr …`，正文参与签名
+ *   GET / HEAD / DELETE → URL 上的 `?sign=`，只签解码后的路径
+ * 分片上传（`POST /slave/upload/…`）的正文不参与签名 —— 与上游
  * `isUploadDataRequest` 同一个判据，否则几十 MB 的分片要先读进内存。
  */
 export async function verifyNodeSignature(args: {
   slaveKey: string;
   method: string;
-  /** 请求的完整 URL（用于取解码后的路径） */
+  /** 请求的完整 URL（用于取解码后的路径与 query 里的 sign） */
   url: string;
   headers: Headers;
-  /** 原始正文；分片上传传空 */
+  /** 原始正文；分片上传与 GET/DELETE 传空 */
   body?: string | Uint8Array | null;
 }): Promise<SignatureCheck> {
   const method = args.method.toUpperCase();
-  const isUploadData =
-    new URL(args.url).pathname.includes(`${SLAVE_PREFIX}/upload/`) && method !== 'PUT';
-  const bodyText =
-    isUploadData || args.body == null
-      ? ''
-      : typeof args.body === 'string'
-        ? args.body
-        : new TextDecoder().decode(args.body);
-
-  const auth = args.headers.get('authorization') ?? '';
-  if (!auth.startsWith('Bearer Cr ')) return { ok: false, reason: 'authorization header is missing' };
-  const provided = auth.slice('Bearer Cr '.length);
-
+  const url = new URL(args.url);
   const headers: Record<string, string> = {};
   args.headers.forEach((value, key) => {
     headers[key] = value;
   });
-  const content = goJsonStringify({
-    Path: decodePathForSign(new URL(args.url).pathname),
-    Header: signedHeaderString(headers),
-    Body: bodyText,
-  });
+
+  let provided: string;
+  let expected: string;
+
+  if (method === 'PUT' || method === 'POST' || method === 'PATCH') {
+    const auth = args.headers.get('authorization') ?? '';
+    if (!auth.startsWith('Bearer Cr ')) {
+      return { ok: false, reason: 'authorization header is missing' };
+    }
+    provided = auth.slice('Bearer Cr '.length);
+    const isUploadData = url.pathname.includes(`${SLAVE_PREFIX}/upload/`) && method !== 'PUT';
+    const bodyText =
+      isUploadData || args.body == null
+        ? ''
+        : typeof args.body === 'string'
+          ? args.body
+          : new TextDecoder().decode(args.body);
+    expected = goJsonStringify({
+      Path: decodePathForSign(url.pathname),
+      Header: signedHeaderString(headers),
+      Body: bodyText,
+    });
+  } else {
+    provided = url.searchParams.get('sign') ?? '';
+    if (!provided) return { ok: false, reason: 'sign is missing in query' };
+    expected = decodePathForSign(url.pathname);
+  }
 
   const idx = provided.lastIndexOf(':');
   if (idx < 0) return { ok: false, reason: 'invalid sign format' };
@@ -383,15 +397,13 @@ export async function verifyNodeSignature(args: {
   }
   if (expires < Math.floor(Date.now() / 1000)) return { ok: false, reason: 'signature expired' };
 
-  const want = await hmacSign(args.slaveKey, content, expires);
-  // 逐字符比较，避免时序侧信道
-  let diff = 0;
-  for (let i = 0; i < want.length; i += 1) {
-    diff |= want.charCodeAt(i) ^ (provided.charCodeAt(i) ?? 0);
+  const want = await hmacSign(args.slaveKey, expected, expires);
+  // 定长比较，避免时序侧信道
+  let diff = want.length === provided.length ? 0 : 1;
+  for (let i = 0; i < Math.min(want.length, provided.length); i += 1) {
+    diff |= want.charCodeAt(i) ^ provided.charCodeAt(i);
   }
-  if (diff !== 0 || want.length !== provided.length) {
-    return { ok: false, reason: 'invalid sign' };
-  }
+  if (diff !== 0) return { ok: false, reason: 'invalid sign' };
   return { ok: true, expires };
 }
 

@@ -51,6 +51,7 @@ import { paymentRoutes, paymentAdminRoutes } from './routes/payment';
 import { DownloadService } from './services/download';
 import { FileSystemService } from './services/fs';
 import { syncNodeTasks } from './services/nodeTasks';
+import { sharePreview } from './middleware/sharePreview';
 import { ShareService } from './services/share';
 import { isSocialMediaBot, renderSharePreview } from './services/share-preview';
 
@@ -216,6 +217,9 @@ app.use('*', cachePublicAnon());
 // appContext 的 KV 读与数据库往返。必须在 appContext 之前注册。
 app.use('*', cacheAuthed());
 app.use('*', appContext());
+// 社交媒体爬虫看分享链接时回 OG 预览页（非爬虫原样放行）。
+// 必须放在 appContext 之后 —— 它要读站点设置和分享信息。
+app.use('*', sharePreview());
 // 后置：miss 时把 200 响应写回 CF 边缘缓存（跨 isolate 共享）。
 app.use('*', cachePublicAnonStore());
 

@@ -73,7 +73,7 @@ npm run dev                      # 本地起服务
 npm run deploy                   # 部署
 ```
 
-还有几个会用到的：`db:migrate` 建表、`db:sync` 主备同步、`kv:setup` 配 KV、`kv:purge` 清缓存重填、`smoke` 冒烟测试、`test:node` 从节点的端到端测试（存储 + 任务分派 + 能力位，会自己起本地 agent 和假主站）。
+还有几个会用到的：`db:migrate` 建表、`db:sync` 主备同步、`kv:setup` 配 KV、`kv:purge` 清缓存重填、`smoke` 冒烟测试、`test:node` 从节点的端到端测试（存储 + 任务分派 + 能力位）、`test:share-og` 分享社交预览。
 
 ## 许可
 

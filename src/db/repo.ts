@@ -18,7 +18,8 @@ import type {
   UserRow,
   UserWithGroup,
 } from './types';
-import { sha256Hex, timingSafeEqual, uuidv4 } from '../lib/crypto';import { MetadataExpectedCollectTime } from '../lib/sysmeta';
+import { sha256Hex, timingSafeEqual, uuidv4 } from '../lib/crypto';
+import { normalizeNodeRow } from './nodes';import { MetadataExpectedCollectTime } from '../lib/sysmeta';
 
 // ---------------------------------------------------------------------------
 // 归一化
@@ -1780,14 +1781,7 @@ export class NodeRepo {
     const rows = (await this.sql`
       SELECT * FROM nodes WHERE id = ${id} AND deleted_at IS NULL LIMIT 1
     `) as Record<string, unknown>[];
-    if (!rows[0]) return null;
-    return {
-      ...rows[0],
-      created_at: toDate(rows[0].created_at),
-      updated_at: toDate(rows[0].updated_at),
-      deleted_at: rows[0].deleted_at ? toDate(rows[0].deleted_at) : null,
-      settings: toJson(rows[0].settings, {}),
-    } as unknown as NodeRow;
+    return rows[0] ? normalizeNodeRow(rows[0]) : null;
   }
 }
 
