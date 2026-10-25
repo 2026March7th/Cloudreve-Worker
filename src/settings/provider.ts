@@ -41,6 +41,9 @@ const COLO_MAX_AGE_S = 60;
 const MEMORY_TTL_MS = 5000;
 let memoryCache: { at: number; map: Map<string, string> } | null = null;
 
+/** Workers 的后台任务挂钩（必须传绑定好的方法，见 index.ts 的注释）。 */
+export type WaitUntil = (p: Promise<unknown>) => void;
+
 /**
  * 归一化外部服务的 base URL（Meilisearch / Tika endpoint）。
  * 管理员常直接粘贴 `ms-xxx.meilisearch.io` 这种不带协议的主机名，
@@ -244,9 +247,11 @@ export class SettingsProvider {
  */
 let prefetched: Promise<SettingsProvider> | null = null;
 
-export function prefetchSettings(env: Env): void {
+export function prefetchSettings(env: Env, waitUntil?: WaitUntil): void {
   if (prefetched) return;
-  prefetched = loadSettings(env).catch(() => null as unknown as SettingsProvider);
+  prefetched = loadSettings(env, resolveDb(env), waitUntil).catch(
+    () => null as unknown as SettingsProvider,
+  );
 }
 
 /** 取走预取结果（一次性）。没有预取或预取失败时返回 null。 */
@@ -261,7 +266,11 @@ export function consumePrefetchedSettings(): Promise<SettingsProvider> | null {
  * 加载设置。优先读 KV 缓存，未命中则回源数据库。
  * `ensureSettings()` 保证表里每个默认键都有行。
  */
-export async function loadSettings(env: Env, db: DbHandle = resolveDb(env)): Promise<SettingsProvider> {
+export async function loadSettings(
+  env: Env,
+  db: DbHandle = resolveDb(env),
+  waitUntil?: WaitUntil,
+): Promise<SettingsProvider> {
   const now = Date.now();
   if (memoryCache && now - memoryCache.at < MEMORY_TTL_MS) {
     return new SettingsProvider(env, memoryCache.map);
@@ -296,7 +305,7 @@ export async function loadSettings(env: Env, db: DbHandle = resolveDb(env)): Pro
     }
   }
 
-  const map = await refillSettingsFromDb(env, db);
+  const map = await refillSettingsFromDb(env, db, waitUntil);
   memoryCache = { at: Date.now(), map };
   return new SettingsProvider(env, map);
 }
@@ -315,7 +324,11 @@ export function clearSettingsMemoryCache(): void {
  * 不删旧键、不读缓存：直接算出一份新的再 put 覆盖。这样**不存在**
  * 「键被删掉、新值还没写」的空窗（空窗期间并发请求会全部回源打库）。
  */
-async function refillSettingsFromDb(env: Env, db: DbHandle = resolveDb(env)): Promise<Map<string, string>> {
+async function refillSettingsFromDb(
+  env: Env,
+  db: DbHandle = resolveDb(env),
+  waitUntil?: WaitUntil,
+): Promise<Map<string, string>> {
   const sql = db.sql;
   // 空闲后（Neon 免费版会自动休眠计算节点）第一条查询偶尔会撞上瞬态错误，
   // 定时任务一小时才来一次，正好踩在这个场景上 —— 限流/网络抖动统一退避重试。
@@ -333,8 +346,17 @@ async function refillSettingsFromDb(env: Env, db: DbHandle = resolveDb(env)): Pr
 
   const obj: Record<string, string> = {};
   for (const [k, v] of map) obj[k] = v;
-  await kvFor(env, 'site').put(KV_CACHE_KEY, JSON.stringify(obj), { expirationTtl: KV_CACHE_TTL });
-  // 顺手写一份 colo 副本，给本节点后续的冷 isolate 用
+  // KV 写是这条冷不路径上最后一个大开销（跨区写入几百毫秒），而响应并不需要
+  // 等它 —— 有 waitUntil 就挂后台，让「设置已就绪」与「KV 回填」解耦。
+  // 没传 waitUntil（cron / 测试）时照旧 await，行为不变。
+  const put = kvFor(env, 'site')
+    .put(KV_CACHE_KEY, JSON.stringify(obj), { expirationTtl: KV_CACHE_TTL })
+    .catch(() => {
+      /* 回填失败只是下次还得回源，不影响本次结果 */
+    });
+  if (waitUntil) waitUntil(put);
+  else await put;
+  // 顺手写一份 colo 副本，给本节点后续的冷 isolate 用（Cache API 写是本地的，几毫秒）
   await coloCachePutJson(COLO_CACHE_KEY, obj, COLO_CACHE_TTL_S);
   return map;
 }

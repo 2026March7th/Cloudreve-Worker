@@ -138,7 +138,7 @@ app.use('*', async (c, next) => {
   if (!bootstrapConfirmed) {
     // 冷启动时「读自举标记」与「读设置」互不依赖，先把设置读取挂起来并行跑，
     // 后面 appContext 会 await 同一个 Promise（见 settings/provider.ts）。
-    prefetchSettings(c.env);
+    prefetchSettings(c.env, (p) => c.executionCtx.waitUntil(p));
     try {
       // 自举标记与「分域降级」状态并行读出（都在 flag 命名空间，一次并发
       // 往返拿全）。分域降级状态**必须每个 isolate 冷启动都装一遍**：

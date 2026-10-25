@@ -105,15 +105,18 @@ export function appContext(): MiddlewareHandler<AppBindings> {
     // 设置读取：入口处已经预取过就直接用那份 Promise（与自举标记并行），
     // 否则现读（内存 / colo 缓存 / KV / 数据库，见 settings/provider.ts）。
     const prefetchedSettings = consumePrefetchedSettings();
+    // waitUntil 必须包一层箭头函数：直接传 `c.executionCtx.waitUntil` 这种
+    // 未绑定原方法会抛 Illegal invocation（踩过，缓存写入静默丢失）。
+    const waitUntil = (p: Promise<unknown>) => c.executionCtx.waitUntil(p);
     let settings: SettingsProvider;
     if (prefetchedSettings) {
       try {
         settings = await prefetchedSettings;
       } catch {
-        settings = await loadSettings(env, db);
+        settings = await loadSettings(env, db, waitUntil);
       }
     } else {
-      settings = await loadSettings(env, db);
+      settings = await loadSettings(env, db, waitUntil);
     }
     const settingsMs = performance.now() - startedAt;
     const codec = new HashIDCodec(settings.hashIdSalt);
