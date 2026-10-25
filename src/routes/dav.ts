@@ -411,8 +411,13 @@ davRoutes.on('PUT', '*', async (c) => {
   if (!body) return c.body(null, 400);
 
   const existing = await fs.resolve(uri);
-  if (existing && existing.file_children !== null) {
-    return c.body(null, 405); // 目标是目录
+  // 目标是目录 → 405。判目录必须看 `type` 位：`file_children` 存的是**父目录 id**，
+  // 文件和目录都不为 null（只有根/回收站项才是 null）。之前用
+  // `file_children !== null` 判「是目录」，等于把每个已存在的文件都当成目录，
+  // 于是 PUT 覆盖已有文件恒定 405 —— 新建能成功、保存（覆盖）永远失败，
+  // 正是客户端「能打开、改完存不进去」的形态。
+  if (existing && isFolderRow(fs, existing)) {
+    return c.body(null, 405);
   }
 
   const blocked = await lockedWriteResponse(c, [uri]);
@@ -548,6 +553,9 @@ davRoutes.on(['COPY', 'MOVE'], '*', async (c) => {
       if (!overwrite) return c.body(null, 412);
       await fs.delete([dstUri], { skipSoftDelete: true });
       targetParent = dstUri.parent();
+      // 覆盖时落点就是 Destination 自己（不是源文件名）：把 a.txt 覆盖成 b.txt
+      // 的结果必须是 b.txt，否则「另存为」会静默变成同目录多出一个 a.txt。
+      targetName = dstUri.name;
     } else {
       targetParent = dstUri.parent();
       targetName = dstUri.name;
@@ -557,8 +565,7 @@ davRoutes.on(['COPY', 'MOVE'], '*', async (c) => {
     const parent = await fs.resolve(targetParent);
     if (!parent || !isFolderRow(fs, parent)) return c.body(null, 409);
 
-    // 同目录改名/覆盖：moveOrCopy 的同名冲突检查会把**源自己**当冲突（源就
-    // 落在该目录里），必须走 rename 直改；rename 自带同名冲突校验。
+    // 同目录 MOVE 改名：走 rename（少几次查询，且它自带同名冲突校验）。
     if (!isCopy && targetParent.path === srcUri.parent().path) {
       await fs.rename(srcUri, targetName);
       // 锁跟着资源走（RFC 4918 §7.5）
@@ -566,13 +573,11 @@ davRoutes.on(['COPY', 'MOVE'], '*', async (c) => {
       return c.body(null, dstExists ? 204 : 201);
     }
 
-    await fs.moveOrCopy([srcUri], targetParent, isCopy);
+    // `destName` 一步到位。之前是「先按原名落、再 rename 成目标名」，同目录
+    // COPY 另存为新名字时前半步会撞到源文件自己（`(parent, name)` 唯一），
+    // 直接 412 —— 也就是「复制一份」永远失败。
+    await fs.moveOrCopy([srcUri], targetParent, isCopy, targetName);
 
-    // 落点名字与原名不同 → 搬/复制完改名
-    if (targetName !== srcUri.name) {
-      const childUri = targetParent.child(srcUri.name);
-      await fs.rename(childUri, targetName);
-    }
     if (!isCopy) {
       await moveLockRoots(c, decodedPath(srcUri), decodedPath(targetParent.child(targetName)));
     }

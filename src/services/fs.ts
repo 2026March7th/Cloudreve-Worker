@@ -1058,7 +1058,13 @@ export class FileSystemService {
   // 移动 / 复制
   // -------------------------------------------------------------------------
 
-  async moveOrCopy(uris: URI[], dstUri: URI, copy: boolean): Promise<void> {
+  /**
+   * 移动 / 复制到目标目录。
+   *
+   * `destName` 用于「复制/移动的同时改名」（WebDAV 的 COPY/MOVE 会这样用：
+   * Destination 最后一段与源名不同）。不传则沿用源文件名。
+   */
+  async moveOrCopy(uris: URI[], dstUri: URI, copy: boolean, destName?: string): Promise<void> {
     const user = this.ctx.requireUser();
 
     // 原版的约束（dbfs.canMoveOrCopyTo）：
@@ -1087,7 +1093,8 @@ export class FileSystemService {
       if (this.isRootFolder(src)) throw new AppError(CodeRootProtected, 'Cannot move root folder');
       this.assertOwner(src, user.id);
 
-      const nameError = validateName(src.name);
+      const finalName = destName ?? src.name;
+      const nameError = validateName(finalName);
       if (nameError) throw new AppError(CodeIllegalObjectName, nameError);
 
       if (copy) {
@@ -1098,11 +1105,11 @@ export class FileSystemService {
         }
         // files 表有 (file_children, name) 唯一索引，不预检同名会把原始
         // DB 冲突裸抛成 500（move 分支同样道理，见下方 conflict 检查）
-        const conflict = await this.ctx.files.childByName(dstFolder!.id, src.name);
+        const conflict = await this.ctx.files.childByName(dstFolder!.id, finalName);
         if (conflict) throw Err.objectExist();
-        await this.copyRecursive(src, dstFolder!.id, user.id);
+        await this.copyRecursive(src, dstFolder!.id, user.id, finalName);
         logAudit(this.ctx, 'copy_from', user.id, { name: src.name });
-        logAudit(this.ctx, 'copy_to', user.id, { name: src.name, dst: dstFolder!.name });
+        logAudit(this.ctx, 'copy_to', user.id, { name: finalName, dst: dstFolder!.name });
       } else if (dstFs === FileSystemType.Trash) {
         await this.softDeleteFile(src);
         logAudit(this.ctx, 'move_to_trash', user.id, { name: src.name });
@@ -1111,10 +1118,13 @@ export class FileSystemService {
         if (dstFolder && (await this.isDescendant(dstFolder.id, src.id))) {
           throw new AppError(CodeGroupNotAllowed, 'Cannot move a folder into itself');
         }
-        const conflict = await this.ctx.files.childByName(dstFolder!.id, src.name);
+        const conflict = await this.ctx.files.childByName(dstFolder!.id, finalName);
         if (conflict) throw Err.objectExist();
         await this.ctx.files.updateParent(src.id, dstFolder!.id);
-        logAudit(this.ctx, 'move_to', user.id, { name: src.name, dst: dstFolder!.name });
+        // 改名要单独走一次（`updateParent` 只换父目录）；跨目录 MOVE 同时改名
+        // 在 WebDAV 里很常见（Destination 最后一段不同）。
+        if (finalName !== src.name) await this.ctx.files.rename(src.id, finalName);
+        logAudit(this.ctx, 'move_to', user.id, { name: finalName, dst: dstFolder!.name });
       }
     }
   }
@@ -1134,11 +1144,16 @@ export class FileSystemService {
    * 递归复制。文件共享实体（引用计数 +1），目录递归下去。
    * 这与原版的行为一致：复制不产生新的物理对象，只增加实体引用。
    */
-  private async copyRecursive(src: FileRow, dstParentId: number, ownerId: number): Promise<FileRow> {
+  private async copyRecursive(
+    src: FileRow,
+    dstParentId: number,
+    ownerId: number,
+    destName?: string,
+  ): Promise<FileRow> {
     const policy = await this.ctx.resolvePolicy(src.storage_policy_files);
     const created = await this.ctx.files.create({
       type: src.type,
-      name: src.name,
+      name: destName ?? src.name,
       ownerId,
       parentId: dstParentId,
       size: src.size,

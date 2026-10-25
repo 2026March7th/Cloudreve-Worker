@@ -31,7 +31,8 @@
     "test:node-tasks": "node scripts/test-node-tasks.mjs",
     "test:node-pool": "node scripts/test-node-pool.mjs",
     "test:share-og": "node scripts/test-share-og.mjs",
-    "test:dav": "node scripts/test-dav-path.mjs"
+    "test:dav": "node scripts/test-dav-path.mjs",
+    "test:dav-protocol": "node scripts/test-dav-protocol.mjs"
   },
   "dependencies": {
     "@neondatabase/serverless": "^0.10.4",
