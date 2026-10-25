@@ -1,20 +1,21 @@
 /**
- * 简易速率限制（KV 固定窗口计数）。
+ * 限速（登录、2FA、注册、找回密码、分享密码）。
  *
- * 用途：登录、2FA、注册、找回密码、分享密码这些「猜口令」入口。之前**一个都
- * 没有** —— 密码最短 4 位 + 无锁定 + 无 IP 限速，等于把在线爆破的门敞开。
+ * 一开始用 Workers KV 计数，**上线实测发现根本不生效**：KV 的读是最终一致的
+ * （读可能命中最多 60 秒的旧值），「读-加一-写回」在连续请求里永远读到初始值，
+ * 12 次登录尝试一次都没触发限制。一个静默失效的限速比没有更糟 —— 它给人一种
+ * 已经被保护的错觉。
  *
- * 设计取舍：
- *   - 用 **窗口序号进键**（`rl:<bucket>:<window>:<id>`）而不是「读-改-写同一个键」，
- *     这样跨窗口不会互相污染计数，也不需要本地状态。
- *   - Workers KV 是最终一致的，读-改-写**不是原子**的：极短时间内的高并发
- *     可能少记几次。对「把爆破成本抬到不现实」这个目标足够；要严格原子得换
- *     Durable Object 或库里建表，那是另一种量级的延迟。
- *   - KV 没绑定时**放行**（fail-open）：宁可少一层防护，也不能因为配置缺失把
- *     所有人锁在门外。部署里 KV 一定在，这条只是兜底。
+ * 所以改成本地数据库里的原子计数：一条
+ *   `INSERT ... ON CONFLICT DO UPDATE SET n = CASE WHEN window_start = $2 ...`
+ * 由 Postgres 行锁串行化，跨 colo、跨 isolate 都是同一份计数，一次往返。
+ * 代价是每次尝试多一次 ~250ms 的跨区往返（登录本来就要 2~3 次，可接受；
+ * 分享密码只在**失败**时才计数，正常访客零成本）。
+ *
+ * 表结构见 `migrations/0014_rate_limits.sql`，窗口外的旧行由每日 cron 顺带清理。
  */
 import type { Env } from '../env';
-import { kvFor } from './kvRouter';
+import { getSql } from '../db';
 
 export interface RateLimitOptions {
   /** 限速维度名，例如 `login:email`、`share:pwd` */
@@ -31,48 +32,86 @@ export interface RateLimitResult {
   ok: boolean;
   /** 还要等多久（秒），ok=true 时为 0 */
   retryAfter: number;
+  /** 本窗口内已计次数 */
+  count: number;
 }
 
-function windowIndexOf(windowSec: number): number {
-  return Math.floor(Date.now() / (windowSec * 1000));
+/** 计数后端。默认走数据库；测试可以用内存实现。 */
+export interface RateLimitStore {
+  /** 记一次并返回本窗口内的累计次数。 */
+  bump(key: string, windowStart: number): Promise<number>;
+  /** 清掉某个键（登录成功后用）。 */
+  reset(key: string): Promise<void>;
 }
 
-function keyOf(opts: RateLimitOptions, window: number): string {
-  // id 里可能是邮箱/带冒号的东西，统一转义，避免拼出歧义的键
-  return `rl:${opts.bucket}:${window}:${encodeURIComponent(opts.id)}`;
+/** 窗口起点（Unix 秒，按 windowSec 对齐）。 */
+export function windowStartOf(windowSec: number): number {
+  const now = Math.floor(Date.now() / 1000);
+  return now - (now % windowSec);
+}
+
+/** 键：bucket + id + 窗口长度。id 里可能有冒号/邮箱，直接拼但带上长度更稳。 */
+export function rateKeyOf(opts: RateLimitOptions): string {
+  return `${opts.bucket}|${opts.windowSec}|${opts.id}`;
+}
+
+function sqlStore(env: Env): RateLimitStore {
+  return {
+    async bump(key, windowStart) {
+      const sql = getSql(env);
+      const rows = (await sql(
+        `INSERT INTO rate_limits (key, window_start, hits)
+         VALUES ($1, $2, 1)
+         ON CONFLICT (key) DO UPDATE SET
+           hits = CASE WHEN rate_limits.window_start = EXCLUDED.window_start
+                       THEN rate_limits.hits + 1 ELSE 1 END,
+           window_start = EXCLUDED.window_start
+         RETURNING hits`,
+        [key, windowStart],
+      )) as Array<{ hits: number | string }>;
+      return Number(rows[0]?.hits ?? 1);
+    },
+    async reset(key) {
+      const sql = getSql(env);
+      await sql('DELETE FROM rate_limits WHERE key = $1', [key]);
+    },
+  };
 }
 
 /**
- * 记一次访问。返回 `ok=false` 表示已超限（**本次也要算进去**，
- * 否则超限期间请求不计费，窗口一过又能打满一轮）。
+ * 记一次访问。
+ *
+ * `ok=false` 表示已超限 —— **本次也计入**，否则超限期间免费，窗口一过又能
+ * 满速打一轮。
  */
-export async function hitRateLimit(env: Env, opts: RateLimitOptions): Promise<RateLimitResult> {
-  const kv = kvFor(env, 'session');
-  if (!kv) return { ok: true, retryAfter: 0 };
-
-  const window = windowIndexOf(opts.windowSec);
-  const key = keyOf(opts, window);
+export async function hitRateLimit(
+  env: Env,
+  opts: RateLimitOptions,
+  store: RateLimitStore = sqlStore(env),
+): Promise<RateLimitResult> {
+  const windowStart = windowStartOf(opts.windowSec);
   try {
-    const raw = await kv.get(key);
-    const count = Number(raw ?? 0);
-    if (count >= opts.limit) {
-      const elapsed = Math.floor((Date.now() / 1000) % opts.windowSec);
-      return { ok: false, retryAfter: Math.max(1, opts.windowSec - elapsed) };
+    const count = await store.bump(rateKeyOf(opts), windowStart);
+    if (count > opts.limit) {
+      const now = Math.floor(Date.now() / 1000);
+      return { ok: false, retryAfter: Math.max(1, opts.windowSec - (now - windowStart)), count };
     }
-    // 多留 10 秒余量：KV 的 expirationTtl 最小值是 60，短窗口靠窗口序号自然作废
-    await kv.put(key, String(count + 1), { expirationTtl: Math.max(60, opts.windowSec + 10) });
-    return { ok: true, retryAfter: 0 };
+    return { ok: true, retryAfter: 0, count };
   } catch {
-    return { ok: true, retryAfter: 0 };
+    // 计数失败**放行**：宁可在数据库出问题时让人登录，也不要因为计数表挂了
+    // 把所有人锁在门外。
+    return { ok: true, retryAfter: 0, count: 0 };
   }
 }
 
 /** 成功之后清掉计数（例如登录成功就别再拦这个人了）。 */
-export async function clearRateLimit(env: Env, opts: RateLimitOptions): Promise<void> {
-  const kv = kvFor(env, 'session');
-  if (!kv) return;
+export async function clearRateLimit(
+  env: Env,
+  opts: RateLimitOptions,
+  store: RateLimitStore = sqlStore(env),
+): Promise<void> {
   try {
-    await kv.delete(keyOf(opts, windowIndexOf(opts.windowSec)));
+    await store.reset(rateKeyOf(opts));
   } catch {
     /* 尽力而为 */
   }
@@ -89,10 +128,7 @@ export function clientIp(c: {
   return 'unknown';
 }
 
-/**
- * 常用策略集中放这里，避免各处凭感觉写数字。
- * 单位都是「每个窗口」。
- */
+/** 常用策略集中放这里，避免各处凭感觉写数字。 */
 export const RATE_LIMITS = {
   /** 同一邮箱登录：10 次 / 分钟（正常用户不会打这么快） */
   loginByEmail: { bucket: 'login:email', limit: 10, windowSec: 60 },

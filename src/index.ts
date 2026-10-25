@@ -27,6 +27,7 @@ import { AppError, CodeNotFound, describeError } from './lib/errors';
 import { ensureSettings, loadSettings } from './settings/provider';
 import { provision } from './db/provision';
 import { resolveDb } from './db/shard';
+import { getSql } from './db';
 import { kvFor } from './lib/kvRouter';
 import { warmAllCaches } from './services/cacheWarmer';
 import { ensureDomainShards, } from './db/domainBootstrap';
@@ -527,7 +528,15 @@ export default {
       console.error('trash collector failed', describeError(e));
     }
 
-    // 3. 从节点任务状态同步。没有从节点的部署这一步是零查询（LIKE 匹配为空）。
+    // 3. 清掉过期的限速计数（窗口外的行已经没用，留着只会越长越大）。
+    try {
+      const sql = getSql(env);
+      await sql("DELETE FROM rate_limits WHERE window_start < EXTRACT(EPOCH FROM now())::bigint - 3600");
+    } catch (e) {
+      console.error('rate limit cleanup failed', describeError(e));
+    }
+
+    // 4. 从节点任务状态同步。没有从节点的部署这一步是零查询（LIKE 匹配为空）。
     try {
       const synced = await syncNodeTasks(env);
       if (synced.checked > 0) {
