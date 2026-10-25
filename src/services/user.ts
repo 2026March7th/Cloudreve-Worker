@@ -481,10 +481,22 @@ export class UserService {
 
     // 站点为空只是快路径：非空时连这条 INSERT 都不发。抢到名额才提升为管理员。
     let effectiveGroupId = groupId;
-    if (siteEmpty && (await this.ctx.users.claimFirstAdmin(normalized))) {
-      await this.ctx.users.updateGroup(user.id, 1);
-      user.group_users = 1;
-      effectiveGroupId = 1;
+    if (siteEmpty) {
+      let claimed = false;
+      try {
+        claimed = await this.ctx.users.claimFirstAdmin(normalized);
+      } catch (e) {
+        // 栅栏表还没建出来（自举标记没跟上）时，不能让注册整个挂掉。
+        // 退回旧行为：站点为空就够了 —— 有极小概率出两个管理员，可接受；
+        // 总比「新部署第一次注册直接 500」要好。
+        console.error('claimFirstAdmin failed, falling back to siteEmpty', e);
+        claimed = true;
+      }
+      if (claimed) {
+        await this.ctx.users.updateGroup(user.id, 1);
+        user.group_users = 1;
+        effectiveGroupId = 1;
+      }
     }
 
     // 根目录与组行互不依赖 —— 并行一次往返拿完。组行用于构造响应，也用于

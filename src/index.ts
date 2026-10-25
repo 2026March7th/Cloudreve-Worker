@@ -81,7 +81,13 @@ import { isSocialMediaBot, renderSharePreview } from './services/share-preview';
  *     自举时装回内存、运行时查询失败自动 30s 短降级、搬迁改两阶段
  *     （先复制到空再清主库，杜绝数据劈半）。
  */
-const BOOTSTRAP_FLAG = 'bootstrap:done:v13';
+/**
+ * 自举标记。**每次改 migrations/ 或 provision/seed 的内容都必须 bump 这一行**，
+ * 否则存量部署里的 `provision()` 整体不会被调用，新表永远不会建出来
+ * （踩过：加了 site_state / rate_limits 两张表没 bump，线上一直「表不存在」，
+ * 限速静默失效、注册也会挂在 claimFirstAdmin 上）。
+ */
+const BOOTSTRAP_FLAG = 'bootstrap:done:v15';
 /** 自举失败后的冷却键（20 秒 TTL）：期间请求直接快速失败，不再重放自举。 */
 const BOOTSTRAP_COOLDOWN = 'bootstrap:cooldown:v1';
 /** 同一 isolate 内的并发请求共享一次自举。 */
