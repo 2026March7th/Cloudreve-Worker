@@ -25,6 +25,7 @@ import { walUnfinished } from '../services/wal';
 import { purgeAllCaches, warmAllCaches } from '../services/cacheWarmer';
 import { CACHE_ENTRIES, purgeableEntries } from '../lib/cacheRegistry';
 import { DEFAULT_FILE_VIEWERS, parseFileViewers } from '../settings/fileViewers';
+import { coloCacheGetJson, coloCachePutJson } from '../lib/coloCache';
 
 const CAPTCHA_PREFIX = 'captcha:';
 const CAPTCHA_TTL = 1800; // 与原版 CaptchaTTL 一致（30 分钟）
@@ -492,7 +493,27 @@ siteRoutes.get('/config/:section', async (c) => {
 });
 
 /** 汇总所有策略里声明的缩略图后缀（去重、排序）。 */
+/**
+ * 各存储策略声明的缩略图后缀（前端「缩略图设置」用它渲染可选列表）。
+ *
+ * 这份数据只随管理员改存储策略变化，但原来每次进站都要把**全表策略**查一遍
+ * （冷 isolate 上实测 180ms，Neon 空闲唤醒时更久）。这里加两层缓存：
+ * isolate 内存 60s + colo Cache API 60s。策略改了最晚一分钟生效 —— 它只是
+ * 一个提示列表，不影响任何权限或数据正确性。
+ */
+const THUMB_EXTS_TTL_MS = 60_000;
+let thumbExtsMemo: { at: number; exts: string[] } | null = null;
+
 async function collectThumbExts(ctx: ReturnType<typeof ctxOf>): Promise<string[]> {
+  if (thumbExtsMemo && Date.now() - thumbExtsMemo.at < THUMB_EXTS_TTL_MS) {
+    return thumbExtsMemo.exts;
+  }
+  const coloHit = await coloCacheGetJson<string[]>('site:thumb_exts', 60);
+  if (Array.isArray(coloHit)) {
+    thumbExtsMemo = { at: Date.now(), exts: coloHit };
+    return coloHit;
+  }
+
   const policies = await ctx.policies.list();
   const exts = new Set<string>();
   for (const policy of policies) {
@@ -503,7 +524,10 @@ async function collectThumbExts(ctx: ReturnType<typeof ctxOf>): Promise<string[]
       }
     }
   }
-  return [...exts].sort();
+  const list = [...exts].sort();
+  thumbExtsMemo = { at: Date.now(), exts: list };
+  await coloCachePutJson('site:thumb_exts', list, 120);
+  return list;
 }
 
 /**
