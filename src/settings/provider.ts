@@ -19,7 +19,12 @@ const KV_CACHE_TTL = 60;
 /** Colo 级（Cache API）副本的物理 TTL / 逻辑新鲜期（秒）。 */
 const COLO_CACHE_KEY = 'settings:all:v1';
 const COLO_CACHE_TTL_S = 120;
-const COLO_MAX_AGE_S = 15;
+/**
+ * 逻辑新鲜期。取 60s 与 KV 副本的 TTL 对齐 —— 也就是「跨 colo 的最坏陈旧
+ * 时间不会比现在更差」，同时把同一 colo 内的冷 isolate 命中率拉到实用水平。
+ * 本 colo 的失效是即时的（invalidateSettings 会删这个键）。
+ */
+const COLO_MAX_AGE_S = 60;
 
 /**
  * isolate 级内存缓存。
@@ -224,6 +229,32 @@ export class SettingsProvider {
   get maxBatchedFile(): number {
     return this.getInt('max_batched_file', 3000);
   }
+}
+
+/**
+ * 预取设置（跨中间件的并行化）。
+ *
+ * 冷 isolate 的请求原本是**串行**两段：先读自举标记（KV），再读设置（KV →
+ * 可能回源数据库）。两段之间没有数据依赖 —— 自举标记只决定「要不要建表」，
+ * 设置读取自己会回源。这里在入口处先把设置读取的 Promise 挂起来，等
+ * `appContext` 真正需要时直接 await 同一个 Promise，两段就并行跑了。
+ *
+ * 失败必须吞掉：全新部署第一次请求时表还没建出来，这次预取注定失败，
+ * 自举完成之后 `appContext` 会走正常的读取路径（返回 null 表示没有可用预取）。
+ */
+let prefetched: Promise<SettingsProvider> | null = null;
+
+export function prefetchSettings(env: Env): void {
+  if (prefetched) return;
+  prefetched = loadSettings(env).catch(() => null as unknown as SettingsProvider);
+}
+
+/** 取走预取结果（一次性）。没有预取或预取失败时返回 null。 */
+export function consumePrefetchedSettings(): Promise<SettingsProvider> | null {
+  const p = prefetched;
+  prefetched = null;
+  if (!p) return null;
+  return p.then((v) => v ?? Promise.reject(new Error('prefetch failed')));
 }
 
 /**

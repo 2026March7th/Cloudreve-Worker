@@ -24,7 +24,7 @@ import { cachePublicAnon, cachePublicAnonStore } from './middleware/cachePublic'
 import { cacheAuthed } from './middleware/cacheAuthed';
 import { fail, ok } from './lib/response';
 import { AppError, CodeNotFound, describeError } from './lib/errors';
-import { ensureSettings, loadSettings } from './settings/provider';
+import { ensureSettings, loadSettings, prefetchSettings } from './settings/provider';
 import { provision } from './db/provision';
 import { resolveDb } from './db/shard';
 import { getSql } from './db';
@@ -136,6 +136,9 @@ app.use('*', async (c, next) => {
   // 已确认过的 isolate 直接短路 —— 这一条是**热路径**上的关键优化，
   // 见 `bootstrapConfirmed` 的注释。
   if (!bootstrapConfirmed) {
+    // 冷启动时「读自举标记」与「读设置」互不依赖，先把设置读取挂起来并行跑，
+    // 后面 appContext 会 await 同一个 Promise（见 settings/provider.ts）。
+    prefetchSettings(c.env);
     try {
       // 自举标记与「分域降级」状态并行读出（都在 flag 命名空间，一次并发
       // 往返拿全）。分域降级状态**必须每个 isolate 冷启动都装一遍**：

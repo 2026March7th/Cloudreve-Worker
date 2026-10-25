@@ -11,7 +11,7 @@ import type { Env } from '../env';
 import { AppContext } from '../services/context';
 import { logAudit } from '../services/audit';
 import { MailService } from '../services/mail';
-import { loadSettings, type SettingsProvider } from '../settings/provider';
+import { consumePrefetchedSettings, loadSettings, type SettingsProvider } from '../settings/provider';
 import { HashIDCodec } from '../lib/hashid';
 import { JWTService, TokenHeaderPrefix, TokenHeaderPrefixCr } from '../lib/jwt';
 import type { UserWithGroup } from '../db/types';
@@ -102,7 +102,19 @@ export function appContext(): MiddlewareHandler<AppBindings> {
     // 见 db/shard.ts）。
     const db = resolveDb(env);
 
-    const settings = await loadSettings(env, db);
+    // 设置读取：入口处已经预取过就直接用那份 Promise（与自举标记并行），
+    // 否则现读（内存 / colo 缓存 / KV / 数据库，见 settings/provider.ts）。
+    const prefetchedSettings = consumePrefetchedSettings();
+    let settings: SettingsProvider;
+    if (prefetchedSettings) {
+      try {
+        settings = await prefetchedSettings;
+      } catch {
+        settings = await loadSettings(env, db);
+      }
+    } else {
+      settings = await loadSettings(env, db);
+    }
     const settingsMs = performance.now() - startedAt;
     const codec = new HashIDCodec(settings.hashIdSalt);
     const jwt = new JWTService(settings.secretKey);
