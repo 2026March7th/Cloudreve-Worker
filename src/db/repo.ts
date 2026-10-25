@@ -227,6 +227,22 @@ export class UserRepo {
   }
 
   /** 站点是否还没有任何用户。第一个注册的用户会被提升为管理员。 */
+  /**
+   * 原子抢占「首个管理员名额」。
+   *
+   * 返回 true = 这次调用抢到了。`INSERT ... ON CONFLICT DO NOTHING RETURNING`
+   * 由数据库主键保证只有一个调用能拿到行 —— 并发注册时不会再出现两个管理员。
+   * 抢到之后由调用方把用户提进管理员组。
+   */
+  async claimFirstAdmin(email: string): Promise<boolean> {
+    const rows = (await this.sql`
+      INSERT INTO site_state (name, value) VALUES ('first_admin', ${email})
+      ON CONFLICT (name) DO NOTHING
+      RETURNING name
+    `) as unknown[];
+    return rows.length > 0;
+  }
+
   async isEmpty(): Promise<boolean> {
     const rows = (await this.sql`SELECT 1 FROM users WHERE deleted_at IS NULL LIMIT 1`) as unknown[];
     return rows.length === 0;

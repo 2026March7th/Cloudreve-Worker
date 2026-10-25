@@ -17,8 +17,9 @@ import { UserService } from '../services/user';
 import { PasskeyService } from '../services/passkey';
 import { OAuthService } from '../services/oauth';
 import { buildAuthorizeUrl, handleCallback, publicOidcInfo } from '../services/oidc';
-import { AppError, CodeNotFullySuccess, CodeNotFound, Err } from '../lib/errors';
+import { AppError, CodeNotFullySuccess, CodeNotFound, CodeRateLimited, Err } from '../lib/errors';
 import { verifyCaptcha } from './site';
+import { RATE_LIMITS, clearRateLimit, clientIp, hitRateLimit } from '../lib/rateLimit';
 
 export const sessionRoutes = new Hono<AppBindings>();
 
@@ -38,6 +39,19 @@ sessionRoutes.post('/token', async (c) => {
     return fail(c, Err.param('Password length must be between 4 and 128'));
   }
 
+  // 暴力破解防护：邮箱维度拦「盯着一个账号打」，IP 维度拦「撞库扫一批账号」。
+  // 这两个桶原来根本不存在 —— 密码最短 4 位 + 无锁定 + 无限速 = 在线爆破无门槛。
+  const ip = clientIp(c);
+  const byEmail = { ...RATE_LIMITS.loginByEmail, id: body.email.trim().toLowerCase() };
+  const byIp = { ...RATE_LIMITS.loginByIp, id: ip };
+  for (const bucket of [byEmail, byIp]) {
+    const gate = await hitRateLimit(c.env, bucket);
+    if (!gate.ok) {
+      c.header('Retry-After', String(gate.retryAfter));
+      return fail(c, new AppError(CodeRateLimited, `Too many login attempts, retry in ${gate.retryAfter}s`));
+    }
+  }
+
   // 登录验证码（站点开启时才校验）
   if (ctx.settings.loginCaptcha) {
     const passed = await verifyCaptcha(ctx, body.ticket, body.captcha);
@@ -53,6 +67,7 @@ sessionRoutes.post('/token', async (c) => {
     if ('two_fa_session_id' in result) {
       return okWithCode(c, CodeNotFullySuccess, result.two_fa_session_id);
     }
+    await clearRateLimit(c.env, byEmail);
     return ok(c, result);
   } catch (e) {
     return fail(c, e);
@@ -184,6 +199,11 @@ sessionRoutes.post('/token/2fa', async (c) => {
   const body = (await c.req.json().catch(() => ({}))) as { otp?: string; session_id?: string };
   if (!body.otp || !body.session_id) {
     return fail(c, Err.param('otp and session_id are required'));
+  }
+  const gate = await hitRateLimit(c.env, { ...RATE_LIMITS.twoFactor, id: body.session_id });
+  if (!gate.ok) {
+    c.header('Retry-After', String(gate.retryAfter));
+    return fail(c, new AppError(CodeRateLimited, `Too many attempts, retry in ${gate.retryAfter}s`));
   }
   try {
     const result = await new UserService(ctx).login2FA(body.otp, body.session_id);

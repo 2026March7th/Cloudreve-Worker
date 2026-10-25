@@ -461,11 +461,14 @@ export class UserService {
 
     // 第一个注册的用户进管理员组。原版靠 CLI seed 建管理员账号；边缘版的
     // 部署路径是「云端一键部署、不碰本机」，没有机会预设密码，所以采用
-    // 「先到先得」：站点无用户时，注册即管理员。之后注册的仍按 default_group。
-    // （isEmpty 已在上面与 byEmail 并行查过，这里直接用结果。）
-    const groupId = siteEmpty
-      ? 1 // Admin 组（seed 与上游 application/migrator 的约定一致）
-      : this.ctx.settings.defaultGroupId;
+    // 「先到先得」。
+    //
+    // ⚠️ 不能直接 `groupId = siteEmpty ? 1 : default`：`isEmpty()` 与 `create()`
+    // 之间没有原子性，两个并发注册都会看到「站点为空」，结果**产生两个管理员**
+    // （越权面的直接来源）。改成：一律按默认组建号，然后用 site_state 的主键
+    // 做栅栏原子抢占名额，抢到再提升。抢不到就永远是普通用户。
+    // Admin 组 id = 1（seed 与上游 application/migrator 的约定一致）。
+    const groupId = this.ctx.settings.defaultGroupId;
 
     const user = await this.ctx.users.create({
       email: normalized,
@@ -476,12 +479,20 @@ export class UserService {
       language,
     });
 
+    // 站点为空只是快路径：非空时连这条 INSERT 都不发。抢到名额才提升为管理员。
+    let effectiveGroupId = groupId;
+    if (siteEmpty && (await this.ctx.users.claimFirstAdmin(normalized))) {
+      await this.ctx.users.updateGroup(user.id, 1);
+      user.group_users = 1;
+      effectiveGroupId = 1;
+    }
+
     // 根目录与组行互不依赖 —— 并行一次往返拿完。组行用于构造响应，也用于
     // 把新用户的完整数据预热进 KV：注册一完成，用户登录后的首批请求
     // （/user/me、容量、文件列表）就直接命中缓存，不必回源 users JOIN groups。
     const [, group] = await Promise.all([
       this.ctx.files.ensureRoot(user.id),
-      this.ctx.groups.byId(groupId),
+      this.ctx.groups.byId(effectiveGroupId),
     ]);
 
     logAudit(this.ctx, 'user_signup', user.id, { email: normalized });

@@ -45,6 +45,14 @@ export const CodeCaptchaRefreshNeeded = 40027;
 export const CodeFailedSendEmail = 40028;
 export const CodeInvalidTempLink = 40029;
 export const CodeTempLinkExpired = 40030;
+
+/**
+ * 请求过于频繁（本地新增，上游没有对应码）。
+ * 用于登录 / 2FA / 注册 / 找回密码 / 分享密码这些「猜口令」入口的限速，
+ * 与 HTTP 的 429 语义一致；响应头同时带 `Retry-After`。
+ * 取 40090 是为了不和上游 4xx 段冲突（上游目前到 40089）。
+ */
+export const CodeRateLimited = 40090;
 export const CodeEmailProviderBaned = 40031;
 export const CodeEmailExisted = 40032;
 export const CodeEmailSent = 40033;

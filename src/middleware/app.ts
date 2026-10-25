@@ -143,6 +143,11 @@ export function appContext(): MiddlewareHandler<AppBindings> {
     }
 
     const appCtx = new AppContext(env, settings, codec, jwt, user, scopes, db);
+    // 客户端 IP 只有这一层拿得到（服务层没有 Request）。分享密码的失败限速要用。
+    appCtx.clientIp =
+      c.req.header('CF-Connecting-IP')?.trim() ||
+      (c.req.header('X-Forwarded-For') ?? '').split(',')[0]?.trim() ||
+      'unknown';
     // 后台任务挂钩：把「发信」这类不能阻塞响应、又不该丢的工作挂到
     // Workers 的 waitUntil 上（对应原版的常驻队列发信）。
     appCtx.setBackgroundHooks({

@@ -55,6 +55,7 @@ import {
   CodeGroupNotAllowed,
   CodeIllegalObjectName,
   CodeIncorrectPassword,
+  CodeRateLimited,
   CodeNoPermissionErr,
   CodeObjectExist,
   CodeOwnerOnly,
@@ -74,6 +75,7 @@ import {
 } from '../lib/sysmeta';
 import { isShareInvalid } from './share-rules';
 import { publish } from './events';
+import { RATE_LIMITS, hitRateLimit } from '../lib/rateLimit';
 
 /**
  * 拼父子路径。父路径是 `/`（根目录）时避免出现 `//name`。
@@ -355,8 +357,20 @@ export class FileSystemService {
     const viewer = this.ctx.user;
     const isOwner = viewer !== undefined && viewer.id === share.user_shares;
 
-    // 密码校验：所有者不受限（原版 share_navigator.go:130-132）
+    // 密码校验：所有者不受限（原版 share_navigator.go:130-132）。
+    // 失败时记一次（按 分享+IP 计数）：分享密码没有其他防护，6 位纯数字几分钟
+    // 就能穷举完，这里把成本抬到不现实。
     if (share.password && !isOwner && (uri.password || '') !== share.password) {
+      const gate = await hitRateLimit(this.ctx.env, {
+        ...RATE_LIMITS.sharePassword,
+        id: `${shareId}:${this.ctx.clientIp}`,
+      });
+      if (!gate.ok) {
+        throw new AppError(
+          CodeRateLimited,
+          `Too many password attempts, retry in ${gate.retryAfter}s`,
+        );
+      }
       throw new AppError(CodeIncorrectPassword, 'Incorrect share password');
     }
 

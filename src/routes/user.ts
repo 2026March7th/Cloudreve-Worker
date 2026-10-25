@@ -27,7 +27,8 @@ import { PasskeyService } from '../services/passkey';
 import { OAuthService } from '../services/oauth';
 import { ShareService } from '../services/share';
 import { FileSystemService } from '../services/fs';
-import { AppError, CodeEmailSent, CodeNotFullySuccess, Err } from '../lib/errors';
+import { AppError, CodeEmailSent, CodeNotFullySuccess, CodeRateLimited, Err } from '../lib/errors';
+import { RATE_LIMITS, clientIp, hitRateLimit } from '../lib/rateLimit';
 import { verifyCaptcha } from './site';
 
 export const userRoutes = new Hono<AppBindings>();
@@ -60,6 +61,13 @@ userRoutes.post('/', async (c) => {
     if (!passed) {
       return fail(c, new AppError(40026, 'CAPTCHA verification failed'));
     }
+  }
+
+  // 批量注册防护（注册一成功还能顺手抢「首个管理员」名额，必须拦住刷号）
+  const regGate = await hitRateLimit(c.env, { ...RATE_LIMITS.registerByIp, id: clientIp(c) });
+  if (!regGate.ok) {
+    c.header('Retry-After', String(regGate.retryAfter));
+    return fail(c, new AppError(CodeRateLimited, `Too many sign-ups, retry in ${regGate.retryAfter}s`));
   }
 
   try {
@@ -349,6 +357,12 @@ userRoutes.post('/reset', async (c) => {
 
   if (!body.email) {
     return fail(c, Err.param('Email is required'));
+  }
+
+  const resetGate = await hitRateLimit(c.env, { ...RATE_LIMITS.resetByIp, id: clientIp(c) });
+  if (!resetGate.ok) {
+    c.header('Retry-After', String(resetGate.retryAfter));
+    return fail(c, new AppError(CodeRateLimited, `Too many requests, retry in ${resetGate.retryAfter}s`));
   }
   if (ctx.settings.forgetCaptcha) {
     const passed = await verifyCaptcha(ctx, body.ticket, body.captcha);

@@ -61,6 +61,12 @@ export class AppContext {
   /** URL / 请求签名器，密钥与 JWT 共用站点 secret */
   readonly signer: Signer;
 
+  /**
+   * 本次请求的客户端 IP。路由中间件在构造后写入（服务层拿不到 Request）。
+   * 目前只用于分享密码的失败计数限速。
+   */
+  clientIp = 'unknown';
+
   constructor(
     readonly env: Env,
     readonly settings: SettingsProvider,
