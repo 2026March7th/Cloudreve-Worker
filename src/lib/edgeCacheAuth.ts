@@ -137,3 +137,39 @@ export function edgeAuthCachePut(
   // 被 edgeCachePut 的 try/catch 吞掉 → 缓存永远写不进去）
   edgeCachePut((p) => c.executionCtx.waitUntil(p), origin, key, c.res, ttlS);
 }
+
+/** 全局「分享版本号」的 KV 键。分享被创建/编辑/删除时递增。 */
+const SHARE_EPOCH_KEY = 'edge:ep:share';
+
+/**
+ * 取分享版本号。
+ *
+ * 用途：匿名分享目录列表有 60s 边缘缓存（`cachePublic`），但**分享被撤销后**
+ * 缓存里的旧响应还会继续发出去 —— 与 GHSA-vx2m-jpxr-xv7w（撤销的分享仍能
+ * 通过缓存签发直链）是同一类问题。把版本号并进缓存键，撤销时 bump 一下，
+ * 旧键立刻失效。
+ *
+ * 代价是每次匿名分享请求多一次 KV 读（同 colo，十几毫秒），换来撤销即时生效；
+ * 相比它替掉的一整串跨区数据库往返（1.5s+）仍然划算。**不要**给它加 isolate
+ * 缓存 —— 加了撤销又会延迟到缓存过期。
+ */
+export async function getShareEpoch(env: Env): Promise<string> {
+  try {
+    const kv = kvFor(env, 'session');
+    if (!kv) return '0';
+    return (await kv.get(SHARE_EPOCH_KEY)) ?? '0';
+  } catch {
+    return '0';
+  }
+}
+
+/** 分享发生写操作时调用；失败不影响正确性（最坏是缓存多活 60 秒）。 */
+export async function bumpShareEpoch(env: Env): Promise<void> {
+  try {
+    const kv = kvFor(env, 'session');
+    if (!kv) return;
+    await kv.put(SHARE_EPOCH_KEY, String(Date.now()));
+  } catch {
+    /* 尽力而为 */
+  }
+}

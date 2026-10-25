@@ -29,6 +29,7 @@ import {
   Err,
 } from '../lib/errors';
 import { randomString } from '../lib/crypto';
+import { bumpShareEpoch } from '../lib/edgeCacheAuth';
 
 export interface ShareCreateParams {
   uri: string;
@@ -153,6 +154,8 @@ export class ShareService {
     });
 
     logAudit(this.ctx, 'share', user.id, { name: file.name, is_private: params.is_private === true });
+    // 新建分享不影响已有分享的可见性，但保持「写分享就 bump」的一致语义
+    await bumpShareEpoch(this.ctx.env);
     return this.shareUrl(share.id, password);
   }
 
@@ -216,6 +219,8 @@ export class ShareService {
     });
 
     logAudit(this.ctx, 'edit_share', user.id, { share_id: shareId });
+    // 改密码 / 改成私有 / 改过期时间都要让缓存的匿名列表立刻失效
+    await bumpShareEpoch(this.ctx.env);
     return this.shareUrl(shareId, password);
   }
 
@@ -570,6 +575,9 @@ export class ShareService {
     }
     await this.ctx.shares.softDelete(shareId);
     logAudit(this.ctx, 'delete_share', user.id, { share_id: shareId });
+    // 让匿名分享列表的边缘缓存立刻失效，否则撤销后的 60 秒内仍能从缓存里
+    // 看到目录、并据其中信息签出直链。
+    await bumpShareEpoch(this.ctx.env);
   }
 
   async batchDelete(shareHashIds: string[]): Promise<void> {
@@ -580,6 +588,7 @@ export class ShareService {
       if (id !== null) ids.push(id);
     }
     await this.ctx.shares.softDeleteMany(ids, user.id);
+    await bumpShareEpoch(this.ctx.env);
   }
 
   // -------------------------------------------------------------------------
