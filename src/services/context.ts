@@ -30,6 +30,8 @@ import { AppError, CodeGroupNotAllowed, CodeNoPermissionErr } from '../lib/error
 import { BooleanSet, GroupPermission } from '../lib/boolset';
 import { getStorageDriver, isPolicyTypeSupported } from '../storage';
 import { isLoadBalancePolicy, pickSlavePolicy } from '../storage/loadBalance';
+import { normalizePolicy } from '../db/repo';
+import { coloCacheGetJson, coloCachePutJson } from '../lib/coloCache';
 import type { StorageDriver } from '../storage/types';
 
 /**
@@ -254,6 +256,9 @@ export class AppContext {
    */
   async groupPolicies(user?: UserRow): Promise<StoragePolicyRow[]> {
     const u = user ?? this.requireUser();
+    // 见函数尾部的写入点：300s colo 缓存，命中零往返。
+    const cached = await coloCacheGetJson<Record<string, unknown>[]>(`grouppol:${u.group_users}`, 300);
+    if (cached) return cached.map((r) => normalizePolicy(r));
     const ids = await this.groups.listPolicyIds(u.group_users);
     const rows = (await this.policies.byIds(ids)) as StoragePolicyRow[];
     // 负载均衡虚拟策略不下发：展开成 slave 并集（去重、过滤无驱动的类型），
@@ -273,7 +278,13 @@ export class AppContext {
       }
     }
     const policies = Array.from(out.values());
-    if (policies.length > 0) return policies;
+    // 组→策略集的 colo 级缓存（300s，管理端改绑定时主动清）：列目录、上传、
+    // assertPolicyAllowed 每个请求都要走这里，没有缓存就是每请求一跳跨区查询。
+    // 存原始行 JSON，读出来重新 normalize（Date 字段要从字符串复原）。
+    if (policies.length > 0) {
+      void coloCachePutJson(`grouppol:${u.group_users}`, policies, 600);
+      return policies;
+    }
     if (!user) return [await this.resolvePolicy(null)];
     return policies;
   }

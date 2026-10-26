@@ -20,6 +20,7 @@ import type {
 } from './types';
 import { uuidv4 } from '../lib/crypto';
 import { verifyDavPassword } from '../lib/davPassword';
+import { coloCacheDelete, coloCacheGetJson, coloCachePutJson } from '../lib/coloCache';
 import { normalizeNodeRow } from './nodes';import { MetadataExpectedCollectTime } from '../lib/sysmeta';
 
 // ---------------------------------------------------------------------------
@@ -699,6 +700,8 @@ export class GroupRepo {
   /** 整体替换组的策略集；空数组 = 清空全部绑定。 */
   async setPolicyIds(id: number, policyIds: number[]): Promise<void> {
     groupPolicyIdCache.delete(id);
+    void coloCacheDelete(`grouppol:${id}`);
+    groupPolicyIdCache.delete(id);
     await this.sql.transaction([
       this.sql`DELETE FROM group_storage_policies WHERE group_id = ${id}`,
       ...policyIds.map(
@@ -991,12 +994,20 @@ export class FileRepo {
    * 逐段查反而更快。根目录行走 isolate 缓存（ensureRoot），首段免费。
    */
   async resolvePath(ownerId: number, elements: string[]): Promise<FileRow | null> {
+    // 路径 → 目录行的 colo 级缓存（60s）：桌面端同步、反复进出同一目录时，
+    // 命中就是零往返。代价是改名 / 删除后旧路径最多还能解析 60s —— 目录本身
+    // 还在（只是改名 / 已软删），操作落在同一个 id 上，不产生越权或错数据。
+    const cacheKey = `dirresolve:${ownerId}:${elements.join('/')}`;
+    const hit = await coloCacheGetJson<Record<string, unknown>>(cacheKey, 60);
+    if (hit) return normalizeFile(hit);
+
     let current = await this.ensureRoot(ownerId);
     for (const el of elements) {
       const next = await this.childByName(current.id, el);
       if (!next) return null;
       current = next;
     }
+    void coloCachePutJson(cacheKey, { ...current }, 120);
     return current;
   }
 
