@@ -537,6 +537,10 @@ export class UserRepo {
 // 用户组
 // ---------------------------------------------------------------------------
 
+/** 组→策略绑定的 isolate 缓存（60s，写路径主动失效）。 */
+const GROUP_POLICY_CACHE_TTL_MS = 60_000;
+const groupPolicyIdCache = new Map<number, { at: number; ids: number[] }>();
+
 export class GroupRepo {
   private sql: Sql;
   /** 绑定到一个具体的数据库客户端；库的选择由调用方决定（见 db/shard.ts）。 */
@@ -672,17 +676,29 @@ export class GroupRepo {
    * 关联表为空时回落到旧的单一 `storage_policy_id` 列，保证迁移前数据无缝。
    */
   async listPolicyIds(id: number): Promise<number[]> {
+    // 组→策略绑定几乎不变，而「列目录 / 上传 / assertPolicyAllowed」每个请求都要
+    // 查它。isolate 缓存 60s：管理端改绑定的写路径会主动清（setPolicyIds），
+    // 其余 isolate 最晚 60s 看到新绑定。
+    const cached = groupPolicyIdCache.get(id);
+    if (cached && Date.now() - cached.at < GROUP_POLICY_CACHE_TTL_MS) return cached.ids;
+
     const rows = (await this.sql`
       SELECT policy_id FROM group_storage_policies WHERE group_id = ${id} ORDER BY policy_id ASC
     `) as Array<{ policy_id: number | string }>;
     const ids = rows.map((r) => Number(r.policy_id)).filter((n) => Number.isFinite(n) && n > 0);
-    if (ids.length > 0) return ids;
+    if (ids.length > 0) {
+      groupPolicyIdCache.set(id, { at: Date.now(), ids });
+      return ids;
+    }
     const group = await this.byId(id);
-    return group?.storage_policy_id != null ? [Number(group.storage_policy_id)] : [];
+    const fallback = group?.storage_policy_id != null ? [Number(group.storage_policy_id)] : [];
+    groupPolicyIdCache.set(id, { at: Date.now(), ids: fallback });
+    return fallback;
   }
 
   /** 整体替换组的策略集；空数组 = 清空全部绑定。 */
   async setPolicyIds(id: number, policyIds: number[]): Promise<void> {
+    groupPolicyIdCache.delete(id);
     await this.sql.transaction([
       this.sql`DELETE FROM group_storage_policies WHERE group_id = ${id}`,
       ...policyIds.map(
