@@ -15,16 +15,16 @@ import { kvFor } from '../lib/kvRouter';
 import { coloCacheDelete, coloCacheGetJson, coloCachePutJson } from '../lib/coloCache';
 
 const KV_CACHE_KEY = 'settings:all:v1';
-const KV_CACHE_TTL = 60;
+const KV_CACHE_TTL = 300;
 /** Colo 级（Cache API）副本的物理 TTL / 逻辑新鲜期（秒）。 */
 const COLO_CACHE_KEY = 'settings:all:v1';
-const COLO_CACHE_TTL_S = 120;
+const COLO_CACHE_TTL_S = 600;
 /**
  * 逻辑新鲜期。取 60s 与 KV 副本的 TTL 对齐 —— 也就是「跨 colo 的最坏陈旧
  * 时间不会比现在更差」，同时把同一 colo 内的冷 isolate 命中率拉到实用水平。
  * 本 colo 的失效是即时的（invalidateSettings 会删这个键）。
  */
-const COLO_MAX_AGE_S = 60;
+const COLO_MAX_AGE_S = 300;
 
 /**
  * isolate 级内存缓存。

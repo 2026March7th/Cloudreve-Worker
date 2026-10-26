@@ -36,7 +36,7 @@ import { kvFor } from '../lib/kvRouter';
 import { normalizePolicy } from '../db/repo';
 import type { Sql } from '../db';
 
-const L1_TTL_MS = 10_000;
+const L1_TTL_MS = 300_000;
 const L2_TTL_S = 300;
 const L1_MAX = 100;
 

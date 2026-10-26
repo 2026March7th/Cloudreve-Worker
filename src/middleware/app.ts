@@ -20,6 +20,7 @@ import { resolveDb, type DbHandle } from '../db/shard';
 import { kvFor } from '../lib/kvRouter';
 import { getCachedUser, invalidateUser, rememberEnv } from '../services/userCache';
 import { rememberPolicyEnv } from '../services/policyCache';
+import { stageInit, stagesOf } from '../lib/timings';
 
 export interface AppBindings {
   Bindings: Env;
@@ -162,6 +163,7 @@ export function appContext(): MiddlewareHandler<AppBindings> {
     }
 
     const appCtx = new AppContext(env, settings, codec, jwt, user, scopes, db);
+    stageInit(appCtx);
     // 客户端 IP 只有这一层拿得到（服务层没有 Request）。分享密码的失败限速要用。
     appCtx.clientIp =
       c.req.header('CF-Connecting-IP')?.trim() ||
@@ -202,9 +204,14 @@ export function appContext(): MiddlewareHandler<AppBindings> {
     // total=整个请求。慢的时候先看这三段谁大。
     const totalMs = performance.now() - startedAt;
     try {
+      // 服务层打的分段（resolve/list/meta/…），有才拼 —— 诊断「一段查询占了
+      // 大头」用，平时是空串不影响。
+      const extra = (stagesOf(appCtx) ?? [])
+        .map((s) => `, ${s.name};dur=${s.ms.toFixed(1)}`)
+        .join('');
       c.header(
         'Server-Timing',
-        `settings;dur=${settingsMs.toFixed(1)}, auth;dur=${authMs.toFixed(1)}, total;dur=${totalMs.toFixed(1)}`,
+        `settings;dur=${settingsMs.toFixed(1)}, auth;dur=${authMs.toFixed(1)}, total;dur=${totalMs.toFixed(1)}${extra}`,
       );
     } catch {
       // 响应头已定稿（例如上游直接返回了不可变的 Response）就放弃这个诊断头

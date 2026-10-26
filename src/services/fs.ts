@@ -76,6 +76,7 @@ import {
 import { isShareInvalid } from './share-rules';
 import { publish } from './events';
 import { RATE_LIMITS, hitRateLimit } from '../lib/rateLimit';
+import { stageMark } from '../lib/timings';
 
 /**
  * 拼父子路径。父路径是 `/`（根目录）时避免出现 `//name`。
@@ -728,7 +729,9 @@ export class FileSystemService {
     // 这里**不能**直接用 requireUser()：匿名访问分享是合法路径（原版靠匿名用户组放行）。
     // my / trash 的登录要求由 resolveMy / resolveTrash 内部保证。
     const viewer = this.ctx.user;
+    let t0 = performance.now();
     const dir = await this.resolve(uri);
+    stageMark(this.ctx, 'resolve', t0);
 
     const isTrashRoot = uri.fsType === FileSystemType.Trash && uri.elements.length === 0;
     // 目录不存在时，如果目标是根目录就按空目录处理（首次登录还没建根）
@@ -783,6 +786,7 @@ export class FileSystemService {
     const flatList =
       isTrashRoot || uri.fsType === FileSystemType.SharedWithMe;
 
+    t0 = performance.now();
     const [listed, parentPath] = await Promise.all([
       this.ctx.files.list({
         parentId: dir ? dir.id : null,
@@ -798,15 +802,18 @@ export class FileSystemService {
       }),
       flatList ? Promise.resolve(null) : this.parentPathOf(dir),
     ]);
+    stageMark(this.ctx, 'list+path', t0);
     const files = listed.files;
     const total = listed.total;
 
     // 这两个查询都依赖上面的 files，彼此独立 —— 并行发出，省掉一次串行等待
     // （Neon HTTP 驱动每次查询是一次 fetch，串行会线性叠加延迟）。
+    t0 = performance.now();
     const [metadataMap, sharedIds] = await Promise.all([
       this.loadMetadata(files, uri.fsType === FileSystemType.My),
       this.ctx.shares.sharedFileIds(files.map((f) => f.id)),
     ]);
+    stageMark(this.ctx, 'meta+share', t0);
 
     // 逐项构造响应。这里可以并行：buildFileResponse 在传了 precomputedPath
     // 之后不再打数据库（除非开了 extended/folderSummary，列表接口都不开）。
@@ -862,6 +869,7 @@ export class FileSystemService {
     const policyOwnerId =
       dir?.owner_id ?? (uri.fsType === FileSystemType.My ? viewer?.id : undefined);
     if (policyOwnerId != null) {
+      const tPolicy = performance.now();
       try {
         // my / trash 的属主就是当前用户 —— 上下文里已经有完整行了，省一次查询。
         const owner =
@@ -887,6 +895,7 @@ export class FileSystemService {
       } catch {
         // 降级：无策略时前端上传器保持 No policy selected 行为
       }
+      stageMark(this.ctx, 'policy', tPolicy);
     }
 
     return response;

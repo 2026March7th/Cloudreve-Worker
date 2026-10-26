@@ -12,7 +12,7 @@
  *
  * 允许列表与 TTL（见 `AUTH_CACHEABLE`）：
  *  - `/api/v4/user/me`      用户资料，30s（资料极少变，写即失效）。
- *  - `/api/v4/file`         列目录，30s（任何成功的写请求都会 bump epoch，
+ *  - `/api/v4/file`         列目录，60s（任何成功的写请求都会 bump epoch，
  *                           下一次读立刻失效，所以 TTL 可以给长一点换回退速度）。
  *
  * `/site/config/*` 与 ping 仍由 `cachePublicAnon` 处理（公开、与用户无关），
@@ -42,7 +42,7 @@ const AUTH_CACHEABLE: CacheRule[] = [
   // 分键缓存（与 /me 同一套失效机制）能把首屏的 appContext + 设置查询整段省掉。
   // 管理后台改设置最多 30s 后生效。
   { re: /^\/api\/v4\/site\/config\/(login|explorer|thumb)$/, ttl: 30 },
-  { re: /^\/api\/v4\/file$/, ttl: 30 },
+  { re: /^\/api\/v4\/file$/, ttl: 60 },
   // 单文件元数据：桌面端同步遍历时按文件逐个调（get_file_info），一次遍历能把
   // 同一个 URI 打很多次；60s 足够覆盖一次遍历，写操作照样即时失效。
   { re: /^\/api\/v4\/file\/info$/, ttl: 60 },
