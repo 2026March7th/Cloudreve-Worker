@@ -43,6 +43,12 @@ const AUTH_CACHEABLE: CacheRule[] = [
   // 管理后台改设置最多 30s 后生效。
   { re: /^\/api\/v4\/site\/config\/(login|explorer|thumb)$/, ttl: 30 },
   { re: /^\/api\/v4\/file$/, ttl: 30 },
+  // 单文件元数据：桌面端同步遍历时按文件逐个调（get_file_info），一次遍历能把
+  // 同一个 URI 打很多次；60s 足够覆盖一次遍历，写操作照样即时失效。
+  { re: /^\/api\/v4\/file\/info$/, ttl: 60 },
+  // 缩略图地址：Explorer 打开文件夹时会按图片逐个要缩略图，每个都是一次
+  // 「解析文件 → 问驱动要地址」的跨区查询。缓存 60s，命中就零往返。
+  { re: /^\/api\/v4\/file\/thumb$/, ttl: 60 },
 ];
 
 /** 命中允许列表且为 GET 则返回规则，否则 null。 */
