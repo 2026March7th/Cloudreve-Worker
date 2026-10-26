@@ -7,6 +7,9 @@
 import { BooleanSet } from '../../src/lib/boolset';
 import { contentByEntityId } from './dav-store';
 
+/** 账号属主的登录邮箱 —— WebDAV 的**用户名**就是它（上游 GetActiveByDavAccount）。 */
+export const DAV_EMAIL = 'dav@example.com';
+
 export const DAV_ACCOUNT = {
   name: 'davuser',
   password: 'davpass',
@@ -17,11 +20,11 @@ export const DAV_ACCOUNT = {
 };
 
 /**
- * 中文账号名 + 非 ASCII 密码。
+ * 同一个用户名下的第二个账号，密码含非 ASCII（`pässwörd-密码`）。
  *
- * 钉住 Basic 凭据的 UTF-8 解码：`atob` 出来的字符串是 latin1，不转码就查不到
- * 这个账号 —— 线上表现正是「MT管理器 / ES 文件浏览器一直 401，
- * 换个纯英文账号就正常」。
+ * 钉两件事：
+ *   1. Basic 凭据必须按 UTF-8 解（`atob` 出来是 latin1，不转码就匹配不上）；
+ *   2. 认证是「邮箱 + 该用户**任一**账号的密码」，不是「账号名 + 密码」。
  */
 export const DAV_ACCOUNT_I18N = {
   ...DAV_ACCOUNT,
@@ -29,7 +32,8 @@ export const DAV_ACCOUNT_I18N = {
   password: 'pässwörd-密码',
 };
 
-/** 未启用 WebDAV 权限的组，用来测 403 分支。 */export function groupWithoutDav() {
+/** 未启用 WebDAV 权限的组，用来测 403 分支。 */
+export function groupWithoutDav() {
   return { id: 2, name: 'no-dav', permissions: new Uint8Array(8) };
 }
 
@@ -54,13 +58,13 @@ export class AppContext {
   user: unknown;
 
   readonly davAccounts = {
-    byNameAndPassword: async (name: string, password: string) => {
+    /** 上游语义：用户名 = 邮箱，密码匹配该用户名下任一账号。 */
+    byEmailAndPassword: async (email: string, password: string) => {
       if (this.opts.accountValid === false) return null;
-      if (name === DAV_ACCOUNT_I18N.name && password === DAV_ACCOUNT_I18N.password) {
-        return { account: DAV_ACCOUNT_I18N };
-      }
-      if (name !== DAV_ACCOUNT.name || password !== DAV_ACCOUNT.password) return null;
-      return { account: DAV_ACCOUNT };
+      if (email !== DAV_EMAIL) return null;
+      if (password === DAV_ACCOUNT_I18N.password) return { account: DAV_ACCOUNT_I18N };
+      if (password === DAV_ACCOUNT.password) return { account: DAV_ACCOUNT };
+      return null;
     },
   };
 

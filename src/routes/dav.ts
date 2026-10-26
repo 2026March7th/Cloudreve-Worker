@@ -102,7 +102,13 @@ davRoutes.use('*', async (c, next) => {
   }
 
   const ctx = ctxOf(c);
-  const hit = await ctx.davAccounts.byNameAndPassword(auth.name, auth.password);
+  // 用户名 = 登录邮箱（上游 GetActiveByDavAccount 的语义），密码 = 该用户任一
+  // WebDAV 账号的密码。前端「连接信息」弹窗里显示的也是邮箱，照填即可。
+  const hit = await ctx.davAccounts.byEmailAndPassword(
+    auth.name,
+    auth.password,
+    ctx.settings.secretKey,
+  );
   if (!hit) {
     // WebDAV 的 Basic Auth 是**每个请求**都带凭据的，攻击者可以拿它当登录接口
     // 无限试密码 —— 登录接口有邮箱/IP 限速，这条路径原来一条都没有。

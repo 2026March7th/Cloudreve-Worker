@@ -43,7 +43,9 @@ function eq(label, actual, expected) {
   check(label, actual === expected, `实际 ${JSON.stringify(actual)} 期望 ${JSON.stringify(expected)}`);
 }
 
-const AUTH = `Basic ${Buffer.from('davuser:davpass').toString('base64')}`;
+// 用户名是**登录邮箱**（上游 GetActiveByDavAccount 语义），不是账号名
+const DAV_EMAIL = 'dav@example.com';
+const AUTH = `Basic ${Buffer.from(`${DAV_EMAIL}:davpass`).toString('base64')}`;
 const PROPFIND_BODY = `<?xml version="1.0" encoding="utf-8"?>
 <D:propfind xmlns:D="DAV:"><D:prop><D:resourcetype/><D:getcontentlength/><D:getlastmodified/><D:displayname/><D:getetag/></D:prop></D:propfind>`;
 
@@ -143,7 +145,7 @@ try {
     check('401 必带 WWW-Authenticate', (r.headers.get('www-authenticate') ?? '').startsWith('Basic'));
   }
   {
-    const bad = `Basic ${Buffer.from('davuser:wrong').toString('base64')}`;
+    const bad = `Basic ${Buffer.from(`${DAV_EMAIL}:wrong`).toString('base64')}`;
     const r = await app.request('https://dav.test/dav', {
       method: 'PROPFIND',
       headers: { Authorization: bad },
@@ -151,19 +153,27 @@ try {
     eq('错密码 → 401', r.status, 401);
   }
   {
-    // 中文账号名 / 非 ASCII 密码：载荷是 base64(UTF-8 字节)，atob 直接当字符串用
-    // 会得到 latin1 乱码，账号查不到 → 401。安卓端（MT管理器、ES）最常见。
+    // 用户名是邮箱、密码匹配该用户**任一** WebDAV 账号；这里用第二个账号的
+    // 非 ASCII 密码，顺带钉住 Basic 载荷的 UTF-8 解码（atob 出来是 latin1）。
     const r = await app.request('https://dav.test/dav', {
       method: 'PROPFIND',
-      headers: { Authorization: `Basic ${Buffer.from('测试账号:pässwörd-密码', 'utf8').toString('base64')}` },
+      headers: { Authorization: `Basic ${Buffer.from(`${DAV_EMAIL}:pässwörd-密码`, 'utf8').toString('base64')}` },
     });
-    eq('中文账号名 + 非 ASCII 密码 → 200', r.status, 207);
+    eq('邮箱 + 非 ASCII 密码 → 207', r.status, 207);
+  }
+  {
+    // 账号名当用户名不认（上游就是这么设计的，界面里显示的也是邮箱）
+    const r = await app.request('https://dav.test/dav', {
+      method: 'PROPFIND',
+      headers: { Authorization: `Basic ${Buffer.from('davuser:davpass').toString('base64')}` },
+    });
+    eq('用账号名当用户名 → 401', r.status, 401);
   }
   {
     // RFC 7617：scheme 大小写不敏感，个别客户端就发小写
     const r = await app.request('https://dav.test/dav', {
       method: 'PROPFIND',
-      headers: { Authorization: `basic ${Buffer.from('davuser:davpass').toString('base64')}` },
+      headers: { Authorization: `basic ${Buffer.from(`${DAV_EMAIL}:davpass`).toString('base64')}` },
     });
     eq('小写 basic scheme → 207', r.status, 207);
   }
@@ -430,7 +440,7 @@ try {
     scoped.use('*', async (c, next) => {
       c.set('ctx', new FakeAppContext({}, {}, {}, {}, null, {}));
       // 覆盖账号 URI 到子目录
-      c.get('ctx').davAccounts.byNameAndPassword = async () => ({
+      c.get('ctx').davAccounts.byEmailAndPassword = async () => ({
         account: { name: 'davuser', password: 'davpass', uri: 'cloudreve://my/scoped', owner_id: 1, options: new Uint8Array(8) },
       });
       await next();

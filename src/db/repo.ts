@@ -18,7 +18,8 @@ import type {
   UserRow,
   UserWithGroup,
 } from './types';
-import { sha256Hex, timingSafeEqual, uuidv4 } from '../lib/crypto';
+import { uuidv4 } from '../lib/crypto';
+import { verifyDavPassword } from '../lib/davPassword';
 import { normalizeNodeRow } from './nodes';import { MetadataExpectedCollectTime } from '../lib/sysmeta';
 
 // ---------------------------------------------------------------------------
@@ -2041,31 +2042,37 @@ export class DavAccountRepo {
   }
 
   /**
-   * Basic Auth 查询：账号名 + 密码 → 属主用户（必须已激活）。
-   * 对应上游 `UserClient.GetActiveByDavAccount`。
+   * WebDAV 认证：**用户名是用户的邮箱**，密码是该用户名下任一 WebDAV 账号的密码。
+   *
+   * 这是上游 `inventory/user.go:GetActiveByDavAccount` 的语义 ——
+   * `Where(user.EmailEqualFold(email))` + `WithDavAccounts(Password(pwd))`，
+   * 也就是「邮箱 + 应用密码」。前端「连接信息」弹窗里显示的正是登录邮箱，
+   * 用户照着填。本仓库早期版本按 `dav_accounts.name` 查，于是照界面填永远是
+   * 401（2026-10-26 MT管理器连不上的原因之一）。
+   *
+   * 密码支持三种存储形态（见 lib/davPassword.ts）：加密、早期 sha256、上游明文。
    */
-  async byNameAndPassword(
-    name: string,
+  async byEmailAndPassword(
+    email: string,
     password: string,
-  ): Promise<{ account: DavAccountRow; user: UserRow } | null> {
-    // 库里存 sha256 hash（创建时明文只回显一次）。历史明文行回退直接
-    // 比较以保持兼容；两条路径都是恒时比较。
+    secretKey: string,
+  ): Promise<{ account: DavAccountRow } | null> {
+    if (!email) return null;
     const rows = (await this.sql`
-      SELECT * FROM dav_accounts
-      WHERE name = ${name} AND deleted_at IS NULL
-      LIMIT 1
+      SELECT d.* FROM dav_accounts d
+      JOIN users u ON u.id = d.owner_id
+      WHERE lower(u.email) = lower(${email})
+        AND u.status = 'active'
+        AND d.deleted_at IS NULL
+      ORDER BY d.id ASC
     `) as Record<string, unknown>[];
-    if (!rows[0]) return null;
-    const account = normalizeDavAccount(rows[0]);
-    const hashed = await sha256Hex(password);
-    const ok =
-      timingSafeEqual(account.password, hashed) || timingSafeEqual(account.password, password);
-    if (!ok) return null;
-    const userRows = (await this.sql`
-      SELECT * FROM users WHERE id = ${account.owner_id} AND status = 'active' LIMIT 1
-    `) as Record<string, unknown>[];
-    if (!userRows[0]) return null;
-    return { account, user: normalizeUser(userRows[0]) };
+    for (const row of rows) {
+      const account = normalizeDavAccount(row);
+      if (await verifyDavPassword(secretKey, account.password, password)) {
+        return { account };
+      }
+    }
+    return null;
   }
 }
 

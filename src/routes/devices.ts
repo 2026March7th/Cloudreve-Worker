@@ -19,7 +19,8 @@ import { fail, ok } from '../lib/response';
 import { URI } from '../services/uri';
 import { AppError, Err } from '../lib/errors';
 import { BooleanSet, GroupPermission } from '../lib/boolset';
-import { randomString, sha256Hex } from '../lib/crypto';
+import { randomString } from '../lib/crypto';
+import { revealDavPassword, sealDavPassword } from '../lib/davPassword';
 import type { HashIDCodec } from '../lib/hashid';
 import type { DavAccountRow } from '../db/repo';
 
@@ -42,14 +43,19 @@ function davOptionsFrom(
   return bs.toBytes();
 }
 
-function davAccountToResponse(codec: HashIDCodec, row: DavAccountRow) {
+/**
+ * 账号响应。`password` 必须是**可用的明文** —— 前端「连接信息」弹窗直接展示这个
+ * 字段，用户抄进 MT管理器 / RaiDrive。只回哈希等于让人拿一串十六进制去登录，
+ * 必然 401（2026-10-26 的故障之一）。
+ */
+async function davAccountToResponse(codec: HashIDCodec, row: DavAccountRow, secretKey: string) {
   const bs = row.options instanceof Uint8Array ? new BooleanSet(row.options) : new BooleanSet();
   return {
     id: codec.encodeDavAccountID(row.id),
     created_at: row.created_at.toISOString(),
     name: row.name,
     uri: row.uri,
-    password: row.password,
+    password: (await revealDavPassword(secretKey, row.password)) ?? '',
     options: bs.toBase64(),
   };
 }
@@ -80,7 +86,9 @@ devicesRoutes.get('/dav', async (c) => {
   });
   const hasMore = (page + 1) * pageSize < total;
   return ok(c, {
-      accounts: accounts.map((a) => davAccountToResponse(ctx.codec, a)),
+      accounts: await Promise.all(
+        accounts.map((a) => davAccountToResponse(ctx.codec, a, ctx.settings.secretKey)),
+      ),
       pagination: {
         page,
         page_size: pageSize,
@@ -109,18 +117,21 @@ devicesRoutes.put('/dav', async (c) => {
       throw new AppError(40007, 'WebDAV is not enabled for this user group');
     }
     validateDavUri(body.uri);
-    // 密码只生成一次明文回显给用户，库内存 sha256（对齐上游 bcrypt 语义，
-    // DB 泄漏不泄漏可用凭据）；认证侧 sha256 比对 + 历史明文行回退
+    // 密码生成一次，回显给用户；库里存加密后的形态（密钥来自站点 secret_key），
+    // 这样设置页的「连接信息」还能把明文显示出来给用户抄，而单拖库解不开
     const plain = randomString(32);
     const account = await ctx.davAccounts.create({
       ownerId: ctx.user.id,
       name: body.name,
       uri: body.uri,
-      password: await sha256Hex(plain),
+      password: await sealDavPassword(ctx.settings.secretKey, plain),
       options: davOptionsFrom(body, ctx.groupPermissions.enabled(GroupPermission.WebDAVProxy)),
     });
     logAudit(ctx, 'webdav_account_create', ctx.user.id, { name: body.name });
-    return ok(c, { ...davAccountToResponse(ctx.codec, account), password: plain });
+    return ok(c, {
+      ...(await davAccountToResponse(ctx.codec, account, ctx.settings.secretKey)),
+      password: plain,
+    });
   } catch (e) {
     return fail(c, e);
   }
@@ -152,7 +163,7 @@ devicesRoutes.patch('/dav/:id', async (c) => {
       options: davOptionsFrom(body, ctx.groupPermissions.enabled(GroupPermission.WebDAVProxy)),
     });
     logAudit(ctx, 'webdav_account_update', ctx.user.id, { name: body.name });
-    return ok(c, davAccountToResponse(ctx.codec, account));
+    return ok(c, await davAccountToResponse(ctx.codec, account, ctx.settings.secretKey));
   } catch (e) {
     return fail(c, e);
   }
