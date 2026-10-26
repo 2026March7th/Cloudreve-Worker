@@ -996,8 +996,14 @@ export class FileRepo {
       const hit = rows[0];
       // 只走到一半（某段不存在）时 deep 会小于段数 —— 必须当成「路径不存在」，
       // 否则会拿父目录冒充目标，越权写不存在的路径。
+      // 再核一次名字：递归查询真要写错，最可能的形态就是「返回了祖先」，
+      // 名字对不上就走下面的逐段查询兜底，绝不把错的目录当结果返回。
       if (!hit || Number(hit._depth) !== elements.length) return null;
-      return normalizeFile(hit);
+      if (String(hit.name) !== elements[elements.length - 1]) {
+        console.error('resolvePath recursive result mismatch, falling back');
+      } else {
+        return normalizeFile(hit);
+      }
     } catch (e) {
       console.error('resolvePath recursive query failed, falling back', e instanceof Error ? e.message : e);
     }
