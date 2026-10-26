@@ -36,7 +36,7 @@ import type { Sql } from '../db';
 /** L1 内存存活时间。短 TTL：只吸收同一 isolate 内的突发并发。 */
 const L1_TTL_MS = 3_000;
 /** L2（KV）存活时间。改动最晚这么多秒后自动可见。 */
-const L2_TTL_S = 120;
+const L2_TTL_S = 300;
 /** L1 条数上限，防止长驻 isolate 内存无界增长（Workers 有 128MB 限制）。 */
 const L1_MAX = 200;
 

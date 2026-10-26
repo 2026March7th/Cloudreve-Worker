@@ -968,19 +968,21 @@ export class FileRepo {
 
   /** 沿路径逐级向下查找。返回 null 表示路径不存在。 */
   async resolvePath(ownerId: number, elements: string[]): Promise<FileRow | null> {
-    const root = await this.ensureRoot(ownerId);
-    if (elements.length === 0) return root;
+    if (elements.length === 0) return this.ensureRoot(ownerId);
 
-    // 一次递归查询走完整条路径。原来的写法是「每段一次 childByName」——
-    // 打开 `/a/b/c` 就是 4 次**串行**往返（每跳 200~400ms，Neon 在新加坡、
-    // 边缘在香港），桌面端枚举目录时直接被 Windows 判超时
+    // 一次递归查询走完整条路径（根的定位也并进同一条 SQL —— 原来还要先
+    // ensureRoot 一跳）。原来的写法是「每段一次 childByName」—— 打开 `/a/b/c`
+    // 就是 4 次**串行**往返（每跳 200~500ms，Neon 在新加坡、边缘在香港），
+    // 桌面端枚举目录时直接被 Windows 判超时
     //（「云操作未在超时时间结束之前完成」）。
     //
     // 失败就退回逐段查询：SQL 万一有问题，行为退化成「慢」而不是「打不开」。
     try {
       const rows = (await this.sql(
         `WITH RECURSIVE walk(depth, id) AS (
-           SELECT 0, ${root.id}::int
+           SELECT 0, r.id
+           FROM files r
+           WHERE r.owner_id = $2 AND r.file_children IS NULL AND r.name = ''
            UNION ALL
            SELECT w.depth + 1, f.id
            FROM walk w
@@ -1008,7 +1010,7 @@ export class FileRepo {
       console.error('resolvePath recursive query failed, falling back', e instanceof Error ? e.message : e);
     }
 
-    let current = root;
+    let current = await this.ensureRoot(ownerId);
     for (const el of elements) {
       const next = await this.childByName(current.id, el);
       if (!next) return null;

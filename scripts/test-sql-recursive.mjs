@@ -13,7 +13,9 @@ import { PGlite } from '@electric-sql/pglite';
 
 const RESOLVE = `
   WITH RECURSIVE walk(depth, id) AS (
-    SELECT 0, $3::int
+    SELECT 0, r.id
+    FROM files r
+    WHERE r.owner_id = $2 AND r.file_children IS NULL AND r.name = ''
     UNION ALL
     SELECT w.depth + 1, f.id
     FROM walk w
@@ -52,8 +54,8 @@ const db = new PGlite();
  * 与 `src/db/repo.ts` 的 resolvePath 逐行等价：取最深一级，再校验深度和名字，
  * 任一不符都返回 null（这一步就是「不存在的路径不会返回父目录」的保证）。
  */
-async function resolvePath(elements, ownerId, rootId) {
-  const { rows } = await db.query(RESOLVE, [elements, ownerId, rootId]);
+async function resolvePath(elements, ownerId) {
+  const { rows } = await db.query(RESOLVE, [elements, ownerId]);
   const hit = rows[0];
   if (!hit) return null;
   if (Number(hit._depth) !== elements.length) return null;
