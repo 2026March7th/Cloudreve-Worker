@@ -95,6 +95,12 @@ jobs:
       - name: 校验 KV 清理脚本（干跑，不实际清理）
         run: npm run kv:purge:dry
 
+      # 递归路径 SQL 的语义回归：跑在 PGlite（WASM 真 Postgres）上，不需要数据库
+      # 服务。它守的是「路径不存在时不会返回父目录」这个安全性质 —— 2026-10-26
+      # 就是靠本地跑真库才发现 SQL 返回的是「走到最深的那一级」，必须配深度校验。
+      - name: 递归路径 SQL 回归
+        run: npm run test:sql-recursive
+
       - name: 构建 + dry-run 检查（含拉取官方前端）
         run: npm run build
 

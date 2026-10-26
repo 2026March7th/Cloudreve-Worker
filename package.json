@@ -37,7 +37,8 @@
     "test:security": "node scripts/test-ssrf.mjs && node scripts/test-rate-limit.mjs && node scripts/test-dav-path.mjs && node scripts/test-dav-password.mjs && node scripts/test-sse.mjs && node scripts/test-share-og.mjs",
     "test:rate-limit": "node scripts/test-rate-limit.mjs",
     "test:dav-password": "node scripts/test-dav-password.mjs",
-    "test:sse": "node scripts/test-sse.mjs"
+    "test:sse": "node scripts/test-sse.mjs",
+    "test:sql-recursive": "node scripts/test-sql-recursive.mjs"
   },
   "dependencies": {
     "@neondatabase/serverless": "^0.10.4",
@@ -47,7 +48,8 @@
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20260919.0",
     "typescript": "^5.7.2",
-    "wrangler": "^4.135.0"
+    "wrangler": "^4.135.0",
+    "@electric-sql/pglite": "^0.5.11"
   },
   "cloudflare": {
     "bindings": {
