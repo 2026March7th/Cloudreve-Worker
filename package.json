@@ -34,9 +34,10 @@
     "test:dav": "node scripts/test-dav-path.mjs",
     "test:dav-protocol": "node scripts/test-dav-protocol.mjs",
     "test:ssrf": "node scripts/test-ssrf.mjs",
-    "test:security": "node scripts/test-ssrf.mjs && node scripts/test-rate-limit.mjs && node scripts/test-dav-path.mjs && node scripts/test-dav-password.mjs && node scripts/test-share-og.mjs",
+    "test:security": "node scripts/test-ssrf.mjs && node scripts/test-rate-limit.mjs && node scripts/test-dav-path.mjs && node scripts/test-dav-password.mjs && node scripts/test-sse.mjs && node scripts/test-share-og.mjs",
     "test:rate-limit": "node scripts/test-rate-limit.mjs",
-    "test:dav-password": "node scripts/test-dav-password.mjs"
+    "test:dav-password": "node scripts/test-dav-password.mjs",
+    "test:sse": "node scripts/test-sse.mjs"
   },
   "dependencies": {
     "@neondatabase/serverless": "^0.10.4",

@@ -50,6 +50,7 @@ import { FileType } from '../lib/boolset';
 import { AppError, CodeFeatureNotEnabled, CodeNotFound, Err } from '../lib/errors';
 import { attachmentDisposition } from '../lib/disposition';
 import { throttleStream } from '../lib/throttle';
+import { sseClientId } from '../lib/sse';
 
 export const fileRoutes = new Hono<AppBindings>();
 
@@ -935,8 +936,14 @@ fileRoutes.get('/events', async (c) => {
 
   const rawUri = c.req.query('uri');
   if (!rawUri) return fail(c, Err.param('uri is required'));
-  const clientId = c.req.header('X-Client-Id') ?? c.req.query('client_id') ?? '';
-  if (!clientId) return fail(c, Err.param('client id is required'));
+  // 客户端 ID 的头名必须认全：官方桌面端发的是 `X-Cr-Client-Id`
+  // （cloudreve-api 里 `format!("{}Client-Id", CR_HEADER_PREFIX)`，前缀就是 `X-Cr-`）。
+  // 只认 `X-Client-Id` 的时候桌面端会拿到 400 信封 → 判「SSE 没升级」→
+  // 界面上那行「实时事件推送丢失」（2026-10-26 实测）。见 lib/sse.ts。
+  const clientId = sseClientId(
+    (name) => c.req.header(name),
+    c.req.query('client_id'),
+  );
 
   try {
     const uri = URI.parse(rawUri);
@@ -1022,6 +1029,7 @@ fileRoutes.get('/events', async (c) => {
       }
     };
 
+    let stopStream: (() => void) | null = null;
     const stream = new ReadableStream<Uint8Array>({
       async start(controller) {
         send = (event: string, data: unknown) => {
@@ -1049,10 +1057,13 @@ fileRoutes.get('/events', async (c) => {
         timer = setTimeout(tick, POLL_MS);
 
         const keepAlive = setInterval(() => send('keep-alive', null), 25_000);
+        let cap: ReturnType<typeof setTimeout> | null = null;
+
         const cleanup = () => {
           if (closed) return;
           closed = true;
           if (timer) clearTimeout(timer);
+          if (cap) clearTimeout(cap);
           clearInterval(keepAlive);
           unsubscribe();
           try {
@@ -1061,7 +1072,23 @@ fileRoutes.get('/events', async (c) => {
             // already closed
           }
         };
+        stopStream = cleanup;
+
+        // 主动断开：留给客户端一个明确信号去重连。
+        // 为什么要断开 —— 每轮轮询都是一次 DB 子请求，Workers 单请求子请求数有限
+        // （免费档 50），一直挂着会在中途被平台掐断，客户端只看到流突然结束。
+        // 先回 reconnect-required 再关，客户端按约定重连，比被默默掐断干净。
+        cap = setTimeout(() => {
+          send('reconnect-required', null);
+          cleanup();
+        }, 120_000);
+
         c.req.raw.signal.addEventListener('abort', cleanup);
+      },
+      // 客户端主动断开（关窗口 / 换目录）时，Workers 取消流走这里 ——
+      // 不加的话 interval 与订阅会挂到这个 isolate 被回收为止。
+      cancel() {
+        stopStream?.();
       },
     });
 
