@@ -778,38 +778,35 @@ export class FileSystemService {
           ? dir.owner_id
           : null;
 
-    const { files, total } = await this.ctx.files.list({
-      parentId: dir ? dir.id : null,
-      ownerId,
-      trash: isTrashRoot,
-      // 「分享给我」是一棵扁平树，不走 parentId 过滤
-      sharedWithMe: uri.fsType === FileSystemType.SharedWithMe,
-      page: params.page,
-      pageSize,
-      orderBy: whitelist(params.orderBy, ORDER_BY_OPTIONS, 'name'),
-      orderDirection: whitelist(params.orderDirection, ORDER_DIRECTION_OPTIONS, 'asc'),
-      typeFilter: params.typeFilter ?? null,
-    });
-
-    // 这两个查询都依赖上面的 files，彼此独立 —— 并行发出，省掉一次串行等待
-    // （Neon HTTP 驱动每次查询是一次 fetch，串行会线性叠加延迟）。
-    //
-    // 关于 `parentPath`：只有当所有条目**确实是同一个目录的直接子节点**时，
-    // 才能把祖先链算一次复用。两种文件系统不满足这个前提，必须逐个算：
-    //   - trash：`pathOf()` 对回收站项恒返回 '/'（file_children 为 null），
-    //     且显示名来自 sys:restore_uri，路径本身没有意义 —— 直接不算；
-    //   - sharedWithMe：是一条**扁平**列表（原版 childFileQuery 不带 parentId），
-    //     条目散落在不同目录，没有公共祖先。
-    // 其余情况（my / share）都是标准的父子层级，可安全复用。
+    // 父路径只依赖 dir（已解析出来），和列目录彼此无关 —— 并行发，省掉
+    // 一整次跨区往返。扁平列表（trash / sharedWithMe）不适用，见下面注释。
     const flatList =
       isTrashRoot || uri.fsType === FileSystemType.SharedWithMe;
 
+    const [listed, parentPath] = await Promise.all([
+      this.ctx.files.list({
+        parentId: dir ? dir.id : null,
+        ownerId,
+        trash: isTrashRoot,
+        // 「分享给我」是一棵扁平树，不走 parentId 过滤
+        sharedWithMe: uri.fsType === FileSystemType.SharedWithMe,
+        page: params.page,
+        pageSize,
+        orderBy: whitelist(params.orderBy, ORDER_BY_OPTIONS, 'name'),
+        orderDirection: whitelist(params.orderDirection, ORDER_DIRECTION_OPTIONS, 'asc'),
+        typeFilter: params.typeFilter ?? null,
+      }),
+      flatList ? Promise.resolve(null) : this.parentPathOf(dir),
+    ]);
+    const files = listed.files;
+    const total = listed.total;
+
+    // 这两个查询都依赖上面的 files，彼此独立 —— 并行发出，省掉一次串行等待
+    // （Neon HTTP 驱动每次查询是一次 fetch，串行会线性叠加延迟）。
     const [metadataMap, sharedIds] = await Promise.all([
       this.loadMetadata(files, uri.fsType === FileSystemType.My),
       this.ctx.shares.sharedFileIds(files.map((f) => f.id)),
     ]);
-
-    const parentPath = flatList ? null : await this.parentPathOf(dir);
 
     // 逐项构造响应。这里可以并行：buildFileResponse 在传了 precomputedPath
     // 之后不再打数据库（除非开了 extended/folderSummary，列表接口都不开）。
