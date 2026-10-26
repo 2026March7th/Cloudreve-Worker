@@ -966,50 +966,15 @@ export class FileRepo {
     return rows[0] ? normalizeFile(rows[0]) : null;
   }
 
-  /** 沿路径逐级向下查找。返回 null 表示路径不存在。 */
+  /**
+   * 沿路径逐段向下查找。返回 null 表示路径不存在。
+   *
+   * ⚠️ 这里**故意不用** `WITH RECURSIVE` 一次查完 —— 线上实测（Server-Timing
+   * 分段，2026-10-26）递归 CTE 单条要 500~1900ms，而带索引的简单查询只要
+   * ~165ms（`unnest` 进递归项后计划器不走向索引）。路径深度通常 2~4 段，
+   * 逐段查反而更快。根目录行走 isolate 缓存（ensureRoot），首段免费。
+   */
   async resolvePath(ownerId: number, elements: string[]): Promise<FileRow | null> {
-    if (elements.length === 0) return this.ensureRoot(ownerId);
-
-    // 一次递归查询走完整条路径（根的定位也并进同一条 SQL —— 原来还要先
-    // ensureRoot 一跳）。原来的写法是「每段一次 childByName」—— 打开 `/a/b/c`
-    // 就是 4 次**串行**往返（每跳 200~500ms，Neon 在新加坡、边缘在香港），
-    // 桌面端枚举目录时直接被 Windows 判超时
-    //（「云操作未在超时时间结束之前完成」）。
-    //
-    // 失败就退回逐段查询：SQL 万一有问题，行为退化成「慢」而不是「打不开」。
-    try {
-      const rows = (await this.sql(
-        `WITH RECURSIVE walk(depth, id) AS (
-           SELECT 0, r.id
-           FROM files r
-           WHERE r.owner_id = $2 AND r.file_children IS NULL AND r.name = ''
-           UNION ALL
-           SELECT w.depth + 1, f.id
-           FROM walk w
-           JOIN unnest($1::text[]) WITH ORDINALITY AS s(name, ord) ON s.ord = w.depth + 1
-           JOIN files f ON f.file_children = w.id AND f.name = s.name AND f.owner_id = $2
-         )
-         SELECT f.*, w.depth AS _depth
-         FROM walk w JOIN files f ON f.id = w.id
-         ORDER BY w.depth DESC
-         LIMIT 1`,
-        [elements, ownerId],
-      )) as Record<string, unknown>[];
-      const hit = rows[0];
-      // 只走到一半（某段不存在）时 deep 会小于段数 —— 必须当成「路径不存在」，
-      // 否则会拿父目录冒充目标，越权写不存在的路径。
-      // 再核一次名字：递归查询真要写错，最可能的形态就是「返回了祖先」，
-      // 名字对不上就走下面的逐段查询兜底，绝不把错的目录当结果返回。
-      if (!hit || Number(hit._depth) !== elements.length) return null;
-      if (String(hit.name) !== elements[elements.length - 1]) {
-        console.error('resolvePath recursive result mismatch, falling back');
-      } else {
-        return normalizeFile(hit);
-      }
-    } catch (e) {
-      console.error('resolvePath recursive query failed, falling back', e instanceof Error ? e.message : e);
-    }
-
     let current = await this.ensureRoot(ownerId);
     for (const el of elements) {
       const next = await this.childByName(current.id, el);
