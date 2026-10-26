@@ -151,6 +151,31 @@ try {
     eq('错密码 → 401', r.status, 401);
   }
   {
+    // 中文账号名 / 非 ASCII 密码：载荷是 base64(UTF-8 字节)，atob 直接当字符串用
+    // 会得到 latin1 乱码，账号查不到 → 401。安卓端（MT管理器、ES）最常见。
+    const r = await app.request('https://dav.test/dav', {
+      method: 'PROPFIND',
+      headers: { Authorization: `Basic ${Buffer.from('测试账号:pässwörd-密码', 'utf8').toString('base64')}` },
+    });
+    eq('中文账号名 + 非 ASCII 密码 → 200', r.status, 207);
+  }
+  {
+    // RFC 7617：scheme 大小写不敏感，个别客户端就发小写
+    const r = await app.request('https://dav.test/dav', {
+      method: 'PROPFIND',
+      headers: { Authorization: `basic ${Buffer.from('davuser:davpass').toString('base64')}` },
+    });
+    eq('小写 basic scheme → 207', r.status, 207);
+  }
+  {
+    const r = await app.request('https://dav.test/dav', { method: 'PROPFIND' });
+    check(
+      '401 质询带 charset=UTF-8',
+      /charset="?UTF-8"?/i.test(r.headers.get('www-authenticate') ?? ''),
+      r.headers.get('www-authenticate') ?? '',
+    );
+  }
+  {
     const noPerm = makeApp({ davPermission: false });
     const r = await noPerm.request('https://dav.test/dav', {
       method: 'PROPFIND',

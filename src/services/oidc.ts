@@ -380,7 +380,12 @@ function decodeJwtPayload(jwt: string): Record<string, unknown> | null {
   if (parts.length < 2) return null;
   try {
     const padded = parts[1]!.replaceAll('-', '+').replaceAll('_', '/');
-    const json = atob(padded + '='.repeat((4 - (padded.length % 4)) % 4));
+    const binary = atob(padded + '='.repeat((4 - (padded.length % 4)) % 4));
+    // atob 出来的是 latin1：id_token 里只要有非 ASCII（中文 name、日文 nickname），
+    // 直接 JSON.parse 会解成乱码或直接抛错（我们随后就当作「没有 id_token」跳过校验）。
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+    const json = new TextDecoder('utf-8', { fatal: false }).decode(bytes);
     return JSON.parse(json) as Record<string, unknown>;
   } catch {
     return null;

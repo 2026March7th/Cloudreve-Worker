@@ -33,6 +33,7 @@ import { UploadService } from '../services/upload';
 import type { FileRow } from '../db/types';
 import type { DavAccountRow } from '../db/repo';
 import { BooleanSet, GroupPermission, FileType } from '../lib/boolset';
+import { parseBasicAuth } from '../lib/basicAuth';
 import { RATE_LIMITS, clientIp, hitRateLimit } from '../lib/rateLimit';
 import {
   CodeFileNotFound,
@@ -70,17 +71,14 @@ const DAV_OPT_READONLY = 0;
 // 鉴权
 // ---------------------------------------------------------------------------
 
-function parseBasicAuth(header: string | undefined): { name: string; password: string } | null {
-  if (!header?.startsWith('Basic ')) return null;
-  try {
-    const decoded = atob(header.slice(6).trim());
-    const i = decoded.indexOf(':');
-    if (i < 0) return null;
-    return { name: decoded.slice(0, i), password: decoded.slice(i + 1) };
-  } catch {
-    return null;
-  }
-}
+// Basic 凭据解析在 lib/basicAuth.ts（UTF-8 与 scheme 大小写两个坑，见那里的注释）
+
+/**
+ * 401 质询头。带上 `charset="UTF-8"`（RFC 7617 §2.1）：中文账号名的客户端
+ * 据此知道按 UTF-8 编码载荷，而不是系统默认的 GBK（MT管理器/ES 这类安卓
+ * 客户端会看这个参数）。
+ */
+const DAV_CHALLENGE = 'Basic realm="cloudreve", charset="UTF-8"';
 
 /** 只读账号禁用的方法。与上游 WebDAVAuth:166 的列表一致。 */
 const WRITE_METHODS = new Set(['DELETE', 'PUT', 'MKCOL', 'COPY', 'MOVE', 'LOCK', 'UNLOCK']);
@@ -99,7 +97,7 @@ davRoutes.use('*', async (c, next) => {
   if (!auth) {
     // OPTIONS 不需要鉴权（上游同款豁免），其余要求 Basic Auth
     if (method === 'OPTIONS') return next();
-    c.header('WWW-Authenticate', 'Basic realm="cloudreve"');
+    c.header('WWW-Authenticate', DAV_CHALLENGE);
     return c.body(null, 401);
   }
 
@@ -112,7 +110,7 @@ davRoutes.use('*', async (c, next) => {
     const gate = await hitRateLimit(ctx.env, { ...RATE_LIMITS.davAuthByIp, id: clientIp(c) });
     logAudit(ctx, 'webdav_login_failed', null, { name: auth.name });
     // Windows WebClient 收到没有 WWW-Authenticate 的 401 不会重试凭据
-    c.header('WWW-Authenticate', 'Basic realm="cloudreve"');
+    c.header('WWW-Authenticate', DAV_CHALLENGE);
     if (!gate.ok) {
       c.header('Retry-After', String(gate.retryAfter));
       return c.body(null, 429);

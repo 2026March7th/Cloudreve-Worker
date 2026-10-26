@@ -16,8 +16,20 @@ export const DAV_ACCOUNT = {
   options: new Uint8Array(8),
 };
 
-/** 未启用 WebDAV 权限的组，用来测 403 分支。 */
-export function groupWithoutDav() {
+/**
+ * 中文账号名 + 非 ASCII 密码。
+ *
+ * 钉住 Basic 凭据的 UTF-8 解码：`atob` 出来的字符串是 latin1，不转码就查不到
+ * 这个账号 —— 线上表现正是「MT管理器 / ES 文件浏览器一直 401，
+ * 换个纯英文账号就正常」。
+ */
+export const DAV_ACCOUNT_I18N = {
+  ...DAV_ACCOUNT,
+  name: '测试账号',
+  password: 'pässwörd-密码',
+};
+
+/** 未启用 WebDAV 权限的组，用来测 403 分支。 */export function groupWithoutDav() {
   return { id: 2, name: 'no-dav', permissions: new Uint8Array(8) };
 }
 
@@ -44,6 +56,9 @@ export class AppContext {
   readonly davAccounts = {
     byNameAndPassword: async (name: string, password: string) => {
       if (this.opts.accountValid === false) return null;
+      if (name === DAV_ACCOUNT_I18N.name && password === DAV_ACCOUNT_I18N.password) {
+        return { account: DAV_ACCOUNT_I18N };
+      }
       if (name !== DAV_ACCOUNT.name || password !== DAV_ACCOUNT.password) return null;
       return { account: DAV_ACCOUNT };
     },
