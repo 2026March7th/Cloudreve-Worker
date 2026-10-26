@@ -454,6 +454,14 @@ export class FileSystemService {
 
   /** 取文件在「用户视角」下的完整路径。 */
   async pathOf(file: FileRow): Promise<string> {
+    // 根目录与回收站项（父为 null）没有路径
+    if (file.file_children === null) return '/';
+
+    // 一次递归查询拿全祖先链。原来每上一级打一次库：目录越深越贵，
+    // 而列表、下载、WebDAV 的 href 全都要调它。
+    const names = await this.ctx.files.ancestorNames(file.id);
+    if (names.length > 0) return `/${names.join('/')}`;
+
     const segments: string[] = [];
     let current: FileRow | null = file;
     let guard = 0;

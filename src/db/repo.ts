@@ -882,6 +882,13 @@ export interface ListFilesArgs {
   sharedWithMe?: boolean;
 }
 
+/**
+ * 根目录行的 isolate 级缓存。根是「每个请求都要用、建好之后永不变」的行，
+ * 缓存它等于给每次导航省一跳 Neon 往返。TTL 兜住极端情况（用户被删重建）。
+ */
+const ROOT_CACHE_TTL_MS = 60_000;
+const rootCache = new Map<number, { at: number; row: FileRow }>();
+
 export class FileRepo {
   private sql: Sql;
   /** 绑定到一个具体的数据库客户端；库的选择由调用方决定（见 db/shard.ts）。 */
@@ -912,10 +919,20 @@ export class FileRepo {
 
   /** 取用户根目录；不存在则创建（首次登录时调用）。 */
   async ensureRoot(ownerId: number): Promise<FileRow> {
+    // 根目录是**每个请求都要用**的行（解析任何路径都从它开始），而它建好之后
+    // 永远不会变、也删不掉。放 isolate 内存缓存 60s，等于每次导航省一跳
+    // Neon 往返（200~400ms）。
+    const cached = rootCache.get(ownerId);
+    if (cached && Date.now() - cached.at < ROOT_CACHE_TTL_MS) return cached.row;
+
     const existing = (await this.sql`
       SELECT * FROM files WHERE owner_id = ${ownerId} AND file_children IS NULL AND name = '' LIMIT 1
     `) as Record<string, unknown>[];
-    if (existing[0]) return normalizeFile(existing[0]);
+    if (existing[0]) {
+      const row = normalizeFile(existing[0]);
+      rootCache.set(ownerId, { at: Date.now(), row });
+      return row;
+    }
 
     const rows = (await this.sql`
       INSERT INTO files (type, name, owner_id, size, is_symbolic)
@@ -923,13 +940,19 @@ export class FileRepo {
       ON CONFLICT DO NOTHING
       RETURNING *
     `) as Record<string, unknown>[];
-    if (rows[0]) return normalizeFile(rows[0]);
+    if (rows[0]) {
+      const row = normalizeFile(rows[0]);
+      rootCache.set(ownerId, { at: Date.now(), row });
+      return row;
+    }
 
     // 并发下可能已被其它请求插入
     const again = (await this.sql`
       SELECT * FROM files WHERE owner_id = ${ownerId} AND file_children IS NULL AND name = '' LIMIT 1
     `) as Record<string, unknown>[];
-    return normalizeFile(again[0]!);
+    const row = normalizeFile(again[0]!);
+    rootCache.set(ownerId, { at: Date.now(), row });
+    return row;
   }
 
   /** 按父目录 + 名字找子节点。parentId 为 null 表示找根目录本身。 */
@@ -946,6 +969,39 @@ export class FileRepo {
   /** 沿路径逐级向下查找。返回 null 表示路径不存在。 */
   async resolvePath(ownerId: number, elements: string[]): Promise<FileRow | null> {
     const root = await this.ensureRoot(ownerId);
+    if (elements.length === 0) return root;
+
+    // 一次递归查询走完整条路径。原来的写法是「每段一次 childByName」——
+    // 打开 `/a/b/c` 就是 4 次**串行**往返（每跳 200~400ms，Neon 在新加坡、
+    // 边缘在香港），桌面端枚举目录时直接被 Windows 判超时
+    //（「云操作未在超时时间结束之前完成」）。
+    //
+    // 失败就退回逐段查询：SQL 万一有问题，行为退化成「慢」而不是「打不开」。
+    try {
+      const rows = (await this.sql(
+        `WITH RECURSIVE walk(depth, id) AS (
+           SELECT 0, ${root.id}::int
+           UNION ALL
+           SELECT w.depth + 1, f.id
+           FROM walk w
+           JOIN unnest($1::text[]) WITH ORDINALITY AS s(name, ord) ON s.ord = w.depth + 1
+           JOIN files f ON f.file_children = w.id AND f.name = s.name AND f.owner_id = $2
+         )
+         SELECT f.*, w.depth AS _depth
+         FROM walk w JOIN files f ON f.id = w.id
+         ORDER BY w.depth DESC
+         LIMIT 1`,
+        [elements, ownerId],
+      )) as Record<string, unknown>[];
+      const hit = rows[0];
+      // 只走到一半（某段不存在）时 deep 会小于段数 —— 必须当成「路径不存在」，
+      // 否则会拿父目录冒充目标，越权写不存在的路径。
+      if (!hit || Number(hit._depth) !== elements.length) return null;
+      return normalizeFile(hit);
+    } catch (e) {
+      console.error('resolvePath recursive query failed, falling back', e instanceof Error ? e.message : e);
+    }
+
     let current = root;
     for (const el of elements) {
       const next = await this.childByName(current.id, el);
@@ -953,6 +1009,32 @@ export class FileRepo {
       current = next;
     }
     return current;
+  }
+
+  /**
+   * 从某节点往上收集路径段（一次查询）。
+   *
+   * 返回**由深到浅**的名字数组，不含根（根的名字是空串）；回收站项（父为 null）
+   * 返回空数组。`pathOf()` 原来每上一级打一次库，深目录列一次表就是好几跳。
+   */
+  async ancestorNames(id: number): Promise<string[]> {
+    try {
+      const rows = (await this.sql(
+        `WITH RECURSIVE up(id, name, parent, depth) AS (
+           SELECT id, name, file_children, 0 FROM files WHERE id = $1
+           UNION ALL
+           SELECT f.id, f.name, f.file_children, u.depth + 1
+           FROM files f JOIN up u ON f.id = u.parent
+         )
+         SELECT name, depth FROM up WHERE name <> '' ORDER BY depth ASC`,
+        [id],
+      )) as { name: string; depth: number }[];
+      // depth 0 是节点自身 → 由浅到深排好再反过来，保持「由深到浅」契约
+      return rows.map((r) => r.name).reverse();
+    } catch (e) {
+      console.error('ancestorNames query failed', e instanceof Error ? e.message : e);
+      return [];
+    }
   }
 
   /** 列出目录内容（或回收站内容）。 */
