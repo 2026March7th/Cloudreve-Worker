@@ -77,6 +77,8 @@ import { isShareInvalid } from './share-rules';
 import { publish } from './events';
 import { RATE_LIMITS, hitRateLimit } from '../lib/rateLimit';
 import { stageMark } from '../lib/timings';
+import { coloCacheGetJson, coloCachePutJson } from '../lib/coloCache';
+import { normalizeFile } from '../db/repo';
 
 /**
  * 拼父子路径。父路径是 `/`（根目录）时避免出现 `//name`。
@@ -310,8 +312,26 @@ export class FileSystemService {
       }
       ownerId = decoded;
     }
+
+    // 路径 → 目录行的 colo 级缓存（60s）：这个站的流量稀疏，几乎每个请求都是
+    // 新 isolate，进程内缓存不命中，没有这层每次导航都要重走一遍逐段查询。
+    // 改名/删除后旧路径最多还能解析 60s —— 目录本身还在（只是改名/已软删），
+    // 操作落在同一个 id 上，无越权无错数据。符号目录不缓存（walk 会抛错，
+    // 缓存命中会绕过那个检查）。
+    const cacheKey = `dirresolve:${ownerId}:${uri.elements.join('/')}`;
+    const hit = await coloCacheGetJson<Record<string, unknown>>(cacheKey, 60);
+    if (hit) {
+      const row = normalizeFile(hit);
+      if (row.is_symbolic) throw Err.symbolicFolder();
+      return row;
+    }
+
     const root = await this.ctx.files.ensureRoot(ownerId);
-    return this.walk(root, uri.elements);
+    const target = await this.walk(root, uri.elements);
+    if (target && !target.is_symbolic) {
+      void coloCachePutJson(cacheKey, { ...target }, 120);
+    }
+    return target;
   }
 
   private async resolveTrash(uri: URI): Promise<FileRow | null> {
